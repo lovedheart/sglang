@@ -86,6 +86,8 @@ from sglang.srt.configs import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
     Spark2_5Config,
+    Qwen4ExpConfig,
+    Qwen4ExpTextConfig,
     Step3p5Config,
     Step3p7Config,
     Step3VLConfig,
