@@ -247,6 +247,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # After the model overrides: Qwen4-Exp declares the PLE offload default there.
     run_hook(handle_offload_compatibility, server_args)
 
+    # PLE-offload/generic-offload mutual exclusion, after the per-model
+    # overrides above have declared the ple_offload_embedding default.
+    from sglang.srt.arg_groups.memory_hook import validate_offload_compatibility
+
+    validate_offload_compatibility(server_args)
+
     # Set kernel backends.
     run_post_process_pass(server_args, _sampling_backend_default)
     # Must run before _handle_attention_backend_compatibility so the
