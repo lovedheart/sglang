@@ -289,6 +289,18 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         )
 
 
+def validate_offload_compatibility(server_args: Any):
+    cfg = resolved_view(server_args)
+    if cfg.ple_offload_embedding and (
+        cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0
+    ):
+        raise ValueError(
+            "--ple-offload-embedding cannot be combined with "
+            "--cpu-offload-gb or --offload-group-size: generic layer offload "
+            "would stage the pinned PLE embedding back to the device."
+        )
+
+
 def reserve_for_graph_mb(server_args: Any) -> float:
 
     cfg = resolving_view(server_args)
