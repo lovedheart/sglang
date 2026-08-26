@@ -107,6 +107,7 @@ _flashinfer_pr4266_direct_default_tactic = None
 _flashinfer_pr4266_prefer_direct = None
 _flashinfer_pr4266_run_direct_dense = None
 _enable_bf16_splitk_gemm = False
+_logged_bf16_gemm_shapes = set()
 
 # GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
 # Unlisted shapes, including M=64, retain the existing TGV/cuBLAS path.
@@ -139,11 +140,61 @@ _FLASHINFER_PR4266_TUNED_TACTICS = {
     (16, 2560, 8192): (64, 16, 2, 11),
     (24, 2560, 8192): (64, 32, 2, 9),
     (32, 2560, 8192): (64, 32, 2, 9),
+    # Qwen4-Exp TP4 decode tactics measured on B300 (sm103) under CUDA graph
+    # replay against cuBLAS/nvjet with splitKreduce. Every entry beat the
+    # existing dispatch; unlisted (m, n, k) keep the CuTe DSL/cuBLAS path.
+    (1, 320, 2560): (64, 8, 4, 11),
+    (1, 512, 2560): (64, 8, 4, 11),
+    (1, 640, 2560): (64, 8, 4, 10),
+    (1, 2560, 1536): (64, 8, 2, 6),
+    (1, 2560, 2560): (64, 8, 2, 6),
+    (1, 3584, 2560): (64, 8, 2, 6),
+    (1, 4096, 2560): (64, 8, 2, 6),
+    (1, 4120, 2560): (64, 8, 2, 6),
+    (2, 320, 2560): (64, 8, 4, 10),
+    (2, 512, 2560): (64, 8, 4, 11),
+    (2, 640, 2560): (64, 8, 4, 11),
+    (2, 2560, 1536): (64, 8, 2, 6),
+    (2, 2560, 2560): (64, 8, 2, 6),
+    (2, 3584, 2560): (64, 8, 2, 6),
+    (2, 4096, 2560): (64, 8, 2, 6),
+    (2, 4120, 2560): (64, 8, 2, 6),
+    (3, 320, 2560): (64, 8, 4, 10),
+    (3, 512, 2560): (64, 8, 4, 10),
+    (3, 640, 2560): (64, 8, 4, 10),
+    (3, 2560, 1536): (64, 8, 2, 6),
+    (3, 2560, 2560): (64, 8, 2, 6),
+    (3, 3584, 2560): (64, 8, 2, 6),
+    (3, 4096, 2560): (64, 8, 2, 6),
+    (3, 4120, 2560): (64, 8, 2, 6),
+    (4, 320, 2560): (64, 8, 4, 12),
+    (4, 512, 2560): (64, 8, 4, 10),
+    (4, 640, 2560): (64, 8, 4, 11),
+    (4, 2560, 1536): (64, 8, 2, 6),
+    (4, 2560, 2560): (64, 8, 2, 6),
+    (4, 3584, 2560): (64, 8, 2, 6),
+    (4, 4096, 2560): (64, 8, 2, 6),
+    (4, 4120, 2560): (64, 8, 2, 6),
+    (8, 320, 2560): (64, 8, 4, 11),
+    (8, 512, 2560): (64, 8, 4, 10),
+    (8, 640, 2560): (64, 8, 4, 11),
+    (8, 2560, 1536): (64, 8, 2, 10),
+    (8, 2560, 2560): (64, 8, 2, 6),
+    (8, 3584, 2560): (64, 8, 2, 6),
+    (8, 4096, 2560): (64, 8, 2, 6),
+    (8, 4120, 2560): (64, 8, 2, 6),
 }
 
 
 def use_flashinfer_pr4266_bf16_gemm(m: int, n: int, k: int) -> bool:
     return (m, n, k) in _FLASHINFER_PR4266_TUNED_TACTICS
+
+
+def _log_bf16_gemm_shape(m: int, n: int, k: int) -> None:
+    key = (m, n, k)
+    if key not in _logged_bf16_gemm_shapes:
+        _logged_bf16_gemm_shapes.add(key)
+        logger.info("BF16_GEMM_SHAPE m=%d n=%d k=%d", m, n, k)
 
 
 def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
@@ -221,8 +272,22 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
         _flashinfer_pr4266_prefer_direct = prefer_direct_bf16_gemm_sm100
         _flashinfer_pr4266_run_direct_dense = run_direct_dense
         _enable_bf16_splitk_gemm = True
+        _precompile_splitk_tactics()
 
     _BF16_GEMM_BACKEND = backend
+
+
+def _precompile_splitk_tactics() -> None:
+    """JIT-compile every allowlisted tactic before CUDA graph capture."""
+    device = torch.cuda.current_device()
+    for (m, n, k), tactic_args in _FLASHINFER_PR4266_TUNED_TACTICS.items():
+        a = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
+        w = torch.zeros(n, k, dtype=torch.bfloat16, device=device)
+        out = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+        _flashinfer_pr4266_run_splitk_dense(
+            a, w.T, None, out, True, _flashinfer_pr4266_splitk_tactic(*tactic_args)
+        )
+    torch.cuda.synchronize()
 
 
 def _bf16_gemm_dispatch_fake(
@@ -259,6 +324,8 @@ def _bf16_gemm_dispatch_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
     m = x.numel() // x.shape[-1]
+    if envs.SGLANG_BF16_GEMM_LOG_SHAPES.get():
+        _log_bf16_gemm_shape(m, weight.shape[0], weight.shape[1])
     if _enable_bf16_splitk_gemm and use_flashinfer_pr4266_bf16_gemm(
         m, weight.shape[0], weight.shape[1]
     ):
@@ -411,6 +478,33 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
+        if envs.SGLANG_BF16_GEMM_LOG_SHAPES.get() and x.ndim == 2:
+            _log_bf16_gemm_shape(
+                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+            )
+        if (
+            _enable_bf16_splitk_gemm
+            and bias is None
+            and x.is_cuda
+            and x.ndim == 2
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+            and not layer.weight.requires_grad
+            and use_flashinfer_pr4266_bf16_gemm(
+                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+            )
+        ):
+            tactic = _flashinfer_pr4266_splitk_tactic(
+                *_FLASHINFER_PR4266_TUNED_TACTICS[
+                    (x.shape[0], layer.weight.shape[0], layer.weight.shape[1])
+                ]
+            )
+            return _flashinfer_pr4266_run_splitk_dense(
+                x, layer.weight.T, None, output, True, tactic
+            )
         if (
             get_bf16_gemm_backend().is_cutedsl()
             and x.is_cuda

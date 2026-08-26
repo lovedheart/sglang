@@ -110,6 +110,27 @@ class TestPrepareServerArgs(CustomTestCase):
             weight_cache_mode="daemon",
             enable_eplb=True,
         )
+    def test_ple_embedding_offload_rejects_generic_weight_offload(self):
+        for generic_offload in (
+            {"cpu_offload_gb": 1},
+            {"offload_group_size": 1},
+        ):
+            with (
+                self.subTest(generic_offload=generic_offload),
+                self.assertRaisesRegex(
+                    ValueError, "ple-offload-embedding cannot be combined"
+                ),
+            ):
+                ServerArgs(
+                    model_path="dummy",
+                    ple_offload_embedding=True,
+                    **generic_offload,
+                )
+
+    def test_return_hidden_states_mode_configuration(self):
+        disabled = ServerArgs(model_path="dummy")
+        self.assertFalse(disabled.enable_return_hidden_states)
+        self.assertIsNone(disabled.return_hidden_states_mode)
 
         # This validation runs before model construction and should allow the
         # daemon to build the same static EPLB layout as the engine.
