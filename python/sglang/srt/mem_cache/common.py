@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_serving, get_spec
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -192,6 +192,7 @@ def _evict_until_allocatable(
         )
         if result.num_tokens_evicted == 0:
             return
+
 
 
 def retraction_backup(
