@@ -52,10 +52,17 @@ def _resolve_trtllm_sparse_decode():
     On Blackwell the FA4 cute varlen fallback runs a prefill-shaped kernel
     at decode row counts; the trtllm-gen decode kernel over a page-aligned
     scratch measures ~35% faster for the gather+attention pair.
-    """
-    from sglang.srt.utils import is_sm100_supported
 
-    if not is_sm100_supported():
+    The flashinfer backend resolves to ``trtllm-gen`` on SM100 and ``xqa``
+    on SM120/SM121 (consumer Blackwell), so the page-aligned scratch path
+    serves both. The FA4 cute varlen fallback that this replaces is broken
+    on SM120: with ``use_tma_O = arch >= sm_90`` and a ragged ``cu_seqlens_q``,
+    its O-store (``offset_batch_Q(mO, dim=3, ragged=True)``) fails MLIR/CUTLASS
+    IR generation, so any SM120 device must take this path instead.
+    """
+    from sglang.srt.utils import is_sm100_supported, is_sm120_supported
+
+    if not (is_sm100_supported() or is_sm120_supported()):
         return None
     try:
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache
