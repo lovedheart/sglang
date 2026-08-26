@@ -739,6 +739,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         nvfp4_config: ModelOptFp4Config,
         nvfp4a16_config: ModelOptFp4Config,
         mxfp8_config: Fp8Config,
+        fp8_pb_wo_config: Optional[Fp8Config] = None,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
@@ -746,6 +747,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         self.mxfp8_config = mxfp8_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
+        self.fp8_pb_wo_config = fp8_pb_wo_config
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -834,6 +836,15 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=True,
         )
+        # FP8 E4M3 2D blockwise (e.g. 128x128) weight-only layers: scales are the
+        # per-block dequant multipliers stored as ``<module>.weight_scale_inv``
+        # (DeepSeek block-fp8 convention); activations are dynamic.
+        fp8_pb_wo_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+            packed_modules_mapping=packed_modules_mapping,
+        )
         nvfp4_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,
             kv_cache_quant_algo=kv_cache_quant_algo,
@@ -857,6 +868,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             quantized_layers=quantized_layers,
             fp8_config=fp8_config,
             mxfp8_config=mxfp8_config,
+            fp8_pb_wo_config=fp8_pb_wo_config,
             nvfp4_config=nvfp4_config,
             nvfp4a16_config=nvfp4a16_config,
         )
@@ -937,6 +949,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
+            if quant_algo == "FP8_PB_WO" and self.fp8_pb_wo_config is not None:
+                return Fp8LinearMethod(self.fp8_pb_wo_config)
             if quant_algo == "MXFP8":
                 return Fp8LinearMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":
