@@ -1,97 +1,330 @@
-<div align="center" id="sglangtop">
-<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
+# Lsglang GPU + NUMA Dual Parallel [[中文]](./README_cn.md)
 
-[![PyPI](https://img.shields.io/pypi/v/sglang)](https://pypi.org/project/sglang)
-![PyPI - Downloads](https://static.pepy.tech/badge/sglang?period=month)
-[![license](https://img.shields.io/github/license/sgl-project/sglang.svg)](https://github.com/sgl-project/sglang/tree/main/LICENSE)
-[![issue resolution](https://img.shields.io/github/issues-closed-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![open issues](https://img.shields.io/github/issues-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/sgl-project/sglang)
+Lsglang is a special extension of sglang that fully utilizes CPU and GPU computing resources with an efficient GPU parallel + NUMA parallel architecture, suitable for MOE model hybrid inference.
 
-</div>
+> **Core Engine:** The actual hybrid inference functionality—including CPU-GPU collaborative computation, NUMA-aware scheduling, expert weight management, and quantization kernel execution—is powered entirely by **[lk_moe](https://pypi.org/project/lk-moe/)**, a highly optimized MOE hybrid inference engine. Within LvLLM (for vLLM) and [Lsglang](https://github.com/guqiong96/Lsglang) (for sglang), each MOE layer can flexibly choose between the original GPU computation path or invoke lk_moe for hybrid inference. For DeepSeek V4, specialized versions are also available: [Lvllmds4](https://github.com/guqiong96/Lvllmds4) (SM120+) and [Lvllmds4-x](https://github.com/guqiong96/Lvllmds4-x) (SM80+).
 
---------------------------------------------------------------------------------
+## System Features
 
-<p align="center">
-<a href="https://lmsys.org/blog/"><b>Blog</b></a> |
-<a href="https://docs.sglang.io/"><b>Documentation</b></a> |
-<a href="https://roadmap.sglang.io/"><b>Roadmap</b></a> |
-<a href="https://slack.sglang.io/"><b>Join Slack</b></a> |
-<a href="https://meet.sglang.io/"><b>Weekly Dev Meeting</b></a> |
-<a href="https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides"><b>Slides</b></a>
-</p>
+- **GPU + NUMA Dual Parallel**: Supports three computing modes: CPU-GPU hybrid decoding, CPU-GPU hybrid prefill, and GPU prefill
+- **VRAM + Memory Load Balancing**: Total model footprint = VRAM + memory, accommodating model 1+1=2, 100% VRAM utilization <sup>Note 1</sup>
+- **GPU Prefill Optimization**: GPU prefill runs in parallel with CPU-GPU hybrid decoding, achieving nearly 100% GPU utilization
+- **NUMA Thread Optimization**: Cross-node communication as low as 3%, L3 cache hit rate over 50%, GPU load can reach 33% to 50% during decoding  
 
-## News
-- [2026/07] 🔥 SGLang and Miles add day-0 support for Kimi K3 ([blog](https://lmsys.org/blog/2026-07-27-kimi-k3-day0-support/)).
-- [2026/07] RadixArk and Google bring full SGLang features to TPUs ([blog](https://lmsys.org/blog/2026-07-30-sglang-google-tpu/)).
-- [2026/07] Serving GLM5.2 NVFP4 agentic workloads with SGLang: Reaching 500 TPS in two weeks ([blog](https://lmsys.org/blog/2026-07-13-glm52-optimization/)).
-- [2026/06] 🔥 The next generation of speculative decoding: DFlash and Spec V2 ([blog](https://lmsys.org/blog/2026-06-15-next-generation-speculative-decoding-dflash-v2/)).
-- [2026/06] SGLang provides day-0 support for latest open models ([Nemotron 3 Ultra](https://lmsys.org/blog/2026-06-04-nvidia-run-nemotron-3-ultra/), [Nemotron 3 Super](https://lmsys.org/blog/2026-03-11-run-nvidia-nemotron-3-super/), [Higgs Audio v3 TTS](https://lmsys.org/blog/2026-06-04-higgs-audio-v3-tts/)).
-- [2026/04] 🔥 DeepSeek-V4 on Day 0: From Fast Inference to Verified RL with SGLang and Miles ([blog](https://lmsys.org/blog/2026-04-25-deepseek-v4/)).
-- [2026/02] 🔥 Unlocking 25x Inference Performance with SGLang on NVIDIA GB300 NVL72 ([blog](https://lmsys.org/blog/2026-02-20-gb300-inferencex/)).
-- [2026/01] SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2026-01-16-sglang-diffusion/)).
+## Relationship with sglang
 
-<details>
-<summary>More</summary>
+Lsglang uses the latest sglang source code and has redesigned and implemented the MOE model hybrid inference module, maintaining 100% full compatibility with sglang<sup>Note 1</sup>.
 
-- [2025/12] SGLang provides day-0 support for latest open models ([MiMo-V2-Flash](https://lmsys.org/blog/2025-12-16-mimo-v2-flash/), [Nemotron 3 Nano](https://lmsys.org/blog/2025-12-15-run-nvidia-nemotron-3-nano/), [Mistral Large 3](https://github.com/sgl-project/sglang/pull/14213), [LLaDA 2.0 Diffusion LLM](https://lmsys.org/blog/2025-12-19-diffusion-llm/), [MiniMax M2](https://lmsys.org/blog/2025-11-04-miminmax-m2/)).
-- [2025/11] SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2025-11-07-sglang-diffusion/)).
-- [2025/10] SGLang now runs natively on TPU with the SGLang-Jax backend ([blog](https://lmsys.org/blog/2025-10-29-sglang-jax/)).
-- [2025/10] PyTorch Conference 2025 SGLang Talk ([slide](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/sglang_pytorch_2025.pdf)).
-- [2025/10] SGLang x Nvidia SF Meetup on 10/2 ([recap](https://x.com/lmsysorg/status/1975339501934510231)).
-- [2025/09] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part II): 3.8x Prefill, 4.8x Decode Throughput ([blog](https://lmsys.org/blog/2025-09-25-gb200-part-2/)).
-- [2025/09] SGLang Day 0 Support for DeepSeek-V3.2 with Sparse Attention ([blog](https://lmsys.org/blog/2025-09-29-deepseek-V32/)).
-- [2025/08] SGLang x AMD SF Meetup on 8/22: Hands-on GPU workshop, tech talks by AMD/xAI/SGLang, and networking ([Roadmap](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_roadmap.pdf), [Large-scale EP](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_ep.pdf), [Highlights](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_highlights.pdf), [AITER/MoRI](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_aiter_mori.pdf), [Wave](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_wave.pdf)).
-- [2025/08] SGLang provides day-0 support for OpenAI gpt-oss model ([instructions](https://github.com/sgl-project/sglang/issues/8833))
-- [2025/06] SGLang, the high-performance serving infrastructure powering trillions of tokens daily, has been awarded the third batch of the Open Source AI Grant by a16z ([a16z blog](https://a16z.com/advancing-open-source-ai-through-benchmarks-and-bold-experimentation/)).
-- [2025/06] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part I): 2.7x Higher Decoding Throughput ([blog](https://lmsys.org/blog/2025-06-16-gb200-part-1/)).
-- [2025/05] Deploying DeepSeek with PD Disaggregation and Large-scale Expert Parallelism on 96 H100 GPUs ([blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/)).
-- [2025/03] Supercharge DeepSeek-R1 Inference on AMD Instinct MI300X ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1-Part2/README.html))
-- [2025/03] SGLang Joins PyTorch Ecosystem: Efficient LLM Serving Engine ([PyTorch blog](https://pytorch.org/blog/sglang-joins-pytorch/))
-- [2025/02] Unlock DeepSeek-R1 Inference Performance on AMD Instinct™ MI300X GPU ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1_Perf/README.html))
-- [2025/01] SGLang provides day one support for DeepSeek V3/R1 models on NVIDIA and AMD GPUs with DeepSeek-specific optimizations. ([instructions](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3), [AMD blog](https://www.amd.com/en/developer/resources/technical-articles/amd-instinct-gpus-power-deepseek-v3-revolutionizing-ai-development-with-sglang.html), [10+ other companies](https://x.com/lmsysorg/status/1887262321636221412))
-- [2024/12] v0.4 Release: Zero-Overhead Batch Scheduler, Cache-Aware Load Balancer, Faster Structured Outputs ([blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)).
-- [2024/10] The First SGLang Online Meetup ([slides](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#the-first-sglang-online-meetup)).
-- [2024/09] v0.3 Release: 7x Faster DeepSeek MLA, 1.5x Faster torch.compile, Multi-Image/Video LLaVA-OneVision ([blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)).
-- [2024/07] v0.2 Release: Faster Llama3 Serving with SGLang Runtime (vs. TensorRT-LLM, vLLM) ([blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/)).
-- [2024/02] SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
-- [2024/01] SGLang provides up to **5x faster inference** with RadixAttention ([blog](https://lmsys.org/blog/2024-01-17-sglang/)).
-- [2024/01] SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
+Note 1: x86 CPUs with AVX2+ instruction sets and Nvidia GPUs with sm80+ architectures
 
-</details>
+## Usage Guide [[中文]](./README_cn.md)
+- [Performance Benchmark](#performance-benchmark)
+- [Version Changes](#version-changes)
+- [Supported Models](#supported-models)
+- [Supported Quantization Formats](#supported-quantization-formats)
+- [Running Command Reference](#running-command-reference)
+- [Configuration Parameters](#configuration-parameters)
+- [Installation Steps](#installation-steps)
+- [Optimization](#optimization)
 
-## About
-SGLang is a high-performance serving framework for large language models and multimodal models.
-It is designed to deliver low-latency and high-throughput inference across a wide range of setups, from a single GPU to large distributed clusters.
-Its core features include:
+## Performance Benchmark
+Open GPU Prefill, max_num_batched_tokens=8192 (Row 1), max_num_batched_tokens=32768 (Row 2)
+| Model | Version | CPU | Memory | GPU | Prefill | Decode | Speculative Decoding |
+|-------|---------|-----|--------|-----|---------|--------|---------|
+| deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.4.7 | EPYC 7642 *2 | 16 channels ddr4 3200 | 5060Ti * 2 | 780 t/s [input 32768]| 25 t/s [input 32768]| 35~47 t/s |
+| deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.4.7 | EPYC 9684x *2 | 24 channels ddr5 4800 | pro 6000 * 1 | 4600 t/s [input 131072]| 75 t/s [input 131072]| 100~132 t/s |
 
-- **Fast Runtime**: Provides efficient serving with RadixAttention for prefix caching, a zero-overhead CPU scheduler, prefill-decode disaggregation, speculative decoding, continuous batching, paged attention, tensor/pipeline/expert/data parallelism, structured outputs, chunked prefill, quantization (FP4/FP8/INT4/AWQ/GPTQ), and multi-LoRA batching.
-- **Broad Model Support**: Supports a wide range of language models (Llama, Qwen, DeepSeek, Kimi, GLM, GPT, Gemma, Mistral, etc.), embedding models (e5-mistral, gte, mcdse), reward models (Skywork), and diffusion models (WAN, Qwen-Image), with easy extensibility for adding new models. Compatible with most Hugging Face models and OpenAI APIs.
-- **Extensive Hardware Support**: Runs on NVIDIA GPUs (GB200/B300/H100/A100/Spark/5090), AMD GPUs (MI355/MI300), Intel Xeon CPUs, Google TPUs, Ascend NPUs, and more.
-- **Active Community**: SGLang is open-source and supported by a vibrant community with widespread industry adoption, powering over 400,000 GPUs worldwide.
-- **RL & Post-Training Backbone**: SGLang is a proven rollout backend used for training many frontier models, with native RL integrations and adoption by well-known post-training frameworks such as [**AReaL**](https://github.com/inclusionAI/AReaL), [**Miles**](https://github.com/radixark/miles), [**slime**](https://github.com/THUDM/slime), [**Tunix**](https://github.com/google/tunix), [**verl**](https://github.com/volcengine/verl) and more.
+## Version Changes
+ 
+```bash
+2026-07-08: Lsglang-v1.4.1 - add ModelOpt W4A16 NVFP4 quantization types support, for example: nvidia/GLM-5.2-NVFP4
+2026-07-05: Lsglang-v1.4.0 - Optimize GPU prefill speed, CPU AVX512 optimization, removed LVLLM_GPU_RESIDENT_MOE_EXPERTS, update to sglang v0.5.14
+2026-06-05: Lsglang-v1.3.0 - Upgraded lk_moe module, supports nvfp4, mxfp4 quantization types, added LVLLM_GPU_RESIDENT_MOE_EXPERTS, removed LVLLM_MOE_USE_WEIGHT, LVLLM_MOE_QUANT_ON_GPU
+2026-04-06: Lsglang-v1.2.0 - Enhanced energy saving effect with LK_POWER_SAVING=1, supports mixed MOE layer inference with FP8+BF16+AWQ4bit
+2026-04-03: Lsglang-v1.1.4 - Supports local compilation of sgl-kernel to fix known issues
+2026-03-11: Lsglang-v1.1.3 - FP8 and AWQ4bit models no longer occupy additional memory when GPU Prefill is enabled, FP8 models removed TO_DTYPE runtime type conversion, KEEP temporarily does not support GPU Prefill
+                             Note 1: RTX 30 series GPUs can enable GPU Prefill for FP8 models by removing the LVLLM_GPU_RESIDENT_MOE_LAYERS parameter
+2026-03-05: Lsglang-v1.1.0 - Supports GPU prefill, updated corresponding commands (FP8 models not supported on RTX 3090 and below architectures)
+2026-02-25: Lsglang-v1.0.6 - Fixed known issues, added new model support  
+2026-02-10: Lsglang-v1.0.0 -  Ported from LvLLM project [https://github.com/guqiong96/Lvllm], verified BF16, F16 original models, FP8 original models, AWQ 4bit symmetric quantization models.
+ 
+```
+ 
+## Supported Models
 
-## Getting Started
-- [Install SGLang](https://docs.sglang.io/get_started/install.html)
-- [Quick Start](https://docs.sglang.io/basic_usage/send_request.html)
-- [Backend Tutorial](https://docs.sglang.io/basic_usage/openai_api_completions.html)
-- [Frontend Tutorial](https://docs.sglang.io/references/frontend/frontend_tutorial.html)
-- [Contribution Guide](https://docs.sglang.io/developer_guide/contribution_guide.html)
+Most original MOE models verified by Lsglang
+ 
+| Model Name | Status |
+|---------|------|
+| gemma-4-26B-A4B-it | ✅ Tested |
+| NVIDIA-Nemotron-3-Super-120B-A12B-BF16 | ✅ Tested |
+| Qwen3.6-35B-A3B | ✅ Tested |
+| Qwen3.5-35B-A3B | ✅ Tested |
+| Qwen3.5-122B-A10B | ✅ Tested |
+| Qwen3.5-397B-A17B | ✅ Tested |
+| Qwen3-Coder-Next | ✅ Tested |
+| Qwen3-Next-80B-A3B-Instruct | ✅ Tested |
+| Qwen3-Coder-30B-A3B-Instruct | ✅ Tested |
+| Qwen3-VL-30B-A3B-Instruct | ✅ Tested | 
+| MiniMax-M2.7 | ✅ Tested |
+| MiniMax-M2.5 | ✅ Tested |
+| MiniMax-M2.1 | ✅ Tested |
+| GLM-5.2-GLM-5.2-NVFP4 | ✅ Tested |
+| GLM-5.1-FP8 | ✅ Tested |
+| GLM-5.0-FP8 | ✅ Tested |
+| GLM-4.7 | ✅ Tested |
+| GLM-4.7-Flash  | ✅ Tested |
+| GLM-4.6V | ✅ Tested |
+| Kimi k2.6 | ✅ Tested |
+| Kimi k2.5 | ✅ Tested |
+| deepseek-ai/DeepSeek-V4-Flash-0731 | ✅ Tested [sm120]|
 
-## Benchmark and Performance
-Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/), [GB200 rack-scale parallelism](https://lmsys.org/blog/2025-09-25-gb200-part-2/), [GB300 long context](https://lmsys.org/blog/2026-02-19-gb300-longctx/).
+Unlisted original MOE models from Qwen3 series, GLM series, and MiniMax series are theoretically supported and pending actual testing.
 
-## Adoption and Sponsorship
-SGLang has been deployed at large scale, generating trillions of tokens in production each day. It is trusted and adopted by a wide range of leading enterprises and institutions, including xAI, NVIDIA, AMD, Intel, LinkedIn, Cursor, Oracle Cloud, Google Cloud, Microsoft Azure, AWS, Atlas Cloud, Voltage Park, Nebius, DataCrunch, Novita, RunPod, InnoMatrix, Modal, MIT, UCLA, the University of Washington, Stanford, UC Berkeley, Tsinghua University, Baseten, Baidu, AntGroup, Alibaba, Tencent, and other major technology organizations.
-As an open-source LLM inference engine, SGLang has become the de facto industry standard, with deployments running on over 400,000 GPUs worldwide.
-SGLang is currently hosted under the non-profit open-source organization [LMSYS](https://lmsys.org/about/).
 
-<img src="https://raw.githubusercontent.com/sgl-project/sgl-learning-materials/refs/heads/main/slides/adoption.png" alt="logo" width="800" margin="10px"></img>
 
-## Contact Us
-For enterprises interested in adopting or deploying SGLang at scale, including technical consulting, sponsorship opportunities, or partnership inquiries, please contact us at [sglang@lmsys.org](mailto:sglang@lmsys.org).
+## Supported Quantization Formats
 
-Long-term active SGLang contributors are eligible for coding agent sponsorship, such as Cursor, Claude Code, or OpenAI Codex. Email [sglang@lmsys.org](mailto:sglang@lmsys.org) with your most important commits or pull requests.
+| Model File | Runtime Format | 
+|---------|------------|
+| bfloat16 | bfloat16/float16| 
+| float16 | bfloat16/float16| 
+| fp8 model | fp8 | 
+| nvfp4 model | nvfp4 | 
+| mxfp4 model | mxfp4 | 
+| awq 4bit symmetric quantization model <sup>Note 1</sup>| w4a16 | 
 
-## Acknowledgment
-We learned the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
+Note 1: https://hf-mirror.com/cyankiwi provides AWQ 4bit symmetric quantization models
+ 
+## Running Command Reference
+ 
+```bash 
+
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 \
+OMP_NUM_THREADS=44 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_GPU_RESIDENT_MOE_LAYERS=0-1,33-34 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LVLLM_ENABLE_MOE_LAYERWISE_LOAD=1 \
+python -m sglang.launch_server \
+    --model /home/guqiong/Models/Qwen3.6-35B-A3B \
+    --served-model-name Qwen3.6-35B-A3B \
+    --host 0.0.0.0 \
+    --port 8070 \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --max-running-requests 2 \
+    --chunked-prefill-size 32000 \
+    --max-total-tokens 66000 \
+    --mem-fraction-static 0.90 \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --disable-shared-experts-fusion
+
+```
+### GLM-5.2-NVFP4 [RTX PRO 6000 * 2]
+```bash 
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+CUDA_VISIBLE_DEVICES=1,0 \
+SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=60 \
+OMP_NUM_THREADS=60 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=512 \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_GPU_RESIDENT_MOE_LAYERS=0-18 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+python -m sglang.launch_server \
+    --model /mnt/ktd/glm52 \
+    --served-model-name GLM-5.2-NVFP4 \
+    --host 0.0.0.0 \
+    --port 8070 \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --max-running-requests 2 \
+    --chunked-prefill-size 16384 \
+    --max-total-tokens 66000 \
+    --mem-fraction-static 0.95 \
+    --tool-call-parser glm47 \
+    --reasoning-parser glm45 \
+    --disable-shared-experts-fusion \
+    -cuda-graph-backend-prefill disabled \
+    --attention-backend triton
+
+# or use flashinfer
+    --attention-backend flashinfer
+
+```
+
+
+
+### GLM-5.2-NVFP4 [RTX 3090 * 2]
+```bash 
+
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=48 \
+OMP_NUM_THREADS=48 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+python -m sglang.launch_server \
+    --model /home/guqiong/Models/GLM-5.2-NVFP4 \
+    --served-model-name GLM-5.2-NVFP4 \
+    --host 0.0.0.0 \
+    --port 8070 \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --max-running-requests 2 \
+    --chunked-prefill-size 256 \
+    --max-total-tokens 8192 \
+    --mem-fraction-static 0.98 \
+    --kv-cache-dtype bfloat16 \
+    --attention-backend triton \
+    --moe-runner-backend marlin \
+    --cuda-graph-backend-prefill disabled \
+    --disable-shared-experts-fusion \
+    --tool-call-parser glm47 \
+    --reasoning-parser glm45
+
+# or use flashinfer
+    --attention-backend flashinfer
+
+```
+
+
+## Configuration Parameters
+
+| Environment Variable | Type | Default Value | Description | Remarks |
+|--------|------|--------|------|------|
+| `LVLLM_MOE_NUMA_ENABLED` | Core Parameter | `0` | Enable hybrid inference: `1`-enable, `0`-disable | Set to `0` to disable hybrid inference, behavior same as vLLM |
+| `LK_THREAD_BINDING` | Performance Parameter | `CPU_CORE` | Thread binding strategy: `CPU_CORE`-bind by CPU core, `NUMA_NODE`-bind by NUMA node | Default bind by CPU core, try NUMA node binding when encountering performance issues |
+| `LK_THREADS` | Performance Parameter | - | Thread count: (total physical cores) ÷ number of GPUs | Hyper-Threading disabled: (total physical cores - 2) ÷ number of GPUs |
+| `OMP_NUM_THREADS` | Performance Parameter | - | OpenMP thread count: set to same as `LK_THREADS` |   | 
+| `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU Parameter | None | MOE expert layers resident on GPU: `0`-layer 0, `0-1`-layers 0 to 1, `0,9`-layers 0 and 9 | After reserving KV Cache VRAM, allocating multiple layers improves performance and reduces corresponding memory usage |
+| `LVLLM_GPU_RESIDENT_MOE_LAYERS_DSPARK` | GPU Parameter | None | DSpark draft model on GPU: `0-2`-layers 0 to 2| Used to accelerate speculative decoding |
+| `LVLLM_GPU_PREFETCH_WINDOW` | GPU Prefill Parameter | None | Prefetch window size: `1`-prefetch 1 layer of MOE experts | Typically prefetch 1 layer |
+| `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU Prefill Parameter | None | Minimum input length for GPU prefill: `4096`-GPU prefill starts when input length reaches this value | Should not be set too small, set to 0 to disable GPU prefill |
+| `LK_POWER_SAVING` | CPU Power Saving | 0 | `1`: enable CPU power saving mode, `0`: disable | Recommended: `0` |
+| `LVLLM_ENABLE_NUMA_INTERLEAVE` | Performance Parameter | 1 | `1`: avoid numa node OOM | Recommended: `1` for large MoE models |
+
+## Installation Steps
+
+### 1. Install CUDA 13.2.1
+
+```bash
+# Uninstall old CUDA and NVIDIA driver
+sudo /usr/local/cuda/bin/cuda-uninstaller   
+sudo nvidia-uninstall
+
+# Download and install CUDA 13.2.1 
+wget https://developer.download.nvidia.com/compute/cuda/13.2.1/local_installers/cuda_13.2.1_595.58.03_linux.run
+sudo sh cuda_13.2.1_595.58.03_linux.run
+```
+
+### 2. Create Python Environment
+
+```bash
+conda create -n Lsglang python==3.12.11
+conda activate Lsglang
+  
+# Upgrade libstdcxx-ng (avoid glibcxx version issues)
+conda install -c conda-forge libstdcxx-ng
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+
+# Install NUMA library
+sudo apt-get install libnuma-dev      # Ubuntu
+sudo dnf install numactl-devel        # Rocky Linux
+```
+
+### 3. Install Lsglang
+
+```bash
+pip install lsglang
+```
+ 
+## Compile from Source and Install Lsglang
+
+```bash
+# 克隆仓库
+git clone https://github.com/guqiong96/Lsglang.git
+cd Lsglang
+pip install -U setuptools wheel scikit-build-core cmake
+pip install torchaudio triton torchvision torch==2.13.0
+pip install grpcio-tools 
+pip install wheel-stub
+MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release  CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e "python" --no-build-isolation -vvv
+```
+
+**Parameter Explanation:**
+- `MAX_JOBS=32 NVCC_THREADS=1`: Reduce compilation memory usage
+- `CMAKE_BUILD_TYPE=Release`: Performance optimization option
+- `CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release`: Performance optimization option
+ 
+
+
+## Optimization
+
+### MoE Resident in VRAM, Linear Increase in Decode and Prefill Speed
+```bash
+# MoE layers 0-5 resident in VRAM
+# Format 0,1,8-9 means MoE layers 0,1,8-9 resident in VRAM
+# Some models start at non-zero layer numbers, e.g., Step-3.5-Flash starts at layer 3 
+LVLLM_GPU_RESIDENT_MOE_LAYERS=0-5 
+``` 
+
+### Enable GPU Prefill
+```bash
+# Prefetch 1 layer
+LVLLM_GPU_PREFETCH_WINDOW=1
+# GPU prefill starts when input length reaches 4096
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=4096 
+#配合修改最大批处理大小
+--chunked-prefill-size 32000 
+``` 
+
+### Disable GPU Prefill
+```bash
+# Disable GPU prefill
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0
+#配合修改最大批处理大小
+--chunked-prefill-size 4096 
+``` 
+
+### Thread Binding to CPU Cores
+```bash
+# Bind to CPU cores (including hyper-threading logical cores), best performance
+LK_THREAD_BINDING=CPU_CORE 
+# Bind to NUMA nodes, second best option, resolves extreme performance issues on virtualization platforms and multi-instance running
+LK_THREAD_BINDING=NUMA_NODE 
+``` 
+### BIOS NUMA Settings
+```bash
+AMD EPYC: Set NPS4 for best performance
+Intel XEON: Set SNC4 for best performance
+# Some virtualization platforms or Intel platforms should not set 5 or 10 nodes, set 2 nodes to avoid performance issues
+Generally: 2, 4, 8 nodes, supports up to 32 nodes, more nodes is better, node count as multiple of GPU count for best performance 
+```
+
+### Thread Count Settings
+```bash
+# Hyper-Threading enabled: total physical cores ÷ number of GPUs
+# Hyper-Threading disabled: (total physical cores - 2) ÷ number of GPUs
+# 96 cores, 2 GPUs → 48 threads per GPU
+LK_THREADS=48
+# Total threads exceeding physical core count may cause performance issues    
+```
+
+### VRAM Settings
+```bash 
+# Maximum batch size occupies significant VRAM, adjust accordingly
+--chunked-prefill-size 32000  
+```
+### CPU Power Saving
+```bash
+# When enabled, reduces CPU temperature during inference with slight performance decrease
+LK_POWER_SAVING=1 
+```

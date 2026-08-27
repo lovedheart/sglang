@@ -249,6 +249,16 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.enable_tp = enable_tp
         self.use_attn_tp_group = use_attn_tp_group
+        from sglang.srt.utils.common import is_lk_embedding_cpu_enabled
+        self.is_lk_embedding = (
+            is_lk_embedding_cpu_enabled() 
+            and "lm_head" not in prefix
+            and "visual" not in prefix
+            and num_embeddings * embedding_dim > 1_000_000_000  # TO_DO:
+        )
+        self.is_gpu_resident_layer = not self.is_lk_embedding
+        self.lk_embeder = None
+        self.lk_output_gpu = None
         if self.enable_tp:
             if use_attn_tp_group:
                 tp_rank = get_parallel().attn_tp_rank
@@ -534,6 +544,30 @@ class VocabParallelEmbedding(torch.nn.Module):
         the caller's all-reduce can use it; the mask temporaries and the
         in-place fill deliberately stay outside the pool.
         """
+        if self.is_lk_embedding and self.lk_embeder is not None:
+            # lk path: gather via lk_moe into a pre-allocated fixed GPU buffer
+            # (not symmetric memory), so decode CUDA graph capture works.
+            if self.tp_size > 1:
+                masked_input, input_mask = get_masked_input_and_mask(
+                    input_,
+                    self.shard_indices.org_vocab_start_index,
+                    self.shard_indices.org_vocab_end_index,
+                    self.shard_indices.num_org_vocab_padding,
+                    self.shard_indices.added_vocab_start_index,
+                    self.shard_indices.added_vocab_end_index,
+                )
+                output_parallel = self.quant_method.embedding(
+                    self, masked_input.long()
+                )
+                if self.output_dtype is not None:
+                    output_parallel = output_parallel.to(self.output_dtype)
+                output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+            else:
+                output_parallel = self.quant_method.embedding(self, input_.long())
+                if self.output_dtype is not None:
+                    output_parallel = output_parallel.to(self.output_dtype)
+            return output_parallel
+
         symm_alloc = use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         )

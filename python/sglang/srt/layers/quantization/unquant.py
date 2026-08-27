@@ -276,11 +276,21 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         **extra_weight_attrs,
     ):
         """Create weights for embedding layer."""
+        # lk embedding tables (e.g. the huge n-gram oe_embeder) are kept
+        # resident on CPU / NUMA host memory and gathered via lk_moe, so
+        # allocate them on CPU instead of the (GPU) target_device context.
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        device = torch.cuda.current_device()
+        if getattr(layer, "is_lk_embedding", False):
+            device = "cpu"
+            layer.is_gpu_resident_layer = False
+
         weight = Parameter(
             torch.empty(
                 sum(output_partition_sizes),
                 input_size_per_partition,
                 dtype=params_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -296,7 +306,85 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         return F.linear(x, layer.weight, bias)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not getattr(layer, "is_lk_embedding", False):
+            return
+        
+        if layer.lk_embeder is not None:
+            return
+        
+        if layer.lk_output_gpu is None:
+            from sglang.srt.runtime_context import get_parallel
+            parallel = get_parallel()
+            
+            max_running_requests = getattr(parallel, 'max_running_requests', 256)
+            chunked_prefill_size = getattr(parallel, 'chunked_prefill_size', 2048)
+            max_tokens = max(chunked_prefill_size, max_running_requests)
+            
+            layer.lk_output_gpu = torch.empty(
+                [max_tokens, layer.embedding_dim],
+                dtype=torch.bfloat16,
+                device='cuda',
+            ).contiguous()
+        
+        import lk_moe
+        from sglang.srt.runtime_context import get_parallel
+        parallel = get_parallel()
+        
+        if layer.use_attn_tp_group:
+            num_processes = parallel.attn_tp_size
+            process_id = parallel.attn_tp_rank
+        else:
+            num_processes = parallel.tp_size
+            process_id = parallel.tp_rank
+
+        
+        cfg = lk_moe.EmbeddingConfigV2()
+        cfg.num_processes = num_processes
+        cfg.process_id = process_id
+        cfg.gpu_id = torch.cuda.current_device()
+        cfg.num_embeddings = layer.num_embeddings_per_partition
+        cfg.embedding_dim = layer.embedding_dim
+        cfg.max_batch_size = layer.lk_output_gpu.shape[0]
+        
+        weight = layer.weight
+        layer.lk_embeder = lk_moe.LKEmbedding(
+            cfg, weight.detach().cpu().contiguous().data_ptr()
+        )
+        layer.lk_embeder.register_numa_weights()
+
+    def clean_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not getattr(layer, "is_lk_embedding", False):
+            return
+        if layer.lk_embeder is None:
+            return
+        if hasattr(layer, "weight"):
+            del layer.weight
+
+    def _embedding_lk(
+        self, layer: torch.nn.Module, input_: torch.Tensor
+    ) -> torch.Tensor:
+        """Gather via lk_moe LKEmbedding (CPU-resident table, graph-capturable).
+        ``input_`` holds GPU token ids masked to the local shard. Output goes to
+        a pre-allocated fixed GPU buffer so the decode CUDA graph can capture
+        the D2H / host-function / H2D sequence.
+        """
+        input_c = input_.contiguous()
+        qlen = input_c.numel()
+        layer.lk_embeder.decode(
+            torch.cuda.current_stream().cuda_stream,
+            qlen,
+            input_c.data_ptr(),
+            layer.lk_output_gpu.data_ptr(),
+        )
+        # input_ is [n_grams, seq_len] (2D); restore the same leading shape.
+        return layer.lk_output_gpu[:qlen].view(*input_.shape, -1)
+
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        if getattr(layer, "is_lk_embedding", False) and getattr(
+            layer, "lk_embeder", None
+        ) is not None:
+            return self._embedding_lk(layer, input_)
         return F.embedding(input_, layer.weight)
 
 
@@ -538,6 +626,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        device = torch.cuda.current_device()
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            device = "cpu"
         self.with_bias = with_bias
 
         # XPU only: the sgl-kernel-xpu grouped GEMM honours the weights' row
@@ -560,7 +652,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
         else:
             w13_weight_data = torch.empty(
-                num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype
+                num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype, device=device
             )
         w13_weight = torch.nn.Parameter(w13_weight_data, requires_grad=False)
         layer.register_parameter("w13_weight", w13_weight)
@@ -568,7 +660,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
         if self.with_bias:
             w13_weight_bias = torch.nn.Parameter(
-                torch.empty(num_experts, w13_up_dim, dtype=torch.float32),
+                torch.empty(num_experts, w13_up_dim, dtype=torch.float32, device=device),
                 requires_grad=False,
             )
             layer.register_parameter("w13_weight_bias", w13_weight_bias)
@@ -587,7 +679,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
         else:
             w2_weight_data = torch.empty(
-                num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype
+                num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype, device=device
             )
         w2_weight = torch.nn.Parameter(w2_weight_data, requires_grad=False)
         layer.register_parameter("w2_weight", w2_weight)
@@ -595,13 +687,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
         if self.with_bias:
             w2_weight_bias = torch.nn.Parameter(
-                torch.empty(num_experts, hidden_size, dtype=torch.float32),
+                torch.empty(num_experts, hidden_size, dtype=torch.float32, device=device),
                 requires_grad=False,
             )
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            return None
         _should_use_aiter_moe = (
             _use_aiter
             and (
