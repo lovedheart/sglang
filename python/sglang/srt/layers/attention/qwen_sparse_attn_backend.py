@@ -1493,10 +1493,13 @@ class QwenSparseAttnBackend(AttentionBackend):
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+        # fp8 KV buffers carry implicit scale 1.0; widening back to the
+        # compute dtype is lossless for the gathered rows and keeps the
+        # Triton kernel single-dtype (tl.dot cannot mix bf16 q with fp8 k).
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
-            torch.cat(k_parts),
-            torch.cat(v_parts),
+            torch.cat(k_parts).to(q.dtype),
+            torch.cat(v_parts).to(q.dtype),
             topk_indices,
             cu_seqlens_q,
             cu_seqlens_k,
