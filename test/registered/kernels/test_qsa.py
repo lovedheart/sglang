@@ -1682,9 +1682,10 @@ def test_qsa_fp8_compressed_decode_matches_bf16_selection():
     assert time.time() - begin < 60
 
 
-def test_qsa_compressed_pool_fp8_roundtrip(monkeypatch):
-    """Under the FP8 flag the compressed cache is fp8, roundtrips within the
-    e4m3 grid, keeps idle slots zero, and allocates no BF16 twin."""
+def test_qsa_compressed_pool_stays_bf16_under_fp8_flag(monkeypatch):
+    """The compressed pool keeps BF16 keys even under the FP8 flag: a
+    gathered fp8 decode is slower than the TileLang BF16 paged path, so the
+    flag only affects scoring call sites (prefill casts on the fly)."""
     monkeypatch.setenv("SGLANG_QWEN_DSA_USE_FP8_INDEXER", "1")
     pool = QSATokenToKVPool(
         size=128,
@@ -1703,19 +1704,15 @@ def test_qsa_compressed_pool_fp8_roundtrip(monkeypatch):
         enable_memory_saver=False,
         start_layer=0,
     )
-    assert pool.qsa_use_fp8_indexer
     buffer = pool.get_qsa_compressed_k_buffer(0)
-    assert buffer.dtype == torch.float8_e4m3fn
-    assert pool.qsa_compressed_flat.numel() == 0
+    assert buffer.dtype == torch.bfloat16
+    assert pool.qsa_compressed_flat.numel() > 0
 
-    # e4m3 grid: values <=32 keep abs error <= 1.0 (arange/16 <= 31.9).
     rows = torch.arange(4 * 128, dtype=torch.bfloat16).reshape(4, 1, 128) / 16
     loc = torch.tensor([5, 6, 9, 10], dtype=torch.int32)
     pool.set_qsa_compressed_k_buffer(0, loc, rows)
-    # e4m3 grid: values <=32 keep abs error <= 1.0
-    torch.testing.assert_close(
-        buffer[loc.long()].float(), rows.float(), rtol=0, atol=1.0
-    )
+    # BF16 storage: the roundtrip is bit-exact, no e4m3 grid loss.
+    torch.testing.assert_close(buffer[loc.long()], rows, rtol=0, atol=0)
     idle = buffer[[0, 1, 2, 3, 4, 7, 8, 11]]
     assert not bool(idle.float().any())
 
