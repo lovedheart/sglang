@@ -6,7 +6,7 @@ removed. Torch implementations are kept as the only fallback and reference.
 """
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -24,6 +24,14 @@ except ImportError:
     tilelang = None
     T = None
     HAS_TILELANG = False
+
+try:
+    import deep_gemm
+
+    HAS_DEEPGEMM = True
+except ImportError:
+    deep_gemm = None
+    HAS_DEEPGEMM = False
 
 
 def _validate_q(q: torch.Tensor) -> None:
@@ -107,6 +115,138 @@ def torch_qsa_mqa_decode(
     copy_len = min(total, max_model_len)
     if copy_len:
         logits[:, :copy_len] = scores[:, :copy_len]
+    return logits
+
+
+# DeepGEMM's SM120 packed fp8 MQA kernel requires a head count in
+# {8, 16, 32, 64}; the weight-free scorer zeroes the padded query heads'
+# weights so they contribute nothing.
+_DEEPGEMM_ALLOWED_HEADS = (8, 16, 32, 64)
+
+
+def _require_deepgemm() -> None:
+    if not HAS_DEEPGEMM:
+        raise RuntimeError(
+            "SGLANG_QWEN_DSA_USE_FP8_INDEXER requires the deep_gemm package "
+            "(with SM120 fp8 MQA-logits kernels); install deep_gemm or unset "
+            "the flag to keep the BF16 indexer."
+        )
+
+
+def _qsa_fp8_query(
+    q: torch.Tensor, score_scale: Optional[float] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """[rows, heads, dim] bf16 -> padded fp8 q + per-head scorer weights.
+
+    The torch scorer computes ``sum_h relu(q_h . k) / score_scale``; DeepGEMM
+    applies per-head weights instead, so real heads weigh ``1/score_scale``
+    and padded heads weigh zero.
+    """
+
+    _require_deepgemm()
+    rows, heads, head_dim = q.shape
+    padded_heads = next((h for h in _DEEPGEMM_ALLOWED_HEADS if h >= heads), None)
+    if padded_heads is None:
+        raise ValueError(f"QSA fp8 MQA cannot pad {heads} query heads")
+    q_fp8 = q
+    if padded_heads != heads:
+        q_fp8 = torch.nn.functional.pad(q, (0, 0, 0, padded_heads - heads))
+    weights = q.new_zeros((rows, padded_heads), dtype=torch.float32)
+    weights[:, :heads] = 1.0 / (score_scale or math.sqrt(head_dim))
+    return q_fp8.to(torch.float8_e4m3fn).contiguous(), weights
+
+
+def deepgemm_qsa_mqa_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    score_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """FP8 packed prefill scores on fp8_e4m3 keys via DeepGEMM.
+
+    Column semantics match ``torch_qsa_mqa_prefill`` (column n is key n,
+    ``row_starts``-relative absolute numbering); out-of-window columns are
+    kernel scratch and must never reach a consumer -- top-k masks by the same
+    ``row_starts``/``row_ends`` windows.
+    """
+
+    _require_deepgemm()
+    _validate_q(q)
+    _validate_k(k)
+    if q.shape[-1] != k.shape[-1]:
+        raise ValueError("QSA query and key head dimensions must match")
+    keys = k.shape[0]
+    k_fp8 = k.reshape(keys, k.shape[-1])
+    # RMS-normalized keys keep the constant unit scale DeepGEMM expects.
+    k_scale = torch.ones(keys, dtype=torch.float32, device=q.device)
+    q_fp8, weights = _qsa_fp8_query(q, score_scale)
+    return deep_gemm.fp8_mqa_logits(
+        q_fp8,
+        (k_fp8, k_scale),
+        weights,
+        row_starts.to(torch.int32),
+        row_ends.to(torch.int32),
+    )
+
+
+def deepgemm_qsa_mqa_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    score_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """FP8 paged decode scores via gather + the packed fp8 kernel.
+
+    The SM120 *paged* kernel hard-requires ``block_kv == 64`` while the
+    compressed cache's pages are compress-ratio shrunken, so decode gathers
+    each row's page table into one flat fp8 slab and feeds the packed kernel
+    with ``ks = row * total``/``ke = ks + context_len`` plus
+    ``max_seqlen_k = total``.  That compact mode returns ``[rows, total]``
+    logits whose column j is row-relative key j -- exactly the layout the
+    paged torch reference exposes (beyond ``context_lens`` is scratch).
+    Rows are processed in blocks to bound the gathered slab.
+    """
+
+    _require_deepgemm()
+    _validate_decode_inputs(q, k_cache, page_table, context_lens)
+    rows, heads, head_dim = q.shape
+    pages, page_size, _, _ = k_cache.shape
+    total = page_table.shape[1] * page_size
+    if total == 0:
+        return torch.full((rows, 0), -float("inf"), dtype=torch.float32, device=q.device)
+    q_fp8, weights = _qsa_fp8_query(q, score_scale)
+    cache_flat = k_cache.reshape(-1, head_dim)
+    context = context_lens.to(torch.int32).reshape(-1)
+    offsets = torch.arange(page_size, dtype=torch.int64, device=q.device)
+    logits = q.new_zeros((rows, total), dtype=torch.float32)
+    # Bound the gathered slab (~128 MiB): each row materializes ``total``
+    # fp8 keys, so long contexts shrink the rows scored per kernel call.
+    block = max(1, min(rows, (128 << 20) // max(total * head_dim, 1)))
+    for row_begin in range(0, rows, block):
+        row_end = min(row_begin + block, rows)
+        slots = (
+            page_table[row_begin:row_end]
+            .to(torch.int64)
+            .clamp_min(0)[:, :, None]
+            * page_size
+            + offsets
+        ).reshape(row_end - row_begin, total)
+        slab = cache_flat.index_select(0, slots.reshape(-1))
+        k_scale = torch.ones(slab.shape[0], dtype=torch.float32, device=q.device)
+        row_starts = (
+            torch.arange(row_end - row_begin, dtype=torch.int32, device=q.device)
+            * total
+        )
+        logits[row_begin:row_end] = deep_gemm.fp8_mqa_logits(
+            q_fp8[row_begin:row_end],
+            (slab, k_scale),
+            weights[row_begin:row_end],
+            row_starts,
+            row_starts + context[row_begin:row_end],
+            max_seqlen_k=total,
+        )
     return logits
 
 
@@ -393,6 +533,8 @@ def qsa_mqa_prefill(
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
+    if k.dtype == torch.float8_e4m3fn:
+        return deepgemm_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
@@ -406,6 +548,10 @@ def qsa_mqa_decode(
     max_model_len: int,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
+    if k_cache.dtype == torch.float8_e4m3fn:
+        return deepgemm_qsa_mqa_decode(
+            q, k_cache, page_table, context_lens, score_scale
+        )
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
             q, k_cache, page_table, context_lens, max_model_len, score_scale
@@ -419,6 +565,8 @@ __all__ = [
     "HAS_TILELANG",
     "qsa_mqa_decode",
     "qsa_mqa_prefill",
+    "deepgemm_qsa_mqa_decode",
+    "deepgemm_qsa_mqa_prefill",
     "tilelang_qsa_mqa_decode",
     "tilelang_qsa_mqa_prefill",
     "torch_qsa_mqa_decode",
