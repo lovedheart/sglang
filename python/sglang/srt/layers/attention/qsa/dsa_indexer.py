@@ -7,9 +7,12 @@ primitive.  A tokenwise profile has ``compress_ratio = 1`` and
 ``block_topk = budget = 2048``; it never consumes the compressed-only MQA
 inputs (``get_prefill_mqa_inputs``/``get_decode_mqa_inputs``).
 
-Only the BF16 torch reference compute is ported.  The qsa_0511 FP8
-(deep_gemm) and TileLang MQA fast paths are deliberately out of scope here:
-requesting them fails loudly instead of silently degrading.
+The BF16 torch reference compute (``torch_dsa_weighted_mqa_logits``) is the
+correctness oracle.  Under ``SGLANG_QWEN_DSA_USE_FP8_INDEXER`` the scoring
+fast paths are wired to DeepGEMM: fp8_mqa_logits for packed prefill and
+fp8_paged_mqa_logits for paged decode/verify.  The TileLang MQA fast path
+remains out of scope: requesting it fails loudly instead of silently
+degrading.
 """
 
 from __future__ import annotations
@@ -100,9 +103,9 @@ class QwenDSAIndexer(MultiPlatformOp):
             )
         self.use_fp8_indexer = envs.SGLANG_QWEN_DSA_USE_FP8_INDEXER.get()
         if self.use_fp8_indexer:
-            # DeepGEMM fast path for the packed prefill scoring only; paged
-            # modes (decode/verify) keep the BF16 reference until the paged
-            # kernel is wired as well.
+            # DeepGEMM fast path for both scoring modes: packed prefill via
+            # fp8_mqa_logits, paged modes (decode/verify) via
+            # fp8_paged_mqa_logits over the fused page layout.
             try:
                 import deep_gemm  # noqa: F401
             except ImportError as exc:  # fail loudly, never degrade
@@ -111,8 +114,9 @@ class QwenDSAIndexer(MultiPlatformOp):
                     f"package (with SM120 MQA logits): {exc}"
                 ) from exc
             logger.info(
-                "QwenDSAIndexer layer %s: FP8 prefill indexer enabled "
-                "(DeepGEMM fp8_mqa_logits); decode stays on BF16.",
+                "QwenDSAIndexer layer %s: FP8 indexer enabled "
+                "(DeepGEMM fp8_mqa_logits prefill + fp8_paged_mqa_logits "
+                "decode).",
                 layer_id,
             )
         self.qsa_profile = profile
