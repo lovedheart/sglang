@@ -317,9 +317,12 @@ class Envs:
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
 
-    # Select the FP8 (deep_gemm) tokenwise QSA indexer scoring: fp8_mqa_logits
-    # for packed prefill, fp8_paged_mqa_logits for paged decode/verify.
-    # Requires DeepGEMM with SM120 MQA logits; fails loudly when unavailable.
+    # Select the FP8 (deep_gemm) QSA indexer scoring for both indexer variants:
+    # the tokenwise QwenDSAIndexer (fp8_mqa_logits prefill + fp8_paged_mqa_logits
+    # decode) and the compressed QSAIndexer (fp8_mqa_logits on FP8 compressed
+    # keys, packed prefill and gathered decode).  Requires DeepGEMM with SM120
+    # MQA logits; fails loudly when unavailable.  Unset keeps today's behavior:
+    # both indexer variants score in BF16 (torch/TileLang).
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
