@@ -85,12 +85,14 @@ class QSAIndexer(MultiPlatformOp):
             self.index_head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
         self._rope_axis_map_cache = None
-        # FP8 scoring (DeepGEMM fp8_mqa_logits) for BOTH indexer variants is
-        # opt-in via SGLANG_QWEN_DSA_USE_FP8_INDEXER.  When set, the pool
-        # stores compressed keys as fp8_e4m3 (see QSATokenToKVPool) and the
-        # dtype-dispatching MQA entry points route to DeepGEMM; the fused
-        # BF16 compress-store kernel is bypassed because it cannot write the
-        # fp8 layout.  Fail loudly here if deep_gemm is missing.
+        # FP8 scoring (DeepGEMM fp8_mqa_logits) under
+        # SGLANG_QWEN_DSA_USE_FP8_INDEXER covers the PACKED PREFILL only for
+        # this compressed indexer: keys stay BF16 in the pool and are cast to
+        # fp8 at the scoring call site (select_prefill_tokens).  Decode stays
+        # the TileLang paged BF16 path -- the SM120 paged FP8 kernel requires
+        # block_kv 64 while compressed pages are ratio-shrunken, so a gathered
+        # fp8 decode is far slower than BF16 paged scoring.  Fail loudly here
+        # if deep_gemm is missing.
         from sglang.srt.environ import envs
 
         self.use_fp8_indexer = envs.SGLANG_QWEN_DSA_USE_FP8_INDEXER.get()
@@ -100,8 +102,8 @@ class QSAIndexer(MultiPlatformOp):
             _require_deepgemm()
             logger.info(
                 "QSAIndexer layer %s: FP8 indexer enabled (DeepGEMM "
-                "fp8_mqa_logits for packed prefill and gather-packed decode; "
-                "compressed keys stored as fp8_e4m3).",
+                "fp8_mqa_logits packed prefill on call-site-cast fp8 keys; "
+                "decode stays BF16 paged).",
                 layer_id,
             )
 
@@ -240,11 +242,6 @@ class QSAIndexer(MultiPlatformOp):
         return self.apply_rope(block_positions, normalized)
 
     def _use_fused_compress(self, pool) -> bool:
-        # The fused store kernel writes BF16 compressed keys; under the FP8
-        # indexer the eager path normalizes in torch and the pool's
-        # set_qsa_compressed_k_buffer quantizes on write instead.
-        if getattr(self, "use_fp8_indexer", False):
-            return False
         return (
             getattr(pool, "qsa_rope_position_buffer", None) is not None
             and self._use_fused_prep(pool.get_qsa_key_state_buffer(self.layer_id))
@@ -482,6 +479,15 @@ class QSAIndexer(MultiPlatformOp):
         row_chunk_size = _qsa_prefill_row_chunk_size(
             rows, compressed_keys.shape[0], q.shape[1]
         )
+        if (
+            getattr(self, "use_fp8_indexer", False)
+            and compressed_keys.shape[0]
+            and q.is_cuda
+        ):
+            # The pool keeps BF16 compressed keys; cast the whole (once per
+            # forward, shared across row chunks) slab so the dtype dispatch in
+            # qsa_mqa_prefill routes to the DeepGEMM packed fp8 kernel.
+            compressed_keys = compressed_keys.to(torch.float8_e4m3fn)
         for row_start in range(0, rows, row_chunk_size):
             row_end = min(row_start + row_chunk_size, rows)
             chunk_slice = slice(row_start, row_end)
