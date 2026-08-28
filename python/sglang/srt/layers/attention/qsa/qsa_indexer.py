@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Tuple
 
 import torch
@@ -22,6 +23,8 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+
+logger = logging.getLogger(__name__)
 
 
 # Bound the dominant FP32 [query_rows, compressed_keys] prefill workspace.
@@ -82,6 +85,25 @@ class QSAIndexer(MultiPlatformOp):
             self.index_head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
         self._rope_axis_map_cache = None
+        # FP8 scoring (DeepGEMM fp8_mqa_logits) for BOTH indexer variants is
+        # opt-in via SGLANG_QWEN_DSA_USE_FP8_INDEXER.  When set, the pool
+        # stores compressed keys as fp8_e4m3 (see QSATokenToKVPool) and the
+        # dtype-dispatching MQA entry points route to DeepGEMM; the fused
+        # BF16 compress-store kernel is bypassed because it cannot write the
+        # fp8 layout.  Fail loudly here if deep_gemm is missing.
+        from sglang.srt.environ import envs
+
+        self.use_fp8_indexer = envs.SGLANG_QWEN_DSA_USE_FP8_INDEXER.get()
+        if self.use_fp8_indexer:
+            from sglang.srt.layers.attention.qsa.mqa import _require_deepgemm
+
+            _require_deepgemm()
+            logger.info(
+                "QSAIndexer layer %s: FP8 indexer enabled (DeepGEMM "
+                "fp8_mqa_logits for packed prefill and gather-packed decode; "
+                "compressed keys stored as fp8_e4m3).",
+                layer_id,
+            )
 
     @staticmethod
     def _validate_config(config) -> None:
@@ -218,6 +240,11 @@ class QSAIndexer(MultiPlatformOp):
         return self.apply_rope(block_positions, normalized)
 
     def _use_fused_compress(self, pool) -> bool:
+        # The fused store kernel writes BF16 compressed keys; under the FP8
+        # indexer the eager path normalizes in torch and the pool's
+        # set_qsa_compressed_k_buffer quantizes on write instead.
+        if getattr(self, "use_fp8_indexer", False):
+            return False
         return (
             getattr(pool, "qsa_rope_position_buffer", None) is not None
             and self._use_fused_prep(pool.get_qsa_key_state_buffer(self.layer_id))
