@@ -1566,6 +1566,160 @@ def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
     torch.testing.assert_close(actual, expected)
 
 
+def _fp8_selection_overlap(fp8_logits, bf16_logits, starts, ends, topk):
+    """Fraction of identical top-k block selections inside each window."""
+    columns = torch.arange(bf16_logits.shape[1], device=bf16_logits.device)
+    columns = columns.unsqueeze(0)
+    valid = (columns >= starts[:, None]) & (columns < ends[:, None])
+    hits = total = 0
+    for row in range(bf16_logits.shape[0]):
+        window = torch.nonzero(valid[row]).flatten()
+        k = min(topk, window.numel())
+        if k == 0:
+            continue
+        fp8_pick = window[fp8_logits[row, window].topk(k).indices]
+        bf16_pick = window[bf16_logits[row, window].topk(k).indices]
+        hits += len(set(fp8_pick.tolist()) & set(bf16_pick.tolist()))
+        total += k
+    return hits / max(total, 1)
+
+
+def test_qsa_fp8_compressed_prefill_matches_bf16_selection():
+    """DeepGEMM fp8 prefill must pick the same blocks as the BF16 scorer."""
+    import time
+
+    if not torch.cuda.is_available():
+        return
+    from sglang.srt.layers.attention.qsa import mqa as mqa_module
+
+    if not mqa_module.HAS_DEEPGEMM:
+        return
+    begin = time.time()
+    torch.manual_seed(3)
+    rows, keys, heads, head_dim = 16, 576, 4, 128
+    q = torch.randn(rows, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    q = (q / q.norm(dim=-1, keepdim=True)).bfloat16()
+    k = torch.randn(keys, 1, head_dim, dtype=torch.bfloat16, device="cuda")
+    k = (k / k.norm(dim=-1, keepdim=True)).bfloat16()
+    starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    ends = torch.full((rows,), keys, dtype=torch.int32, device="cuda")
+
+    # Honest comparison: BF16 keys vs the fp8-quantized same keys through
+    # the dispatching entry point; the gap is pure e4m3 noise.
+    bf16_logits = qsa_mqa_prefill(q, k, starts, ends)
+    fp8_logits = qsa_mqa_prefill(q, k.to(torch.float8_e4m3fn), starts, ends)
+    assert (
+        _fp8_selection_overlap(fp8_logits, bf16_logits, starts, ends, BLOCK_TOPK)
+        >= 0.99
+    )
+
+    # Wiring check: with both sides on the shared e4m3 grid the fp8 kernel
+    # reproduces the torch reference (no selection ties to perturb).
+    k_grid = k.to(torch.float8_e4m3fn).float().bfloat16()
+    q_grid = q.to(torch.float8_e4m3fn).float().bfloat16()
+    exact = qsa_mqa_prefill(q_grid, k_grid, starts, ends)
+    fp8_exact = mqa_module.deepgemm_qsa_mqa_prefill(
+        q_grid, k.to(torch.float8_e4m3fn), starts, ends
+    )
+    torch.testing.assert_close(fp8_exact, exact, rtol=0, atol=1e-4)
+    assert time.time() - begin < 60
+
+
+def test_qsa_fp8_compressed_decode_matches_bf16_selection():
+    """Gathered packed-kernel decode must pick the same blocks as BF16."""
+    import time
+
+    if not torch.cuda.is_available():
+        return
+    from sglang.srt.layers.attention.qsa import mqa as mqa_module
+
+    if not mqa_module.HAS_DEEPGEMM:
+        return
+    begin = time.time()
+    torch.manual_seed(9)
+    bs, heads, head_dim, page_size, pages_per_batch = 4, 4, 128, 16, 36
+    q = torch.randn(bs, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    q = (q / q.norm(dim=-1, keepdim=True)).bfloat16()
+    cache = torch.randn(
+        bs * pages_per_batch,
+        page_size,
+        1,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    cache = (cache / cache.norm(dim=-1, keepdim=True)).bfloat16()
+    page_table = torch.arange(
+        bs * pages_per_batch, dtype=torch.int32, device="cuda"
+    ).reshape(bs, pages_per_batch)
+    context_lens = torch.full(
+        (bs,), pages_per_batch * page_size, dtype=torch.int32, device="cuda"
+    )
+    total = pages_per_batch * page_size
+
+    bf16_logits = qsa_mqa_decode(q, cache, page_table, context_lens, total)
+    fp8_logits = qsa_mqa_decode(
+        q, cache.to(torch.float8_e4m3fn), page_table, context_lens, total
+    )
+    starts = torch.zeros(bs, dtype=torch.int32, device="cuda")
+    assert (
+        _fp8_selection_overlap(fp8_logits, bf16_logits, starts, context_lens, BLOCK_TOPK)
+        >= 0.99
+    )
+
+    # Wiring check: grid-matched keys and queries agree with the reference
+    # inside every window.
+    cache_grid = cache.to(torch.float8_e4m3fn).float().bfloat16()
+    q_grid = q.to(torch.float8_e4m3fn).float().bfloat16()
+    exact = qsa_mqa_decode(q_grid, cache_grid, page_table, context_lens, total)
+    fp8_exact = mqa_module.deepgemm_qsa_mqa_decode(
+        q_grid, cache.to(torch.float8_e4m3fn), page_table, context_lens
+    )
+    in_window = torch.arange(total, device="cuda").unsqueeze(0) < context_lens[:, None]
+    torch.testing.assert_close(
+        fp8_exact[in_window], exact[in_window], rtol=0, atol=1e-4
+    )
+    assert time.time() - begin < 60
+
+
+def test_qsa_compressed_pool_fp8_roundtrip(monkeypatch):
+    """Under the FP8 flag the compressed cache is fp8, roundtrips within the
+    e4m3 grid, keeps idle slots zero, and allocates no BF16 twin."""
+    monkeypatch.setenv("SGLANG_QWEN_DSA_USE_FP8_INDEXER", "1")
+    pool = QSATokenToKVPool(
+        size=128,
+        dtype=torch.bfloat16,
+        page_size=8,
+        head_num=2,
+        head_dim=64,
+        full_attention_layer_ids=[0],
+        device="cpu",
+        mamba_pool=SimpleNamespace(),
+        qsa_index_kv_heads=1,
+        qsa_index_head_dim=128,
+        qsa_compress_ratio=COMPRESS_RATIO,
+        qsa_token_topk=TOKEN_TOPK,
+        num_request_slots=8,
+        enable_memory_saver=False,
+        start_layer=0,
+    )
+    assert pool.qsa_use_fp8_indexer
+    buffer = pool.get_qsa_compressed_k_buffer(0)
+    assert buffer.dtype == torch.float8_e4m3fn
+    assert pool.qsa_compressed_flat.numel() == 0
+
+    # e4m3 grid: values <=32 keep abs error <= 1.0 (arange/16 <= 31.9).
+    rows = torch.arange(4 * 128, dtype=torch.bfloat16).reshape(4, 1, 128) / 16
+    loc = torch.tensor([5, 6, 9, 10], dtype=torch.int32)
+    pool.set_qsa_compressed_k_buffer(0, loc, rows)
+    # e4m3 grid: values <=32 keep abs error <= 1.0
+    torch.testing.assert_close(
+        buffer[loc.long()].float(), rows.float(), rtol=0, atol=1.0
+    )
+    idle = buffer[[0, 1, 2, 3, 4, 7, 8, 11]]
+    assert not bool(idle.float().any())
+
+
 def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
     rows, keys, heads, head_dim = 65, 64, 4, 8
     token_topk, compress_ratio = 8, 4
