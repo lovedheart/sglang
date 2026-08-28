@@ -319,12 +319,17 @@ class QwenDSAIndexer(MultiPlatformOp):
             # gathers stay in range and fast_topk masks them out by length.
             k_chunk = index_k.index_select(0, table_long[row_start:row_end].reshape(-1))
             k_chunk = k_chunk.reshape(row_end - row_start, max_len, 1, -1)
-            logits = torch_dsa_weighted_mqa_logits(
-                q[row_start:row_end],
-                w[row_start:row_end],
-                k_chunk,
-                self.score_scale,
-            )
+            # Hot-path scoring: run the dot in the cache dtype (bf16 tensor
+            # cores, fp32 accumulate) instead of materializing fp32 copies of
+            # the gathered K (a 4x byte-amplified copy per layer); top-k only
+            # consumes the fp32 ordering.  The bit-exact fp32 form is the
+            # torch_dsa_weighted_mqa_logits reference, CI-covered separately.
+            scores = torch.relu(
+                torch.einsum("mhd,mkhd->mkh", q[row_start:row_end], k_chunk)
+            ).float()
+            logits = (scores * w[row_start:row_end].float().unsqueeze(1)).sum(
+                dim=-1
+            ) / self.score_scale
             lengths = sequence_lengths[row_start:row_end]
             selected = qsa_fast_topk(
                 logits,
