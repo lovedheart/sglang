@@ -10,9 +10,12 @@ inputs (``get_prefill_mqa_inputs``/``get_decode_mqa_inputs``).
 The BF16 torch reference compute (``torch_dsa_weighted_mqa_logits``) is the
 correctness oracle.  Under ``SGLANG_QWEN_DSA_USE_FP8_INDEXER`` the scoring
 fast paths are wired to DeepGEMM: fp8_mqa_logits for packed prefill and
-fp8_paged_mqa_logits for paged decode/verify.  The flag covers both indexer
-variants; the compressed QSAIndexer (qsa_indexer.py) scores its fp8_e4m3
-compressed keys through the packed fp8_mqa_logits kernel on both phases.
+fp8_paged_mqa_logits for paged decode/verify.  For the compressed
+QSAIndexer (qsa_indexer.py) the flag covers the packed PREFILL only -- keys
+stay BF16 in the pool and are cast to fp8 at the scoring call site, while
+decode keeps the TileLang paged BF16 path (the SM120 paged FP8 kernel needs
+block_kv 64, impossible on ratio-shrunken compressed pages, and a gathered
+fp8 decode is far slower than BF16 paged scoring).
 The TileLang MQA fast path remains out of scope: requesting it fails loudly
 instead of silently degrading.
 """
