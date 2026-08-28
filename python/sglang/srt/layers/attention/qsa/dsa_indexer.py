@@ -296,7 +296,6 @@ class QwenDSAIndexer(MultiPlatformOp):
         """Per-query-row top-k over ``[0, row_len)`` for paged modes."""
 
         pool = indexer_metadata.token_to_kv_pool
-        index_k = pool.get_dsa_index_k_buffer(self.layer_id)
         sequence_lengths = indexer_metadata.sequence_lengths.to(torch.int32)
         table = indexer_metadata.token_slot_table
         rows, max_len = table.shape
@@ -309,6 +308,54 @@ class QwenDSAIndexer(MultiPlatformOp):
         output = torch.full(
             (rows, self.token_topk), -1, dtype=torch.int32, device=q.device
         )
+        if getattr(self, "use_fp8_indexer", False):
+            import deep_gemm
+
+            # Slot page contiguity (page_size 64, paged allocator) makes
+            # page j of a row  slot(table[r, j * 64]) // 64; the fused fp8
+            # page layout written by QwenDSATokenToKVPool matches the
+            # DeepGEMM paged kernel.  Rows past each context length hold
+            # stale pages; the kernel masks them via context_lens.
+            fused_kv = pool.get_dsa_index_paged(self.layer_id)
+            context_lens_1d = sequence_lengths.clamp(min=0, max=max_len)
+            context_lens = context_lens_1d.unsqueeze(1).contiguous()  # [rows, next_n=1]
+            block_table = (table[:, :: self.page_size] // self.page_size).to(
+                torch.int32
+            ).contiguous()
+            scale_heads = max(self.index_n_heads, 32)
+            q_fp8 = q.contiguous().to(torch.float8_e4m3fn)
+            weights = w.float() / self.score_scale
+            if q_fp8.shape[1] < scale_heads:
+                q_fp8 = torch.nn.functional.pad(
+                    q_fp8, (0, 0, 0, scale_heads - q_fp8.shape[1])
+                )
+                weights = torch.nn.functional.pad(
+                    weights, (0, scale_heads - weights.shape[1])
+                )
+            logits = deep_gemm.fp8_paged_mqa_logits(
+                q_fp8.view(rows, 1, scale_heads, self.index_head_dim),
+                fused_kv,
+                weights,
+                context_lens,
+                block_table,
+                deep_gemm.get_paged_mqa_logits_metadata(
+                    context_lens,
+                    self.page_size,
+                    deep_gemm.get_num_sms(),
+                ),
+                max_len,
+                clean_logits=False,
+            )
+            selected = qsa_fast_topk(
+                logits.view(rows, -1),
+                torch.zeros_like(context_lens_1d),
+                context_lens_1d,
+                topk=self.token_topk,
+            )
+            output.copy_(selected)
+            return output
+
+        index_k = pool.get_dsa_index_k_buffer(self.layer_id)
         row_chunk = _qsa_prefill_row_chunk_size(
             rows, max_len, self.index_n_heads
         )
@@ -350,7 +397,6 @@ class QwenDSAIndexer(MultiPlatformOp):
         """Packed per-sequence top-k with causal windows for extend modes."""
 
         pool = indexer_metadata.token_to_kv_pool
-        index_k = pool.get_dsa_index_k_buffer(self.layer_id)
         sequence_lengths = indexer_metadata.sequence_lengths.to(torch.int32)
         table = indexer_metadata.token_slot_table
         query_sequence_ids = indexer_metadata.token_to_batch_idx.long()
@@ -372,10 +418,7 @@ class QwenDSAIndexer(MultiPlatformOp):
                     continue
                 row_indices = row_mask.nonzero(as_tuple=True)[0]
                 slots = table[sequence_id, :seq_len].long()
-                k_seq = index_k.index_select(0, slots)
-                k_fp8 = k_seq.reshape(seq_len, self.index_head_dim).contiguous().to(
-                    torch.float8_e4m3fn
-                )
+                k_fp8 = pool.get_dsa_index_k_fp8(self.layer_id, slots)
                 k_scale = torch.ones(seq_len, dtype=torch.float32, device=q.device)
                 row_chunk = _qsa_prefill_row_chunk_size(
                     row_indices.numel(), seq_len, self.index_n_heads
@@ -419,6 +462,7 @@ class QwenDSAIndexer(MultiPlatformOp):
                     output[chunk_rows] = selected
             return output
 
+        index_k = pool.get_dsa_index_k_buffer(self.layer_id)
         for sequence_id in range(sequence_lengths.numel()):
             seq_len = int(sequence_lengths[sequence_id].item())
             row_mask = query_sequence_ids == sequence_id
