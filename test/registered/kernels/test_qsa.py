@@ -416,18 +416,33 @@ def test_qwen_dsa_pool_roundtrip_and_layer_mapping():
     rows = torch.arange(32, dtype=torch.bfloat16).reshape(4, 1, 8)
     loc = torch.tensor([5, 6, 9, 10], dtype=torch.int32)
     pool.set_dsa_index_k_buffer(0, loc, rows)
-    buffer = pool.get_dsa_index_k_buffer(0)
-    torch.testing.assert_close(buffer[5].float(), rows[0].float(), rtol=0, atol=0)
-    torch.testing.assert_close(buffer[10].float(), rows[3].float(), rtol=0, atol=0)
-    written_rows = buffer.abs().sum(dim=(1, 2)) > 0
-    assert int(written_rows.sum()) == 4
-    assert written_rows[loc.long()].all()
-    assert not written_rows[:5].any()
+    if getattr(pool, "qsa_use_fp8_indexer", False):
+        # FP8 mode keeps only fused pages: gather must roundtrip within the
+        # e4m3 grid (values <=31 quantize with abs error <= 1) and untouched
+        # slots must read back as zeros.
+        gathered = pool.get_dsa_index_k_fp8(0, loc)
+        torch.testing.assert_close(
+            gathered.float(), rows.float().reshape(4, 8), rtol=0, atol=1.0
+        )
+        idle = pool.get_dsa_index_k_fp8(
+            0, torch.tensor([0, 1, 2, 3, 4, 7, 8, 11], dtype=torch.int32)
+        )
+        assert not idle.any()
+    else:
+        buffer = pool.get_dsa_index_k_buffer(0)
+        torch.testing.assert_close(buffer[5].float(), rows[0].float(), rtol=0, atol=0)
+        torch.testing.assert_close(buffer[10].float(), rows[3].float(), rtol=0, atol=0)
+        written_rows = buffer.abs().sum(dim=(1, 2)) > 0
+        assert int(written_rows.sum()) == 4
+        assert written_rows[loc.long()].all()
+        assert not written_rows[:5].any()
 
     try:
         pool.get_dsa_index_k_buffer(7)
     except ValueError as exc:
         assert "full attention layers" in str(exc)
+    except RuntimeError as exc:  # FP8 mode: no BF16 twin exists at all
+        assert "FP8-indexer" in str(exc)
     else:
         raise AssertionError("QwenDSA pool must reject non-full-attention layers")
 
