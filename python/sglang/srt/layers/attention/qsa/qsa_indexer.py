@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Tuple
 
 import torch
@@ -23,17 +24,21 @@ from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
 
-# Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
-# top-k is per row, so tiling rows does not change the selection.
+logger = logging.getLogger(__name__)
+
+
+# Bound the dominant FP32 [query_rows, compressed_keys] prefill workspace.
+# Top-k is row-independent, so large scheduler chunks can be scored in smaller
+# row tiles without changing the selected blocks.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
-
-
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
     if rows <= 0 or keys <= 0:
         return max(rows, 1)
     block_q = max(1, 128 // heads)
     bytes_per_row = keys * torch.float32.itemsize
-    max_padded_rows = max(block_q, _QSA_PREFILL_LOGITS_BUDGET_BYTES // bytes_per_row)
+    max_padded_rows = max(
+        block_q, _QSA_PREFILL_LOGITS_BUDGET_BYTES // bytes_per_row
+    )
     max_padded_rows = max(block_q, max_padded_rows // block_q * block_q)
     return min(rows, max_padded_rows)
 
@@ -80,6 +85,25 @@ class QSAIndexer(MultiPlatformOp):
             self.index_head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
         self._rope_axis_map_cache = None
+        # FP8 scoring (DeepGEMM fp8_mqa_logits) for BOTH indexer variants is
+        # opt-in via SGLANG_QWEN_DSA_USE_FP8_INDEXER.  When set, the pool
+        # stores compressed keys as fp8_e4m3 (see QSATokenToKVPool) and the
+        # dtype-dispatching MQA entry points route to DeepGEMM; the fused
+        # BF16 compress-store kernel is bypassed because it cannot write the
+        # fp8 layout.  Fail loudly here if deep_gemm is missing.
+        from sglang.srt.environ import envs
+
+        self.use_fp8_indexer = envs.SGLANG_QWEN_DSA_USE_FP8_INDEXER.get()
+        if self.use_fp8_indexer:
+            from sglang.srt.layers.attention.qsa.mqa import _require_deepgemm
+
+            _require_deepgemm()
+            logger.info(
+                "QSAIndexer layer %s: FP8 indexer enabled (DeepGEMM "
+                "fp8_mqa_logits for packed prefill and gather-packed decode; "
+                "compressed keys stored as fp8_e4m3).",
+                layer_id,
+            )
 
     @staticmethod
     def _validate_config(config) -> None:
@@ -131,7 +155,12 @@ class QSAIndexer(MultiPlatformOp):
         )
 
     def _rope_axis_map(self, device) -> torch.Tensor:
-        """axis_map[i] is the MRoPE position axis whose cos/sin rotary pair i reads."""
+        """Per-pair position-axis selector reproducing the MRoPE composition.
+
+        Pair index i reads cos/sin of position axis ``axis_map[i]``: all zero
+        for plain RoPE; Qwen interleaved MRoPE takes axes 1/2 at pair indices
+        1/2 mod 3 within their sections; sectioned MRoPE maps section ranges.
+        """
         cache = self._rope_axis_map_cache
         if cache is not None and cache.device == device:
             return cache
@@ -211,10 +240,14 @@ class QSAIndexer(MultiPlatformOp):
         return self.apply_rope(block_positions, normalized)
 
     def _use_fused_compress(self, pool) -> bool:
-        return getattr(
-            pool, "qsa_rope_position_buffer", None
-        ) is not None and self._use_fused_prep(
-            pool.get_qsa_key_state_buffer(self.layer_id)
+        # The fused store kernel writes BF16 compressed keys; under the FP8
+        # indexer the eager path normalizes in torch and the pool's
+        # set_qsa_compressed_k_buffer quantizes on write instead.
+        if getattr(self, "use_fp8_indexer", False):
+            return False
+        return (
+            getattr(pool, "qsa_rope_position_buffer", None) is not None
+            and self._use_fused_prep(pool.get_qsa_key_state_buffer(self.layer_id))
         )
 
     def _fused_compress_store(
@@ -225,8 +258,11 @@ class QSAIndexer(MultiPlatformOp):
         source_keys: torch.Tensor | None = None,
         source_rope: torch.Tensor | None = None,
     ) -> None:
-        """Fused mean -> gemma norm -> MRoPE -> compressed-cache store;
-        a None source_keys/source_rope reads the members from the pending ring."""
+        """Fused mean -> gemma norm -> MRoPE -> compressed-cache store.
+
+        The member source defaults to the pending ring; extend forwards pass
+        this forward's packed keys/rope instead (members are chunk-local).
+        """
         from sglang.kernels.ops.attention.qsa_indexer import (
             qsa_index_k_compress_store,
         )
@@ -275,6 +311,7 @@ class QSAIndexer(MultiPlatformOp):
             compress_ratio=self.compress_ratio,
         )
 
+
     def update_key_state_and_compress(
         self,
         token_k: torch.Tensor,
@@ -314,14 +351,14 @@ class QSAIndexer(MultiPlatformOp):
         group_end_positions = metadata.compress_group_positions.long()
         compressed_locs = metadata.write_locs
         if is_extend:
-            # Extend chunks are group-aligned; each planned group lies in this forward,
-            # so read its members from the packed chunk tensors.
+            # Extend chunks are group-aligned, so every member of every
+            # planned group is a token of THIS forward: source the members
+            # from the packed chunk tensors directly (no cache round trip).
             member_rows = metadata.compress_member_rows.long()
             group_locs = member_rows[:, None] + torch.arange(
                 self.compress_ratio, device=member_rows.device, dtype=torch.long
             )
             source_keys = token_k
-            group_locs = group_locs.clamp_max(source_keys.shape[0] - 1)
             source_rope = metadata.extend_rope_matrix
             if source_rope is None:
                 source_rope = build_rope_position_matrix(
@@ -357,7 +394,12 @@ class QSAIndexer(MultiPlatformOp):
         pool.set_qsa_compressed_k_buffer(self.layer_id, compressed_locs, normalized)
 
     def _compress_decode_cuda_graph(self, metadata) -> None:
-        """Fixed-shape graph-replay compression; non-boundary rows write slot 0."""
+        """Run a fixed-shape compression step; non-boundaries write slot zero.
+
+        Member slots come from ``metadata.graph_ring_group_locs``, a static
+        buffer refreshed before every replay alongside the other graph
+        buffers (triton prologue, or the host fallback refresh).
+        """
 
         if metadata.graph_write_locs is None or metadata.graph_ring_group_locs is None:
             raise RuntimeError("QSA CUDA graph compression metadata is incomplete")
@@ -393,18 +435,15 @@ class QSAIndexer(MultiPlatformOp):
         if tensor.numel() == 0:
             return tensor
         positions = positions.long()
-        num_positions = (
-            positions.shape[-1] if positions.ndim == 2 else positions.numel()
-        )
+        num_positions = positions.shape[-1] if positions.ndim == 2 else positions.numel()
         if num_positions != tensor.shape[0]:
             raise ValueError("QSA RoPE positions must match the token dimension")
-        if not get_is_capture_mode() and hasattr(
-            self.rotary_emb, "_ensure_cos_sin_cache_length"
-        ):
+        if not get_is_capture_mode() and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length"):
             self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
 
-        # position_cos/position_sin repeat cos/sin to the full rotary width;
-        # apply_rotary_emb consumes one half.
+        # Let the exact Qwen4-Exp RoPE instance compose regular or three-axis
+        # multimodal positions.  Its public cache view repeats cos/sin to the
+        # full rotary width; apply_rotary_emb consumes one half.
         self.rotary_emb.get_cos_sin_with_position(positions)
         rotary_dim = self.rotary_emb.rotary_dim
         half_rotary_dim = rotary_dim // 2
@@ -530,8 +569,12 @@ class QSAIndexer(MultiPlatformOp):
         Fast paths are gated per platforms inside kernel calls.
         """
         forward_mode = forward_batch.forward_mode
-        is_target_verify = getattr(forward_mode, "is_target_verify", lambda: False)()
-        is_draft_extend = getattr(forward_mode, "is_draft_extend_v2", lambda: False)()
+        is_target_verify = getattr(
+            forward_mode, "is_target_verify", lambda: False
+        )()
+        is_draft_extend = getattr(
+            forward_mode, "is_draft_extend_v2", lambda: False
+        )()
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             # EAGLE/MTP may advance the model's RoPE coordinate independently
             # from the physical paged-KV position.  Compression and sparse
@@ -543,7 +586,9 @@ class QSAIndexer(MultiPlatformOp):
         else:
             logical_positions = getattr(forward_batch, "positions", None)
             if logical_positions is None:
-                logical_positions = positions[0] if positions.ndim == 2 else positions
+                logical_positions = (
+                    positions[0] if positions.ndim == 2 else positions
+                )
             logical_positions = logical_positions.flatten()
         # DP MAX_LEN padding adds token rows without assigning them to a
         # request. token_to_batch_idx is the source of truth for semantic rows.
@@ -587,7 +632,9 @@ class QSAIndexer(MultiPlatformOp):
             pool=indexer_metadata.token_to_kv_pool,
             cache_loc=state_slots,
             q_heads_padded=(
-                # The tilelang decode MQA kernel needs query heads in multiples of 8.
+                # The tilelang decode MQA requires a query-head multiple of 8;
+                # writing the zero padding from the fused prep kernel avoids a
+                # separate fill + cat per layer.
                 ((self.index_n_heads + 7) // 8) * 8
                 if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
                 else None
@@ -616,7 +663,9 @@ class QSAIndexer(MultiPlatformOp):
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
-            indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
+            indexer_metadata.get_prefill_mqa_inputs(
+                self.layer_id, logical_positions
+            )
         )
         query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
         row_sequence_lengths = sequence_lengths.index_select(
