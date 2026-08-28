@@ -58,10 +58,12 @@ class QSATokenToKVPool(HybridLinearKVPool):
     # is the pools' reserved padding slot, so compressed slot 0 stays the
     # inert dump target for non-boundary rows.
     index_state_dtype = torch.bfloat16
-    # FP8-indexer mode stores compressed keys as fp8_e4m3 (one byte per
-    # element) plus one shared constant-1.0 fp32 scale vector; compressed keys
-    # are RMS-normed, so a unit scale never overflows and is written once.
-    qsa_fp8_state_dtype = torch.float8_e4m3fn
+    # Compressed keys stay BF16 in the pool even under
+    # SGLANG_QWEN_DSA_USE_FP8_INDEXER: the SM120 paged FP8 kernel requires
+    # block_kv 64 while compressed pages are ratio-shrunken, so a gathered
+    # fp8 decode scores far below the TileLang paged BF16 path.  Only the
+    # packed prefill scorer consumes fp8, cast per call from these BF16 pages
+    # (see QSAIndexer.select_prefill_tokens).
 
     @classmethod
     def qsa_bytes_per_token(
@@ -81,21 +83,10 @@ class QSATokenToKVPool(HybridLinearKVPool):
         count and stays outside this budget like the other per-request
         buffers.
         """
-        fp8_storage = (
-            compressed_dtype == cls.qsa_fp8_state_dtype
-            or cls.qsa_use_fp8_indexer_enabled()
-        )
-        dtype = cls.qsa_fp8_state_dtype if fp8_storage else cls.index_state_dtype
         index_k_bytes = _index_k_bytes(
-            kv_heads=kv_heads, head_dim=head_dim, dtype=dtype
+            kv_heads=kv_heads, head_dim=head_dim, dtype=compressed_dtype
         )
         return index_k_bytes // compress_ratio * num_layers
-
-    @classmethod
-    def qsa_use_fp8_indexer_enabled(cls) -> bool:
-        from sglang.srt.environ import envs
-
-        return envs.SGLANG_QWEN_DSA_USE_FP8_INDEXER.get()
 
 
     def __init__(
@@ -177,17 +168,10 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 f"float8_e4m3fn, got {qsa_indexer_dtype}"
             )
         # Storage dtype of the compressed keys and the index Q (the GEMM
-        # operands). The legacy env flag selects the same fp8 layout as the
-        # CLI dtype, so either selector lands on identical buffers.
-        from sglang.srt.environ import envs
-
-        self.qsa_use_fp8_indexer = (
-            envs.SGLANG_QWEN_DSA_USE_FP8_INDEXER.get()
-            or qsa_indexer_dtype == torch.float8_e4m3fn
-        )
-        self.qsa_compressed_dtype = (
-            torch.float8_e4m3fn if self.qsa_use_fp8_indexer else qsa_indexer_dtype
-        )
+        # operands) -- the dtype the buffers below carry and the compress
+        # store writes. The env-flag fp8 indexer keeps BF16 storage and
+        # casts to fp8 at the prefill scoring call site instead.
+        self.qsa_compressed_dtype = qsa_indexer_dtype
         logger.info(
             "QSA compressed indexer cache dtype: %s (pending ring %s)",
             self.qsa_compressed_dtype,
@@ -198,9 +182,12 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
         self.qsa_compressed_capacity = -(state_size // -self.qsa_compress_ratio)
-        if self.qsa_use_fp8_indexer and self.qsa_index_kv_heads != 1:
+        if (
+            self.qsa_compressed_dtype == torch.float8_e4m3fn
+            and self.qsa_index_kv_heads != 1
+        ):
             raise ValueError(
-                "FP8-indexer compressed QSA requires index_kv_heads = 1 "
+                "FP8 compressed QSA indexer storage requires index_kv_heads = 1 "
                 f"(one fp8 scale per compressed key), got {self.qsa_index_kv_heads}"
             )
         # Pre-compression index-K state is a per-request RING, not a
@@ -234,15 +221,15 @@ class QSATokenToKVPool(HybridLinearKVPool):
         )
         # One contiguous allocation behind per-layer views: every layer's
         # compressed pages are addressable from a single base pointer.  In
-        # FP8-indexer mode the same view shape carries fp8_e4m3 payloads and
-        # the BF16 flat twin is not allocated (compressed keys are
-        # RMS-normed, so the DeepGEMM per-key scales are a constant 1.0 that
-        # each call site materializes over its gathered rows).  The fused
-        # payload+scale page layout of the tokenwise pool is not needed here:
-        # the SM120 paged kernel requires block_kv 64 while compressed pages
-        # are ratio-shrunken, so the compressed indexer scores through the
-        # packed kernel on gathers.
-        if self.qsa_use_fp8_indexer:
+        # fp8 storage mode (the --qsa-indexer-dtype fp8_e4m3 choice) the
+        # per-layer views carry fp8 payloads and the BF16 flat twin is not
+        # allocated; compressed keys are RMS-normed, so the DeepGEMM per-key
+        # scales are a constant 1.0 that each call site materializes over
+        # its gathered rows.
+        if self.qsa_compressed_dtype == torch.float8_e4m3fn:
+            self.qsa_compressed_flat = torch.empty(
+                0, dtype=self.index_state_dtype, device=device
+            )
             self.qsa_compressed_k_buffer_pool = [
                 torch.zeros(
                     (
@@ -255,9 +242,6 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 )
                 for _ in full_attention_layer_ids
             ]
-            self.qsa_compressed_flat = torch.empty(
-                0, dtype=self.index_state_dtype, device=device
-            )
         else:
             self.qsa_compressed_flat = torch.zeros(
                 (
