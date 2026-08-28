@@ -315,30 +315,109 @@ class QwenDSATokenToKVPool(HybridLinearKVPool):
         self.qsa_token_topk = int(qsa_token_budget)
         self.qsa_block_topk = int(qsa_token_budget)
         state_size = size + page_size
-        self.dsa_index_k_buffer_pool = [
-            torch.zeros(
-                (state_size, self.qsa_index_kv_heads, self.qsa_index_head_dim),
-                dtype=self.index_state_dtype,
-                device=device,
-            )
-            for _ in full_attention_layer_ids
-        ]
+        # FP8 paged layout for the DeepGEMM decode indexer
+        # (SGLANG_QWEN_DSA_USE_FP8_INDEXER): fused
+        # [pages, 64, 1, head_dim + 4] uint8 per layer -- head_dim fp8_e4m3
+        # bytes followed by 4 fp32 scale bytes whose value is a constant 1.0
+        # (written once; indexer K is RMS-normed so scale=1 never overflows).
+        # Slots map to (slot // 64) page, offset slot % 64, so the block
+        # table is slot_table[:, ::64] // 64.  In this mode the BF16 twin is
+        # not allocated: every read gathers from the fp8 pages.
+        from sglang.srt.environ import envs
+
+        self.qsa_use_fp8_indexer = envs.SGLANG_QWEN_DSA_USE_FP8_INDEXER.get()
+        self.qsa_index_page_size = page_size
+        num_pages = state_size // page_size
+        assert state_size % page_size == 0, "index-K pages must align"
+        hd = self.qsa_index_head_dim
+        if self.qsa_use_fp8_indexer:
+            self.dsa_index_k_buffer_pool = None
+            paged = []
+            for _ in full_attention_layer_ids:
+                fused = torch.zeros(
+                    (num_pages, page_size, 1, hd + 4),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                fused.view(num_pages, -1)[:, page_size * hd :].view(
+                    torch.float32
+                ).fill_(1.0)
+                paged.append(fused)
+            self.dsa_index_paged_pool = paged
+        else:
+            self.dsa_index_k_buffer_pool = [
+                torch.zeros(
+                    (state_size, self.qsa_index_kv_heads, self.qsa_index_head_dim),
+                    dtype=self.index_state_dtype,
+                    device=device,
+                )
+                for _ in full_attention_layer_ids
+            ]
+            self.dsa_index_paged_pool = None
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
+
+    def _qsa_index_slot_offsets(self, loc: torch.Tensor) -> torch.Tensor:
+        """Flat byte offsets of each slot's fp8 payload inside a fused page.
+
+        Page layout (DeepGEMM fused-KV contract): first ``page_size *
+        head_dim`` bytes of data (token i at i * head_dim), then
+        ``page_size * 4`` fp32 scale bytes.
+        """
+        head_dim = self.qsa_index_head_dim
+        page_stride = self.qsa_index_page_size * (head_dim + 4)
+        loc = loc.long()
+        return (loc // self.qsa_index_page_size) * page_stride + (
+            loc % self.qsa_index_page_size
+        ) * head_dim
 
     def set_dsa_index_k_buffer(
         self, layer_id: int, loc: torch.Tensor, index_k: torch.Tensor
     ) -> None:
-        buffer = self.get_dsa_index_k_buffer(layer_id)
+        layer = self._transfer_full_attention_id(layer_id)
+        if self.dsa_index_paged_pool is not None:
+            fused = self.dsa_index_paged_pool[layer]
+            head_dim = self.qsa_index_head_dim
+            offs = self._qsa_index_slot_offsets(loc).unsqueeze(1) + torch.arange(
+                head_dim, dtype=torch.int64, device=loc.device
+            )
+            k_fp8 = index_k.to(torch.float8_e4m3fn).reshape(-1, head_dim)
+            fused.view(-1)[offs] = k_fp8.view(torch.uint8)
+            return
+        buffer = self.dsa_index_k_buffer_pool[layer]
         buffer[loc.long()] = index_k.to(buffer.dtype)
 
     def get_dsa_index_k_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.dsa_index_k_buffer_pool is None:
+            raise RuntimeError(
+                "tokenwise QSA BF16 index-K buffer is absent in FP8-indexer "
+                "mode; gather via get_dsa_index_k_fp8 instead"
+            )
         return self.dsa_index_k_buffer_pool[self._transfer_full_attention_id(layer_id)]
+
+    def get_dsa_index_paged(self, layer_id: int) -> torch.Tensor:
+        if self.dsa_index_paged_pool is None:
+            raise RuntimeError("QSA FP8 paged index-K is disabled")
+        return self.dsa_index_paged_pool[self._transfer_full_attention_id(layer_id)]
+
+    def get_dsa_index_k_fp8(self, layer_id: int, slots: torch.Tensor) -> torch.Tensor:
+        """Gather head_dim fp8 payloads for ``slots`` ([N] -> [N, head_dim])."""
+        fused = self.get_dsa_index_paged(layer_id)
+        head_dim = self.qsa_index_head_dim
+        idx = self._qsa_index_slot_offsets(slots).unsqueeze(1) + torch.arange(
+            head_dim, dtype=torch.int64, device=slots.device
+        )
+        return fused.view(-1)[idx].view(torch.float8_e4m3fn)
 
     def get_kv_size_bytes(self):
         k_size, v_size = super().get_kv_size_bytes()
-        dsa_k_size = sum(
-            tensor.numel() * tensor.element_size()
-            for tensor in self.dsa_index_k_buffer_pool
-        )
+        if getattr(self, "dsa_index_paged_pool", None) is not None:
+            dsa_k_size = sum(
+                tensor.numel() for tensor in self.dsa_index_paged_pool
+            )
+        else:
+            dsa_k_size = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in self.dsa_index_k_buffer_pool
+            )
         return k_size + dsa_k_size, v_size
