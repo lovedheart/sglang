@@ -34,6 +34,10 @@ class QSATokenToKVPool(HybridLinearKVPool):
     # is the pools' reserved padding slot, so compressed slot 0 stays the
     # inert dump target for non-boundary rows.
     index_state_dtype = torch.bfloat16
+    # FP8-indexer mode stores compressed keys as fp8_e4m3 (one byte per
+    # element) plus one shared constant-1.0 fp32 scale vector; compressed keys
+    # are RMS-normed, so a unit scale never overflows and is written once.
+    qsa_fp8_state_dtype = torch.float8_e4m3fn
 
     @classmethod
     def qsa_bytes_per_token(
@@ -47,10 +51,21 @@ class QSATokenToKVPool(HybridLinearKVPool):
         count and stays outside this budget like the other per-request
         buffers.
         """
+        dtype = (
+            cls.qsa_fp8_state_dtype
+            if cls.qsa_use_fp8_indexer_enabled()
+            else cls.index_state_dtype
+        )
         index_k_bytes = _index_k_bytes(
-            kv_heads=kv_heads, head_dim=head_dim, dtype=cls.index_state_dtype
+            kv_heads=kv_heads, head_dim=head_dim, dtype=dtype
         )
         return index_k_bytes // compress_ratio * num_layers
+
+    @classmethod
+    def qsa_use_fp8_indexer_enabled(cls) -> bool:
+        from sglang.srt.environ import envs
+
+        return envs.SGLANG_QWEN_DSA_USE_FP8_INDEXER.get()
 
 
     def __init__(
@@ -130,6 +145,14 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
         self.qsa_compressed_capacity = -(state_size // -self.qsa_compress_ratio)
+        from sglang.srt.environ import envs
+
+        self.qsa_use_fp8_indexer = envs.SGLANG_QWEN_DSA_USE_FP8_INDEXER.get()
+        if self.qsa_use_fp8_indexer and self.qsa_index_kv_heads != 1:
+            raise ValueError(
+                "FP8-indexer compressed QSA requires index_kv_heads = 1 "
+                f"(one fp8 scale per compressed key), got {self.qsa_index_kv_heads}"
+            )
         # Pre-compression index-K state is a per-request RING, not a
         # per-token cache: once a group's compressed key is written, its raw
         # members are never read again, and page-granular prefix sharing
@@ -160,25 +183,50 @@ class QSATokenToKVPool(HybridLinearKVPool):
             (ring_slots, 3), dtype=torch.int64, device=device
         )
         # One contiguous allocation behind per-layer views: every layer's
-        # compressed pages are addressable from a single base pointer.
-        self.qsa_compressed_flat = torch.zeros(
-            (
-                len(full_attention_layer_ids),
-                self.qsa_compressed_capacity
-                * self.qsa_index_kv_heads
-                * self.qsa_index_head_dim,
-            ),
-            dtype=self.index_state_dtype,
-            device=device,
-        )
-        self.qsa_compressed_k_buffer_pool = [
-            self.qsa_compressed_flat[layer_offset].view(
-                self.qsa_compressed_capacity,
-                self.qsa_index_kv_heads,
-                self.qsa_index_head_dim,
+        # compressed pages are addressable from a single base pointer.  In
+        # FP8-indexer mode the same view shape carries fp8_e4m3 payloads and
+        # the BF16 flat twin is not allocated (compressed keys are
+        # RMS-normed, so the DeepGEMM per-key scales are a constant 1.0 that
+        # each call site materializes over its gathered rows).  The fused
+        # payload+scale page layout of the tokenwise pool is not needed here:
+        # the SM120 paged kernel requires block_kv 64 while compressed pages
+        # are ratio-shrunken, so the compressed indexer scores through the
+        # packed kernel on gathers.
+        if self.qsa_use_fp8_indexer:
+            self.qsa_compressed_k_buffer_pool = [
+                torch.zeros(
+                    (
+                        self.qsa_compressed_capacity,
+                        self.qsa_index_kv_heads,
+                        self.qsa_index_head_dim,
+                    ),
+                    dtype=torch.float8_e4m3fn,
+                    device=device,
+                )
+                for _ in full_attention_layer_ids
+            ]
+            self.qsa_compressed_flat = torch.empty(
+                0, dtype=self.index_state_dtype, device=device
             )
-            for layer_offset in range(len(full_attention_layer_ids))
-        ]
+        else:
+            self.qsa_compressed_flat = torch.zeros(
+                (
+                    len(full_attention_layer_ids),
+                    self.qsa_compressed_capacity
+                    * self.qsa_index_kv_heads
+                    * self.qsa_index_head_dim,
+                ),
+                dtype=self.index_state_dtype,
+                device=device,
+            )
+            self.qsa_compressed_k_buffer_pool = [
+                self.qsa_compressed_flat[layer_offset].view(
+                    self.qsa_compressed_capacity,
+                    self.qsa_index_kv_heads,
+                    self.qsa_index_head_dim,
+                )
+                for layer_offset in range(len(full_attention_layer_ids))
+            ]
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
 
