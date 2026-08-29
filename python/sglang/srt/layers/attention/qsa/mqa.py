@@ -127,7 +127,7 @@ _DEEPGEMM_ALLOWED_HEADS = (8, 16, 32, 64)
 def _require_deepgemm() -> None:
     if not HAS_DEEPGEMM:
         raise RuntimeError(
-            "SGLANG_QWEN_DSA_USE_FP8_INDEXER requires the deep_gemm package "
+            "SGLANG_QSA_USE_FP8_INDEXER requires the deep_gemm package "
             "(with SM120 fp8 MQA-logits kernels); install deep_gemm or unset "
             "the flag to keep the BF16 indexer."
         )
