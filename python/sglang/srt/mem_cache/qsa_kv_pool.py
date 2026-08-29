@@ -35,7 +35,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
     # inert dump target for non-boundary rows.
     index_state_dtype = torch.bfloat16
     # Compressed keys stay BF16 in the pool even under
-    # SGLANG_QWEN_DSA_USE_FP8_INDEXER: the SM120 paged FP8 kernel requires
+    # SGLANG_QSA_USE_FP8_INDEXER: the SM120 paged FP8 kernel requires
     # block_kv 64 while compressed pages are ratio-shrunken, so a gathered
     # fp8 decode scores far below the TileLang paged BF16 path.  Only the
     # packed prefill scorer consumes fp8, cast per call from these BF16 pages
@@ -322,7 +322,7 @@ class QwenDSATokenToKVPool(HybridLinearKVPool):
         self.qsa_block_topk = int(qsa_token_budget)
         state_size = size + page_size
         # FP8 paged layout for the DeepGEMM decode indexer
-        # (SGLANG_QWEN_DSA_USE_FP8_INDEXER): fused
+        # (SGLANG_QSA_USE_FP8_INDEXER): fused
         # [pages, 64, 1, head_dim + 4] uint8 per layer -- head_dim fp8_e4m3
         # bytes followed by 4 fp32 scale bytes whose value is a constant 1.0
         # (written once; indexer K is RMS-normed so scale=1 never overflows).
@@ -331,7 +331,7 @@ class QwenDSATokenToKVPool(HybridLinearKVPool):
         # not allocated: every read gathers from the fp8 pages.
         from sglang.srt.environ import envs
 
-        self.qsa_use_fp8_indexer = envs.SGLANG_QWEN_DSA_USE_FP8_INDEXER.get()
+        self.qsa_use_fp8_indexer = envs.SGLANG_QSA_USE_FP8_INDEXER.get()
         self.qsa_index_page_size = page_size
         num_pages = state_size // page_size
         assert state_size % page_size == 0, "index-K pages must align"
