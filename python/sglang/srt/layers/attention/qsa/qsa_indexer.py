@@ -86,7 +86,7 @@ class QSAIndexer(MultiPlatformOp):
         )
         self._rope_axis_map_cache = None
         # FP8 scoring (DeepGEMM fp8_mqa_logits) under
-        # SGLANG_QWEN_DSA_USE_FP8_INDEXER covers the PACKED PREFILL only for
+        # SGLANG_QSA_USE_FP8_INDEXER covers the PACKED PREFILL only for
         # this compressed indexer: keys stay BF16 in the pool and are cast to
         # fp8 at the scoring call site (select_prefill_tokens).  Decode stays
         # the TileLang paged BF16 path -- the SM120 paged FP8 kernel requires
@@ -95,7 +95,7 @@ class QSAIndexer(MultiPlatformOp):
         # if deep_gemm is missing.
         from sglang.srt.environ import envs
 
-        self.use_fp8_indexer = envs.SGLANG_QWEN_DSA_USE_FP8_INDEXER.get()
+        self.use_fp8_indexer = envs.SGLANG_QSA_USE_FP8_INDEXER.get()
         if self.use_fp8_indexer:
             from sglang.srt.layers.attention.qsa.mqa import _require_deepgemm
 
