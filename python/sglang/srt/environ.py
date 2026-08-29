@@ -312,7 +312,9 @@ class Envs:
     # fp8 kernel is slower.  Requires DeepGEMM with SM120 MQA logits; fails
     # loudly when unavailable.  Unset keeps today's behavior: both indexer
     # variants score in BF16 (torch/TileLang).
-    SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
+    SGLANG_QSA_USE_FP8_INDEXER = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_QWEN_DSA_USE_FP8_INDEXER"
+    )
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
