@@ -1686,7 +1686,7 @@ def test_qsa_compressed_pool_stays_bf16_under_fp8_flag(monkeypatch):
     """The compressed pool keeps BF16 keys even under the FP8 flag: a
     gathered fp8 decode is slower than the TileLang BF16 paged path, so the
     flag only affects scoring call sites (prefill casts on the fly)."""
-    monkeypatch.setenv("SGLANG_QWEN_DSA_USE_FP8_INDEXER", "1")
+    monkeypatch.setenv("SGLANG_QSA_USE_FP8_INDEXER", "1")
     pool = QSATokenToKVPool(
         size=128,
         dtype=torch.bfloat16,
