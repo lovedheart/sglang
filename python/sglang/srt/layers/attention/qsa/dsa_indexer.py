@@ -8,7 +8,7 @@ primitive.  A tokenwise profile has ``compress_ratio = 1`` and
 inputs (``get_prefill_mqa_inputs``/``get_decode_mqa_inputs``).
 
 The BF16 torch reference compute (``torch_dsa_weighted_mqa_logits``) is the
-correctness oracle.  Under ``SGLANG_QWEN_DSA_USE_FP8_INDEXER`` the scoring
+correctness oracle.  Under ``SGLANG_QSA_USE_FP8_INDEXER`` the scoring
 fast paths are wired to DeepGEMM: fp8_mqa_logits for packed prefill and
 fp8_paged_mqa_logits for paged decode/verify.  For the compressed
 QSAIndexer (qsa_indexer.py) the flag covers the packed PREFILL only -- keys
@@ -106,7 +106,7 @@ class QwenDSAIndexer(MultiPlatformOp):
             raise ValueError(
                 f"tokenwise QSA requires page_size = 64, got {page_size}"
             )
-        self.use_fp8_indexer = envs.SGLANG_QWEN_DSA_USE_FP8_INDEXER.get()
+        self.use_fp8_indexer = envs.SGLANG_QSA_USE_FP8_INDEXER.get()
         if self.use_fp8_indexer:
             # DeepGEMM fast path for both scoring modes: packed prefill via
             # fp8_mqa_logits, paged modes (decode/verify) via
@@ -115,7 +115,7 @@ class QwenDSAIndexer(MultiPlatformOp):
                 import deep_gemm  # noqa: F401
             except ImportError as exc:  # fail loudly, never degrade
                 raise RuntimeError(
-                    "SGLANG_QWEN_DSA_USE_FP8_INDEXER requires the DeepGEMM "
+                    "SGLANG_QSA_USE_FP8_INDEXER requires the DeepGEMM "
                     f"package (with SM120 MQA logits): {exc}"
                 ) from exc
             logger.info(
