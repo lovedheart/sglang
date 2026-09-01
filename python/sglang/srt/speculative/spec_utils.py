@@ -812,7 +812,7 @@ def _verify_commit_step_indices(
         )
 
         track_interval = (
-            get_exec().mamba.mamba_track_interval
+            mamba_track_grid(batch.tree_cache.page_size)
             if batch.mamba_track_indices is not None
             else 0
         )
