@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
-from sglang.srt.utils.common import ceil_align, ceil_div
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
