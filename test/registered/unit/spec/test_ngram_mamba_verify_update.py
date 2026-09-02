@@ -422,5 +422,124 @@ class TestMtpVerifyHookSignature(CustomTestCase):
             )
 
 
+class TestReplaySSMFoldPleCommit(CustomTestCase):
+    """The ReplaySSM fold-every-commit path replaces the recurrent commit, so it
+    must scatter the PLE side states (ngram context + short-conv state) itself --
+    their per-step ``intermediate`` scratch is written during verify regardless of
+    the flag, and without the scatter the sidecar freezes for the whole run.
+    """
+
+    SIZE, SPEC, D, CTX = 6, 4, 8, 4
+
+    def _make_fold_worker(self, dst_indices, conv_state, context):
+        target_worker = MagicMock()
+        target_worker.model_runner.model = MagicMock()
+        req_pool = target_worker.model_runner.req_to_token_pool
+        req_pool.mamba_pool.replayssm_spec_fold = True
+        req_pool.mamba_pool.replayssm_is_kda = False
+        req_pool.mamba_pool.replayssm_cache_base = None
+        req_pool.get_mamba_indices.return_value = dst_indices
+        req_pool.translate_mamba_indices.side_effect = lambda x: x
+        req_pool.short_conv_pool.conv_state = None
+        req_pool.short_conv_pool.intermediate_conv_state = None
+        if conv_state is not None:
+            req_pool.short_conv_pool.conv_state = conv_state.unsqueeze(0).unsqueeze(0)
+        req_pool.ngram_pool.context = context
+        # Encode batch row and tree step into the value so both are observable.
+        enc = (
+            torch.arange(self.SPEC + 1, dtype=torch.int64).view(-1, 1) * 1000
+            + torch.arange(self.D, dtype=torch.int64).view(1, -1) * 10
+        )
+        req_pool.ngram_pool.intermediate_context = (
+            enc.view(self.SPEC + 1, self.D, 1)
+            .expand(self.SPEC + 1, self.D, self.CTX)
+            .contiguous()
+        )
+        return target_worker
+
+    def _run(self, target_worker, batch, accept_lens, accept_index):
+        with patch(
+            "sglang.srt.speculative.spec_utils.mambaish_config",
+            return_value={"some": "config"},
+        ), patch(
+            "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold."
+            "commit_gdn_replayssm_fold_after_verify"
+        ) as fold:
+            from sglang.srt.speculative.spec_utils import (
+                commit_mamba_states_after_verify,
+            )
+
+            commit_mamba_states_after_verify(
+                target_worker, batch, accept_lens, accept_index, draft_token_num=self.D
+            )
+        fold.assert_called_once()
+        return fold
+
+    def _batch(self, seq_lens, track_indices=None):
+        batch = MagicMock()
+        batch.forward_mode.is_idle.return_value = False
+        batch.mamba_track_indices = track_indices
+        batch.seq_lens = seq_lens
+        batch.tree_cache.page_size = 256
+        return batch
+
+    def test_fold_scatters_ngram_context_per_batch_row(self):
+        # req_pool rows 0..2 map to mamba slots 3, 1, 5; row 2 is padding (-1).
+        dst = torch.tensor([3, 1, -1], dtype=torch.int64)
+        context = torch.full((self.SIZE + 1, self.CTX), -7, dtype=torch.int64)
+        target_worker = self._make_fold_worker(dst, None, context)
+        batch = self._batch(torch.tensor([10, 20, 30], dtype=torch.int32))
+        batch.req_pool_indices = torch.tensor([0, 1, 2], dtype=torch.int64)
+        accept_lens = torch.tensor([3, 1, 1], dtype=torch.int32)
+        # 8-wide rows (draft_token_num == self.D); linear chain.
+        accept_index = torch.tensor(
+            [
+                [0, 1, 2, -1, -1, -1, -1, -1],
+                [8, -1, -1, -1, -1, -1, -1, -1],
+                [16, -1, -1, -1, -1, -1, -1, -1],
+            ],
+            dtype=torch.int32,
+        )
+
+        self._run(target_worker, batch, accept_lens, accept_index)
+
+        # Row 0 accepted 3 of 4 drafts -> step 2 of batch row 0; row 1 -> step 0.
+        self.assertEqual(context[3, 0].item(), 0 * 1000 + 2 * 10)
+        self.assertEqual(context[1, 0].item(), 1 * 1000 + 0 * 10)
+        # The padding row must leave its slot untouched.
+        self.assertTrue(torch.equal(context[5], torch.full((self.CTX,), -7)))
+
+    def test_fold_scatters_track_slot_on_interval_crossing(self):
+        # Two reqs in slots 3, 1; only the first crosses the 256-token track
+        # interval (step 2), the track slot is 4.
+        dst = torch.tensor([3, 1], dtype=torch.int64)
+        context = torch.full((self.SIZE + 1, self.CTX), -7, dtype=torch.int64)
+        target_worker = self._make_fold_worker(dst, None, context)
+        batch = self._batch(
+            torch.tensor([253, 128], dtype=torch.int32),
+            track_indices=torch.tensor([4, -1], dtype=torch.int64),
+        )
+        batch.req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
+        accept_lens = torch.tensor([4, 3], dtype=torch.int32)
+        accept_index = torch.tensor(
+            [
+                [0, 1, 2, 3, -1, -1, -1, -1],
+                [8, 9, 10, -1, -1, -1, -1, -1],
+            ],
+            dtype=torch.int32,
+        )
+
+        with patch(
+            "sglang.srt.speculative.spec_utils.mamba_track_grid", return_value=256
+        ):
+            self._run(target_worker, batch, accept_lens, accept_index)
+
+        # Working slots got the last accepted step; the crossing req also
+        # snapshot its interval-boundary step into the track slot.
+        self.assertEqual(context[3, 0].item(), 0 * 1000 + 3 * 10)
+        self.assertEqual(context[1, 0].item(), 1 * 1000 + 2 * 10)
+        self.assertEqual(context[4, 0].item(), 0 * 1000 + 2 * 10)
+
+
 if __name__ == "__main__":
     unittest.main()

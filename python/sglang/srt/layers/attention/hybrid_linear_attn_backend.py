@@ -1344,7 +1344,8 @@ class HybridLinearAttnBackend(AttentionBackend):
             mamba_steps_to_track,
         )
 
-        self._update_ple_state_after_mtp_verify(
+        update_ple_state_after_mtp_verify(
+            self.linear_attn_backend.req_to_token_pool,
             state_indices_tensor,
             last_correct_step_indices,
             mamba_track_indices,
@@ -1384,57 +1385,65 @@ class HybridLinearAttnBackend(AttentionBackend):
             :, src_indices[valid_indices], steps[valid_indices]
         ]
 
-    def _update_ple_state_after_mtp_verify(
-        self,
-        state_indices_tensor: torch.Tensor,
-        last_correct_step_indices: torch.Tensor,
-        mamba_track_indices: Optional[torch.Tensor],
-        mamba_steps_to_track: Optional[torch.Tensor],
+
+def update_ple_state_after_mtp_verify(
+    req_to_token_pool,
+    state_indices_tensor: torch.Tensor,
+    last_correct_step_indices: torch.Tensor,
+    mamba_track_indices: Optional[torch.Tensor],
+    mamba_steps_to_track: Optional[torch.Tensor],
+) -> None:
+    """Roll the accepted per-step PLE side states into their main slots.
+
+    Shared by the recurrent commit (via ``update_mamba_state_after_mtp_verify``)
+    and the ReplaySSM fold-every-commit path in ``spec_utils``: the PLE pools keep
+    their own per-draft ``intermediate`` scratch (sized by
+    ``speculative_num_draft_tokens``, independent of the SSM intermediate_ssm the
+    fold path drops), so the fold path must scatter them here too or the ngram /
+    short-conv context freezes for the whole spec decode run.
+    """
+    if mamba_track_indices is not None:
+        assert mamba_steps_to_track is not None
+
+    state_pairs = []
+    short_conv_pool = req_to_token_pool.short_conv_pool
+    if (
+        short_conv_pool.conv_state is not None
+        and short_conv_pool.intermediate_conv_state is not None
     ):
-        """Roll the accepted per-step PLE side states into their main slots."""
-        req_to_token_pool = self.linear_attn_backend.req_to_token_pool
+        state_pairs.append(
+            (
+                short_conv_pool.conv_state,
+                short_conv_pool.intermediate_conv_state,
+            )
+        )
+
+    ngram_pool = req_to_token_pool.ngram_pool
+    if (
+        ngram_pool.context is not None
+        and ngram_pool.intermediate_context is not None
+    ):
+        state_pairs.append(
+            (
+                ngram_pool.context.unsqueeze(0),
+                ngram_pool.intermediate_context.unsqueeze(0),
+            )
+        )
+
+    for state, intermediate_state in state_pairs:
+        HybridLinearAttnBackend._scatter_speculative_state_with_mask(
+            state,
+            intermediate_state,
+            state_indices_tensor,
+            last_correct_step_indices,
+        )
         if mamba_track_indices is not None:
-            assert mamba_steps_to_track is not None
-
-        state_pairs = []
-        short_conv_pool = req_to_token_pool.short_conv_pool
-        if (
-            short_conv_pool.conv_state is not None
-            and short_conv_pool.intermediate_conv_state is not None
-        ):
-            state_pairs.append(
-                (
-                    short_conv_pool.conv_state,
-                    short_conv_pool.intermediate_conv_state,
-                )
-            )
-
-        ngram_pool = req_to_token_pool.ngram_pool
-        if (
-            ngram_pool.context is not None
-            and ngram_pool.intermediate_context is not None
-        ):
-            state_pairs.append(
-                (
-                    ngram_pool.context.unsqueeze(0),
-                    ngram_pool.intermediate_context.unsqueeze(0),
-                )
-            )
-
-        for state, intermediate_state in state_pairs:
-            self._scatter_speculative_state_with_mask(
+            HybridLinearAttnBackend._scatter_speculative_state_with_mask(
                 state,
                 intermediate_state,
-                state_indices_tensor,
-                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
             )
-            if mamba_track_indices is not None:
-                self._scatter_speculative_state_with_mask(
-                    state,
-                    intermediate_state,
-                    mamba_track_indices,
-                    mamba_steps_to_track,
-                )
 
 
 class ShortConvHybridAttnBackend(HybridLinearAttnBackend):

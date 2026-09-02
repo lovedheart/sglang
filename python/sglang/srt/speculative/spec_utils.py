@@ -920,6 +920,23 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             null_block_id=-1,
         )
+        # PLE side states (ngram / short-conv) keep their own per-step
+        # intermediate scratch regardless of ReplaySSM, so the fold path must
+        # scatter them too -- otherwise they freeze for the whole spec run.
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            update_ple_state_after_mtp_verify,
+        )
+
+        track_idx = batch.mamba_track_indices
+        if track_idx is not None:
+            track_idx = req_pool.translate_mamba_indices(track_idx)
+        update_ple_state_after_mtp_verify(
+            req_pool,
+            state_batch_indices,
+            last_correct_step_indices,
+            track_idx,
+            mamba_steps_to_track,
+        )
         return
 
     if (
