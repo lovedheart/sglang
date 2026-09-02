@@ -189,6 +189,10 @@ def fused_hc_mix_supported(
     # device-scope atomics, so summation order varies across replays.
     if _deterministic_inference():
         return False
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_HC_MIX_TRITON.get():
+        return False
     return (
         hyper_input_normed.is_cuda
         and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
