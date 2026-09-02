@@ -672,6 +672,7 @@ def test_qsa_backend_is_registered():
 
 def test_qsa_idle_skips_metadata_construction():
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.kv_cache_quant_method = None
     backend.forward_metadata = object()
 
     backend.init_forward_metadata(
@@ -749,6 +750,7 @@ def test_qsa_cuda_graph_target_verify_ignores_capture_bucket_requests():
 
 def test_qsa_target_verify_rejects_branching_speculation():
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.kv_cache_quant_method = None
     backend.compress_ratio = 4
     try:
         backend._require_chain_speculation(
@@ -886,6 +888,7 @@ def test_qsa_extend_matches_with_and_without_dp_attention_padding(monkeypatch):
         token_slot_table=torch.arange(16, dtype=torch.int32).reshape(1, 16),
     )
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.kv_cache_quant_method = None
     backend.forward_metadata = metadata
 
     class Pool:
@@ -936,6 +939,7 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
         qsa_backend_module, "sparse_gqa_fwd_interface_triton", fake_sparse_gqa
     )
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.kv_cache_quant_method = None
 
     class Pool:
         def set_kv_buffer(self, layer, loc, k, v):
@@ -976,6 +980,7 @@ def _make_paged_extend_backend():
         token_slot_table=torch.arange(16, dtype=torch.int32).reshape(1, 16),
     )
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.kv_cache_quant_method = None
     backend.forward_metadata = metadata
 
     class Pool:
@@ -1981,6 +1986,7 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path():
     def run_case(mode, bs, num_rows, seq_lens_list, extend_len, extend_lens=None):
         pool = _Pool()
         backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+        backend.kv_cache_quant_method = None
         # A page-aligned token table: request r's token i lives in full page
         # (r * 32 + i // 64) at offset i % 64, mirroring the paged allocator.
         rows = torch.arange(8, dtype=torch.int32, device=device)[:, None]
@@ -2151,6 +2157,7 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
     def run_case(mode, bs, num_rows, seq_lens, extend_lens, extend_len, num_padding):
         pool = _Pool()
         backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+        backend.kv_cache_quant_method = None
         rows = torch.arange(8, dtype=torch.int32, device=device)[:, None]
         cols = torch.arange(4096, dtype=torch.int32, device=device)[None, :]
         backend.req_to_token = (
@@ -2387,6 +2394,120 @@ def test_qsa_backend_unquantized_pool_is_untouched():
     assert (
         QwenSparseAttnBackend(plain_runner).kv_cache_quant_method is None
     )
+
+
+def _make_fp4_qsa_pool(quant_name):
+    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        get_kv_cache_quant_method,
+    )
+    from sglang.srt.mem_cache.qsa_kv_pool import QwenDSATokenToKVPool
+
+    quant_method = get_kv_cache_quant_method(
+        quant_name, num_layers=1, device="cpu"
+    )
+    pool = QwenDSATokenToKVPool(
+        size=128,
+        dtype=torch.bfloat16,
+        page_size=64,
+        head_num=2,
+        head_dim=16,
+        full_attention_layer_ids=[0],
+        device="cpu",
+        mamba_pool=SimpleNamespace(),
+        qsa_index_kv_heads=1,
+        qsa_index_head_dim=8,
+        qsa_token_budget=64,
+        enable_memory_saver=False,
+        start_layer=0,
+        quant_method=quant_method,
+    )
+    return pool, quant_method
+
+
+@pytest.mark.parametrize("quant_name", ["fp4_mx_block16"])
+def test_qsa_gather_dequant_matches_full_pool_dequant(quant_name):
+    """Row-gathered dequant must equal dequantizing the whole pool first:
+    the QSA FP4 path replaces element indexing with whole-row dequant, so any
+    addressing mistake (packed vs element strides) shows up here."""
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.kv_cache_quant_method = None
+    pool, quant_method = _make_fp4_qsa_pool(quant_name)
+    backend.token_to_kv_pool = pool
+    backend.kv_cache_quant_method = quant_method
+    backend._fp4_attn_dtype = torch.bfloat16
+
+    torch.manual_seed(5)
+    loc = torch.tensor([0, 3, 17, 127], dtype=torch.int64)
+    k = torch.randn(4, 2, 16, dtype=torch.bfloat16)
+    v = torch.randn(4, 2, 16, dtype=torch.bfloat16)
+    pool.set_kv_buffer(SimpleNamespace(layer_id=0), loc, k, v)
+
+    slots = torch.tensor([0, 3, 3, 17, -1, 127], dtype=torch.int64)
+    k_rows, v_rows = backend._gather_kv_fp4(0, slots)
+    assert k_rows.dtype == torch.bfloat16
+    assert k_rows.shape == (6, 2, 16)
+    # Written rows come back within the FP4 grid of the source values.
+    torch.testing.assert_close(k_rows[[0, 1, 3, 5]], k, rtol=0.5, atol=0.5)
+    torch.testing.assert_close(v_rows[[0, 1, 3, 5]], v, rtol=0.5, atol=0.5)
+    # Gathered rows are bit-identical to whole-buffer dequant addressed the
+    # same way (invalid -1 slots clamp to row 0; callers mask them).
+    k_fp4, v_fp4, k_scales, v_scales = pool.get_raw_kv_buffer(0)
+    k_all, v_all = quant_method.dequantize_gathered_kv(
+        k_fp4, k_scales, v_fp4, v_scales, 0, dtype=torch.bfloat16
+    )
+    torch.testing.assert_close(
+        k_rows, k_all.index_select(0, slots.clamp(min=0)), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        v_rows, v_all.index_select(0, slots.clamp(min=0)), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("quant_name", ["fp4_mx_block16"])
+def test_qsa_fp4_paged_reference_matches_dequantized_pool(quant_name):
+    """End-to-end wiring: the CPU paged reference path over an FP4 pool must
+    equal the same reference over the fully dequantized pool (bit-exact),
+    which pins the slot-address remap the gather path installs."""
+    from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention
+
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.kv_cache_quant_method = None
+    pool, quant_method = _make_fp4_qsa_pool(quant_name)
+    backend.token_to_kv_pool = pool
+    backend.kv_cache_quant_method = quant_method
+    backend._fp4_attn_dtype = torch.bfloat16
+
+    torch.manual_seed(7)
+    k = torch.randn(8, 2, 16, dtype=torch.bfloat16)
+    v = torch.randn(8, 2, 16, dtype=torch.bfloat16)
+    pool.set_kv_buffer(
+        SimpleNamespace(layer_id=0), torch.arange(8, dtype=torch.int64), k, v
+    )
+    metadata = SimpleNamespace(
+        token_to_batch_idx=torch.tensor([0, 1], dtype=torch.int32),
+        sequence_lengths=torch.tensor([4, 4], dtype=torch.int32),
+        token_slot_table=torch.tensor(
+            [[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32
+        ),
+        row_req_pool_indices=None,
+        is_cuda_graph=False,
+    )
+    backend._resolve_metadata = lambda fb: metadata
+    q = torch.randn(2, 2, 16, dtype=torch.bfloat16)
+    # Second row's third index exceeds its length: exercises the -1 mask
+    # through the remapped addressing.
+    topk = torch.tensor([[0, 2, 1], [1, 3, 9]], dtype=torch.int32)
+    layer = SimpleNamespace(layer_id=0, scaling=0.2)
+    batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+    output = backend._forward_paged_attention(q, layer, batch, topk)
+
+    k_fp4, v_fp4, k_scales, v_scales = pool.get_raw_kv_buffer(0)
+    k_all, v_all = quant_method.dequantize_gathered_kv(
+        k_fp4, k_scales, v_fp4, v_scales, 0, dtype=torch.bfloat16
+    )
+    slots = backend._logical_to_physical(topk, metadata)
+    expected = qsa_sparse_attention(q, k_all, v_all, slots, layer.scaling)
+    torch.testing.assert_close(output.reshape(2, -1), expected.reshape(2, -1))
 
 
 if __name__ == "__main__":
