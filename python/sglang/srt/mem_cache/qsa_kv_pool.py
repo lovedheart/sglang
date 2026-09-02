@@ -12,6 +12,7 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.layers.attention.qsa.metadata import qsa_ring_stride
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
 
 
@@ -142,15 +143,19 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # keeps every extend chunk group-aligned, so the only state that
         # must survive a forward is the pending group's members -- at most
         # ``ratio`` tokens per request, addressed as
-        # ``req_pool_idx * ratio + position % ratio``. Request slot 0 is
-        # never allocated, so ring rows [0, ratio) double as the inert dump
-        # for tokens whose group already compressed in the same forward.
+        # ``req_pool_idx * stride + position % stride`` (stride = 2*ratio via
+        # qsa_ring_stride, so a speculative verify window cannot alias the
+        # pending group it compresses). Request slot 0 is never allocated, so
+        # ring rows [0, stride) double as the inert dump for tokens whose
+        # group already compressed in the same forward.
         if num_request_slots <= 0:
             raise ValueError(
                 f"QSA pending ring needs request slots, got {num_request_slots}"
             )
         self.qsa_num_request_slots = int(num_request_slots)
-        ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
+        ring_slots = self.qsa_num_request_slots * qsa_ring_stride(
+            self.qsa_compress_ratio
+        )
         self.qsa_key_state_buffer_pool = [
             torch.zeros(
                 (ring_slots, self.qsa_index_kv_heads, self.qsa_index_head_dim),

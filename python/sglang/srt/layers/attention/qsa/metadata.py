@@ -235,6 +235,22 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         )
 
 
+def qsa_ring_stride(compress_ratio: int) -> int:
+    """Slots per request in the pending-group ring.
+
+    The stride must exceed one group: a speculative verify forward stores its
+    whole draft window into the ring BEFORE compressing the boundary group, so
+    under a ``% ratio`` stride the window's later rows clobber the still
+    needed members of that group (same class of bug DSWA fixed as
+    ``ring_stride = window + max_spec_steps``). A stride of ``2 * ratio``
+    keeps one full group plus one speculation window apart. The STRIDE (not
+    just the base) must change: under ``% ratio`` positions p and p+ratio
+    always alias. Request slot 0 stays the inert dump; ring rows
+    [0, stride) belong to it and are never allocated.
+    """
+    return 2 * compress_ratio
+
+
 def build_pending_ring_slots(
     *,
     token_to_batch_idx: torch.Tensor,
@@ -246,21 +262,23 @@ def build_pending_ring_slots(
 ) -> torch.Tensor:
     """Per-token slots in the per-request pending ring.
 
-    ``req_pool_idx * ratio + position % ratio``: four consecutive positions
-    occupy four distinct slots, which is exactly the pending group. On extend
-    forwards only that pending tail must survive the forward (compression
-    sources members from the chunk itself), so older tokens dump into ring
-    rows [0, ratio) -- request slot 0 is never allocated. Pure tensor
-    arithmetic, CUDA-graph safe.
+    ``req_pool_idx * stride + position % stride`` (stride =
+    ``qsa_ring_stride(ratio)``): the pending group's positions occupy
+    ``ratio`` distinct slots and a speculation window cannot alias them. On
+    extend forwards only that pending tail must survive the forward
+    (compression sources members from the chunk itself), so older tokens dump
+    into ring rows [0, stride) -- request slot 0 is never allocated. Pure
+    tensor arithmetic, CUDA-graph safe.
     """
+    stride = qsa_ring_stride(compress_ratio)
     rows = token_to_batch_idx.long()[: logical_positions.numel()]
     requests = req_pool_indices.long()[rows]
     positions = logical_positions.long()
-    slots = requests * compress_ratio + positions % compress_ratio
+    slots = requests * stride + positions % stride
     if is_extend:
         lengths = sequence_lengths.long()[rows]
         pending = positions >= (lengths // compress_ratio) * compress_ratio
-        slots = torch.where(pending, slots, positions % compress_ratio)
+        slots = torch.where(pending, slots, positions % stride)
     return slots
 
 
@@ -272,6 +290,7 @@ def build_group_ring_slots(
     compress_ratio: int,
 ) -> torch.Tensor:
     """Ring slots of a planned group's members, oldest first."""
+    stride = qsa_ring_stride(compress_ratio)
     requests = req_pool_indices.long()[sequence_ids]
     offsets = torch.arange(
         compress_ratio - 1, -1, -1,
@@ -279,7 +298,7 @@ def build_group_ring_slots(
         dtype=torch.long,
     )
     positions = (group_end_positions[:, None] - offsets[None, :]).clamp_min(0)
-    return requests[:, None] * compress_ratio + positions % compress_ratio
+    return requests[:, None] * stride + positions % stride
 
 
 def build_rope_position_matrix(

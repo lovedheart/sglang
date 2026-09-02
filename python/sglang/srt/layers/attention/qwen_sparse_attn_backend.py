@@ -268,13 +268,17 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "speculative_eagle_topk=1"
             )
         draft_tokens = int(getattr(spec_info, "draft_token_num", 0) or 0)
-        if draft_tokens > self.compress_ratio:
-            # The pending-group ring keys state by position % ratio; a verify
-            # window wider than the ratio would collide within one forward.
+        if draft_tokens > 2 * self.compress_ratio:
+            # The pending-group ring strides 2*ratio positions (see
+            # qsa_ring_stride): one full group plus one speculation window
+            # never alias, so a verify window up to 2*ratio cannot clobber a
+            # member still needed by this forward's compression. A wider
+            # window could wrap onto one.
             raise NotImplementedError(
-                "Qwen QSA requires speculative_num_draft_tokens <= the QSA "
-                f"compress ratio ({self.compress_ratio}): the pending "
-                f"index-key ring holds one group; got {draft_tokens}"
+                "Qwen QSA requires speculative_num_draft_tokens <= 2 * the QSA "
+                f"compress ratio ({2 * self.compress_ratio}): the pending "
+                f"index-key ring holds one group plus a speculation window;"
+                f" got {draft_tokens}"
             )
 
     @staticmethod
