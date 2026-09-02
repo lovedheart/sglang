@@ -95,8 +95,22 @@ class QSAIndexer(MultiPlatformOp):
         # if deep_gemm is missing.
         from sglang.srt.environ import envs
 
-        self.use_fp8_indexer = envs.SGLANG_QSA_USE_FP8_INDEXER.get()
-        if self.use_fp8_indexer:
+        # FP4 takes precedence: enabling it implies FP4, not FP8, scoring.
+        self.use_fp4_indexer = envs.SGLANG_QSA_USE_FP4_INDEXER.get()
+        self.use_fp8_indexer = (
+            envs.SGLANG_QSA_USE_FP8_INDEXER.get() and not self.use_fp4_indexer
+        )
+        if self.use_fp4_indexer:
+            from sglang.srt.layers.attention.qsa.mqa import _require_deepgemm
+
+            _require_deepgemm(fp4=True)
+            logger.info(
+                "QSAIndexer layer %s: FP4 indexer enabled (DeepGEMM "
+                "fp8_fp4_mqa_logits packed prefill on call-site-quantized "
+                "fp4 keys; decode stays BF16 paged).",
+                layer_id,
+            )
+        elif self.use_fp8_indexer:
             from sglang.srt.layers.attention.qsa.mqa import _require_deepgemm
 
             _require_deepgemm()
@@ -479,9 +493,26 @@ class QSAIndexer(MultiPlatformOp):
         row_chunk_size = _qsa_prefill_row_chunk_size(
             rows, compressed_keys.shape[0], q.shape[1]
         )
+        num_keys = compressed_keys.shape[0]
         if (
+            getattr(self, "use_fp4_indexer", False)
+            and num_keys
+            and q.is_cuda
+        ):
+            # The pool keeps BF16 compressed keys; quantize the whole slab
+            # once per forward (shared across row chunks) into the packed
+            # (codes, ue8m0-scales) pair so qsa_mqa_prefill routes to the
+            # DeepGEMM packed FP4 kernel.
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                quantize_fp4_indexer_tensor,
+            )
+
+            compressed_keys = quantize_fp4_indexer_tensor(
+                compressed_keys.reshape(-1, compressed_keys.shape[-1])
+            )
+        elif (
             getattr(self, "use_fp8_indexer", False)
-            and compressed_keys.shape[0]
+            and num_keys
             and q.is_cuda
         ):
             # The pool keeps BF16 compressed keys; cast the whole (once per
@@ -491,7 +522,7 @@ class QSAIndexer(MultiPlatformOp):
         for row_start in range(0, rows, row_chunk_size):
             row_end = min(row_start + row_chunk_size, rows)
             chunk_slice = slice(row_start, row_end)
-            if compressed_keys.shape[0] == 0:
+            if num_keys == 0:
                 block_indices = torch.full(
                     (row_end - row_start, self.block_topk),
                     -1,
