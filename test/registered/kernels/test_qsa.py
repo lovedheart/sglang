@@ -2337,5 +2337,57 @@ def test_qsa_ring_stride_separates_speculation_window():
     assert (base + 5 % stride) != (base + (5 + ratio) % stride)
 
 
+def _make_quant_pool_runner(quant_method):
+    runner, _, _ = _make_qsa_runner_and_pool()
+    runner.token_to_kv_pool.get_kv_cache_quant_method = lambda: quant_method
+    return runner
+
+
+class _UnsupportedQuantMethod:
+    """Registry-less quant method: resolves no attention access at all."""
+
+    name = "quantum_foo"
+
+    def resolve_attention_access(self, phase, backend):
+        return None
+
+    def describe_attention_accesses(self, phase):
+        return []
+
+
+def test_qsa_backend_rejects_unsupported_kv_quant_methods():
+    with pytest.raises(ValueError, match="does not support"):
+        QwenSparseAttnBackend(_make_quant_pool_runner(_UnsupportedQuantMethod()))
+
+
+@pytest.mark.parametrize("quant_name", ["nvfp4", "fp4_mx_block16"])
+def test_qsa_backend_accepts_gather_dequant_kv_quant_methods(quant_name):
+    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        get_kv_cache_quant_method,
+    )
+
+    quant_method = get_kv_cache_quant_method(
+        quant_name, num_layers=2, device="cpu"
+    )
+    backend = QwenSparseAttnBackend(_make_quant_pool_runner(quant_method))
+    assert backend.kv_cache_quant_method is quant_method
+
+
+def test_qsa_backend_unquantized_pool_is_untouched():
+    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        UnquantizedKVCacheMethod,
+    )
+
+    backend = QwenSparseAttnBackend(
+        _make_quant_pool_runner(UnquantizedKVCacheMethod())
+    )
+    assert backend.kv_cache_quant_method is None
+    # Pools predating the accessor (fake harness pools) must keep working.
+    plain_runner, _, _ = _make_qsa_runner_and_pool()
+    assert (
+        QwenSparseAttnBackend(plain_runner).kv_cache_quant_method is None
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
