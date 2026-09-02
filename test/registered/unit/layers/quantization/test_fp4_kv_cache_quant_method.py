@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=35, suite="base-a-test-cpu")
 
+import argparse
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -62,6 +63,67 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         self.assertEqual(resolve_kv_cache_quant("nvfp4"), "nvfp4")
         self.assertEqual(resolve_kv_cache_quant("fp4_mx_block16"), "fp4_mx_block16")
         self.assertIsNone(resolve_kv_cache_quant("fp8_e4m3"))
+
+    def test_resolve_retired_fp4_alias_is_no_quant(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            resolve_kv_cache_quant,
+        )
+
+        # The legacy "fp4_e2m1" alias was retired upstream (deprecated-alias
+        # removal); it no longer names a recipe and resolves to an
+        # unquantized cache.
+        self.assertIsNone(resolve_kv_cache_quant("fp4_e2m1"))
+
+    def test_cli_rejects_retired_fp4_alias(self):
+        from sglang.srt.server_args import ServerArgs
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        action = next(
+            a for a in parser._actions if "--kv-cache-dtype" in a.option_strings
+        )
+        self.assertNotIn("fp4_e2m1", action.choices)
+
+    @unittest.skipUnless(
+        hasattr(torch, "float4_e2m1fn_x2"), "FP4 storage dtype required"
+    )
+    def test_draft_kv_pinned_to_bf16_under_fp4_target(self):
+        from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+
+        for target_dtype_str in ("nvfp4", "fp4_mx_block16"):
+            resolved, dtype = configure_kv_cache_dtype(
+                server_args_kv_cache_dtype=target_dtype_str,
+                model=None,
+                model_dtype=torch.bfloat16,
+                is_draft_worker=True,
+                is_dflash=False,
+                speculative_draft_attention_backend="triton",
+            )
+            self.assertEqual(dtype, torch.bfloat16)
+            # "auto" tags the unquantized pool for backend descale gating.
+            self.assertEqual(resolved, "auto")
+            # The target itself keeps FP4.
+            _, dtype_t = configure_kv_cache_dtype(
+                server_args_kv_cache_dtype=target_dtype_str,
+                model=None,
+                model_dtype=torch.bfloat16,
+                is_draft_worker=False,
+                is_dflash=False,
+                speculative_draft_attention_backend="triton",
+            )
+            self.assertEqual(dtype_t, torch.float4_e2m1fn_x2)
+        # An explicit draft dtype still overrides the pin.
+        resolved, dtype = configure_kv_cache_dtype(
+            server_args_kv_cache_dtype="nvfp4",
+            model=None,
+            model_dtype=torch.bfloat16,
+            is_draft_worker=True,
+            is_dflash=False,
+            speculative_draft_attention_backend="triton",
+            speculative_draft_kv_cache_dtype="fp8_e4m3",
+        )
+        self.assertEqual(dtype, torch.float8_e4m3fn)
+        self.assertEqual(resolved, "fp8_e4m3")
 
     def test_resolve_mxfp4_name_raises(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
