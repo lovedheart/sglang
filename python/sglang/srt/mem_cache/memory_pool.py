@@ -2622,7 +2622,13 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _quantized_scales(self, global_layer_id: int, k_scale, v_scale):
-        if k_scale is None and hasattr(self.quant_method, "k_scales_gpu"):
+        # FP4 pools own their per-layer global scales on device
+        # (k_scales_gpu, indexed by global layer id).  Callers may carry a
+        # different flavor -- RadixAttention defaults are CPU float 1.0 --
+        # which would both break CUDA-graph capture (CPU->GPU copy in the
+        # quantize kernel path) and ignore the loaded calibration scales;
+        # so whenever the method has GPU scales they win.
+        if hasattr(self.quant_method, "k_scales_gpu"):
             k_scale = self.quant_method.k_scales_gpu[
                 global_layer_id : global_layer_id + 1
             ]
