@@ -249,11 +249,11 @@ class QSATokenToKVPool(HybridLinearKVPool):
 class QwenDSATokenToKVPool(HybridLinearKVPool):
     """Hybrid KV pool carrying the per-token index-K cache of tokenwise QSA.
 
-    Only the BF16 reference layout is ported: one flat
+    BF16 reference layout: one flat
     ``[size + page_size, index_kv_heads, index_head_dim]`` buffer per
-    full-attention (DSA) layer, addressed by raw KV slots.  The FP8
-    deep_gemm layout is intentionally not ported yet and the caller-side
-    fast paths fail loudly instead of silently degrading.
+    full-attention (DSA) layer, addressed by raw KV slots.  Under
+    ``SGLANG_QSA_USE_FP8_INDEXER`` / ``SGLANG_QSA_USE_FP4_INDEXER`` the
+    quantized paged layouts replace it (see ``__init__``).
     """
 
     index_state_dtype = torch.bfloat16
@@ -262,12 +262,21 @@ class QwenDSATokenToKVPool(HybridLinearKVPool):
     def qsa_bytes_per_token(
         cls, *, kv_heads: int, head_dim: int, num_layers: int
     ) -> int:
-        return (
-            _index_k_bytes(
+        # Must mirror the __init__ layout choice, including the paged
+        # quantized variants: fp4 packs head_dim/2 code bytes plus 4 ue8m0
+        # scale bytes, fp8 stores head_dim bytes plus 4 constant fp32 scale
+        # bytes; BF16 keeps kv_heads * head_dim * 2.
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_QSA_USE_FP4_INDEXER.get():
+            per_token = kv_heads * (head_dim // 2 + 4)
+        elif envs.SGLANG_QSA_USE_FP8_INDEXER.get():
+            per_token = kv_heads * (head_dim + 4)
+        else:
+            per_token = _index_k_bytes(
                 kv_heads=kv_heads, head_dim=head_dim, dtype=cls.index_state_dtype
             )
-            * num_layers
-        )
+        return per_token * num_layers
 
     def __init__(
         self,
@@ -334,14 +343,39 @@ class QwenDSATokenToKVPool(HybridLinearKVPool):
         # Slots map to (slot // 64) page, offset slot % 64, so the block
         # table is slot_table[:, ::64] // 64.  In this mode the BF16 twin is
         # not allocated: every read gathers from the fp8 pages.
+        # FP4 (SGLANG_QSA_USE_FP4_INDEXER, takes precedence) stores packed
+        # e2m1 codes plus four group-32 ue8m0 scale bytes per token --
+        # [pages, 64, 1, head_dim/2 + 4] uint8, the exact DeepSeek-V4 fp4
+        # indexer page contract (head_dim/2 code bytes, then 4 packed scale
+        # bytes).  Scale bytes are real per-token values written by the
+        # store kernel, never a constant.
         from sglang.srt.environ import envs
 
-        self.qsa_use_fp8_indexer = envs.SGLANG_QSA_USE_FP8_INDEXER.get()
+        self.qsa_use_fp4_indexer = envs.SGLANG_QSA_USE_FP4_INDEXER.get()
+        self.qsa_use_fp8_indexer = (
+            envs.SGLANG_QSA_USE_FP8_INDEXER.get() and not self.qsa_use_fp4_indexer
+        )
         self.qsa_index_page_size = page_size
         num_pages = state_size // page_size
         assert state_size % page_size == 0, "index-K pages must align"
         hd = self.qsa_index_head_dim
-        if self.qsa_use_fp8_indexer:
+        if self.qsa_use_fp4_indexer:
+            if hd != 128:
+                raise ValueError(
+                    "tokenwise QSA FP4 index-K requires head_dim 128 (the "
+                    "DeepSeek-V4 fp4 quant kernels pack 128-element tokens), "
+                    f"got {hd}"
+                )
+            self.dsa_index_k_buffer_pool = None
+            self.dsa_index_paged_pool = [
+                torch.zeros(
+                    (num_pages, page_size, 1, hd // 2 + 4),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                for _ in full_attention_layer_ids
+            ]
+        elif self.qsa_use_fp8_indexer:
             self.dsa_index_k_buffer_pool = None
             paged = []
             for _ in full_attention_layer_ids:
@@ -382,12 +416,39 @@ class QwenDSATokenToKVPool(HybridLinearKVPool):
             loc % self.qsa_index_page_size
         ) * head_dim
 
+    def _qsa_index_fp4_payload_offsets(self, loc: torch.Tensor) -> torch.Tensor:
+        """Flat byte offsets of each slot's packed-code payload in an fp4 page.
+
+        Page layout (DeepSeek-V4 fp4 indexer contract): ``page_size *
+        head_dim/2`` code bytes (token i at i * head_dim/2), then
+        ``page_size * 4`` packed ue8m0 scale bytes (token i at
+        page_size * head_dim/2 + i * 4).
+        """
+        code_bytes = self.qsa_index_head_dim // 2
+        page_stride = self.qsa_index_page_size * (code_bytes + 4)
+        loc = loc.long()
+        return (loc // self.qsa_index_page_size) * page_stride + (
+            loc % self.qsa_index_page_size
+        ) * code_bytes
+
     def set_dsa_index_k_buffer(
         self, layer_id: int, loc: torch.Tensor, index_k: torch.Tensor
     ) -> None:
         layer = self._transfer_full_attention_id(layer_id)
         if self.dsa_index_paged_pool is not None:
             fused = self.dsa_index_paged_pool[layer]
+            if self.qsa_use_fp4_indexer:
+                from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                    store_fp4_index_k_cache,
+                )
+
+                store_fp4_index_k_cache(
+                    input=index_k.reshape(-1, self.qsa_index_head_dim),
+                    cache=fused.view(fused.shape[0], -1),
+                    loc=loc.long(),
+                    page_size=self.qsa_index_page_size,
+                )
+                return
             head_dim = self.qsa_index_head_dim
             offs = self._qsa_index_slot_offsets(loc).unsqueeze(1) + torch.arange(
                 head_dim, dtype=torch.int64, device=loc.device
@@ -401,8 +462,9 @@ class QwenDSATokenToKVPool(HybridLinearKVPool):
     def get_dsa_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         if self.dsa_index_k_buffer_pool is None:
             raise RuntimeError(
-                "tokenwise QSA BF16 index-K buffer is absent in FP8-indexer "
-                "mode; gather via get_dsa_index_k_fp8 instead"
+                "tokenwise QSA BF16 index-K buffer is absent in quantized "
+                "(FP8/FP4) indexer mode; gather via get_dsa_index_k_fp8 or "
+                "get_dsa_index_k_fp4 instead"
             )
         return self.dsa_index_k_buffer_pool[self._transfer_full_attention_id(layer_id)]
 
@@ -419,6 +481,36 @@ class QwenDSATokenToKVPool(HybridLinearKVPool):
             head_dim, dtype=torch.int64, device=slots.device
         )
         return fused.view(-1)[idx].view(torch.float8_e4m3fn)
+
+    def get_dsa_index_k_fp4(
+        self, layer_id: int, slots: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather packed fp4 codes + ue8m0 scales for ``slots`` ([N] -> ...).
+
+        Returns ``(codes int8 [N, head_dim/2], sf int32 [N])`` as consumed by
+        the DeepGEMM packed FP4 MQA kernel.
+        """
+        fused = self.get_dsa_index_paged(layer_id)
+        code_bytes = self.qsa_index_head_dim // 2
+        page_size = self.qsa_index_page_size
+        base = self._qsa_index_fp4_payload_offsets(slots).long()
+        codes = fused.view(-1)[
+            base[:, None] + torch.arange(code_bytes, dtype=torch.int64, device=slots.device)
+        ].view(torch.int8)
+        # Scale bytes live in a separate per-page tail: after the whole
+        # page's code block, 4 bytes per token slot.
+        slots_long = slots.long()
+        sf_base = (
+            (slots_long // page_size) * (page_size * (code_bytes + 4))
+            + page_size * code_bytes
+            + (slots_long % page_size) * 4
+        )
+        sf_bytes = fused.view(-1)[
+            sf_base[:, None]
+            + torch.arange(4, dtype=torch.int64, device=slots.device)
+        ]
+        sf = sf_bytes.contiguous().view(torch.int32).reshape(-1)
+        return codes, sf
 
     def get_kv_size_bytes(self):
         k_size, v_size = super().get_kv_size_bytes()

@@ -106,8 +106,26 @@ class QwenDSAIndexer(MultiPlatformOp):
             raise ValueError(
                 f"tokenwise QSA requires page_size = 64, got {page_size}"
             )
-        self.use_fp8_indexer = envs.SGLANG_QSA_USE_FP8_INDEXER.get()
-        if self.use_fp8_indexer:
+        # FP4 takes precedence over the FP8 flag.
+        self.use_fp4_indexer = envs.SGLANG_QSA_USE_FP4_INDEXER.get()
+        self.use_fp8_indexer = (
+            envs.SGLANG_QSA_USE_FP8_INDEXER.get() and not self.use_fp4_indexer
+        )
+        if self.use_fp4_indexer:
+            # DeepGEMM FP4 fast path for both scoring modes: packed
+            # fp8_fp4_mqa_logits prefill over gathered packed pages, paged
+            # fp8_fp4_paged_mqa_logits decode over the 68 B/token fp4 index
+            # pages (e2m1 codes + four group-32 ue8m0 scale bytes).
+            from sglang.srt.layers.attention.qsa.mqa import _require_deepgemm
+
+            _require_deepgemm(fp4=True)
+            logger.info(
+                "QwenDSAIndexer layer %s: FP4 indexer enabled "
+                "(DeepGEMM fp8_fp4_mqa_logits prefill + fp8_fp4_paged_"
+                "mqa_logits decode).",
+                layer_id,
+            )
+        elif self.use_fp8_indexer:
             # DeepGEMM fast path for both scoring modes: packed prefill via
             # fp8_mqa_logits, paged modes (decode/verify) via
             # fp8_paged_mqa_logits over the fused page layout.
@@ -317,6 +335,64 @@ class QwenDSAIndexer(MultiPlatformOp):
         output = torch.full(
             (rows, self.token_topk), -1, dtype=torch.int32, device=q.device
         )
+        if getattr(self, "use_fp4_indexer", False):
+            import deep_gemm
+
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                quantize_fp4_indexer_tensor,
+            )
+
+            # Same slot-page mapping as the fp8 path; the fp4 fused page is
+            # the DeepSeek-V4 layout (head_dim/2 code bytes then 4 packed
+            # ue8m0 scale bytes per token), which is what this kernel wants.
+            fused_kv = pool.get_dsa_index_paged(self.layer_id)
+            context_lens_1d = sequence_lengths.clamp(min=0, max=max_len)
+            context_lens = context_lens_1d.unsqueeze(1).contiguous()  # [rows, next_n=1]
+            block_table = (table[:, :: self.page_size] // self.page_size).to(
+                torch.int32
+            ).contiguous()
+            # The FP4 kernel requires a multiple-of-8 head count; pad the
+            # real heads to 8 with zero weights so pads contribute nothing.
+            scale_heads = next(h for h in (8, 16, 32, 64) if h >= self.index_n_heads)
+            q_pad = q
+            if q_pad.shape[1] < scale_heads:
+                q_pad = torch.nn.functional.pad(
+                    q_pad, (0, 0, 0, scale_heads - q_pad.shape[1])
+                )
+            q_codes, q_sf = quantize_fp4_indexer_tensor(
+                q_pad.contiguous().reshape(rows * scale_heads, self.index_head_dim)
+            )
+            weights = w.float() / self.score_scale
+            if weights.shape[1] < scale_heads:
+                weights = torch.nn.functional.pad(
+                    weights, (0, scale_heads - weights.shape[1])
+                )
+            logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+                (
+                    q_codes.view(rows, 1, scale_heads, self.index_head_dim // 2),
+                    q_sf.view(rows, 1, scale_heads),
+                ),
+                fused_kv.view(-1, self.page_size, 1, self.index_head_dim // 2 + 4),
+                weights,
+                context_lens,
+                block_table,
+                deep_gemm.get_paged_mqa_logits_metadata(
+                    context_lens,
+                    self.page_size,
+                    deep_gemm.get_num_sms(),
+                ),
+                max_len,
+                clean_logits=False,
+            )
+            selected = qsa_fast_topk(
+                logits.view(rows, -1),
+                torch.zeros_like(context_lens_1d),
+                context_lens_1d,
+                topk=self.token_topk,
+            )
+            output.copy_(selected)
+            return output
+
         if getattr(self, "use_fp8_indexer", False):
             import deep_gemm
 
@@ -416,6 +492,42 @@ class QwenDSAIndexer(MultiPlatformOp):
         output = torch.full(
             (rows, self.token_topk), -1, dtype=torch.int32, device=q.device
         )
+        if getattr(self, "use_fp4_indexer", False):
+            from sglang.srt.layers.attention.qsa.mqa import (
+                deepgemm_qsa_mqa_prefill_fp4,
+            )
+
+            for sequence_id in range(sequence_lengths.numel()):
+                seq_len = int(sequence_lengths[sequence_id].item())
+                row_mask = query_sequence_ids == sequence_id
+                if seq_len <= 0 or not bool(row_mask.any()):
+                    continue
+                row_indices = row_mask.nonzero(as_tuple=True)[0]
+                slots = table[sequence_id, :seq_len].long()
+                k_fp4 = pool.get_dsa_index_k_fp4(self.layer_id, slots)
+                row_chunk = _qsa_prefill_row_chunk_size(
+                    row_indices.numel(), seq_len, self.index_n_heads
+                )
+                for chunk_start in range(0, row_indices.numel(), row_chunk):
+                    chunk_rows = row_indices[chunk_start : chunk_start + row_chunk]
+                    row_ends = row_ends_all.index_select(0, chunk_rows)
+                    logits = deepgemm_qsa_mqa_prefill_fp4(
+                        q.index_select(0, chunk_rows),
+                        k_fp4,
+                        torch.zeros_like(row_ends),
+                        row_ends,
+                        self.score_scale,
+                        head_weights=w.index_select(0, chunk_rows),
+                    )
+                    selected = qsa_fast_topk(
+                        logits,
+                        torch.zeros_like(row_ends),
+                        row_ends,
+                        topk=self.token_topk,
+                    )
+                    output[chunk_rows] = selected
+            return output
+
         if getattr(self, "use_fp8_indexer", False):
             import deep_gemm
 
