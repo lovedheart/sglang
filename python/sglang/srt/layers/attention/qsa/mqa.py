@@ -124,12 +124,19 @@ def torch_qsa_mqa_decode(
 _DEEPGEMM_ALLOWED_HEADS = (8, 16, 32, 64)
 
 
-def _require_deepgemm() -> None:
+
+def _require_deepgemm(fp4: bool = False) -> None:
     if not HAS_DEEPGEMM:
         raise RuntimeError(
             "SGLANG_QSA_USE_FP8_INDEXER requires the deep_gemm package "
             "(with SM120 fp8 MQA-logits kernels); install deep_gemm or unset "
             "the flag to keep the BF16 indexer."
+        )
+    if fp4 and not hasattr(deep_gemm, "fp8_fp4_mqa_logits"):
+        raise RuntimeError(
+            "SGLANG_QSA_USE_FP4_INDEXER requires a deep_gemm build with the "
+            "SM120 FP4 MQA-logits kernels (fp8_fp4_mqa_logits); this install "
+            "only exposes FP8 kernels."
         )
 
 
@@ -184,6 +191,70 @@ def deepgemm_qsa_mqa_prefill(
     return deep_gemm.fp8_mqa_logits(
         q_fp8,
         (k_fp8, k_scale),
+        weights,
+        row_starts.to(torch.int32),
+        row_ends.to(torch.int32),
+    )
+
+
+def deepgemm_qsa_mqa_prefill_fp4(
+    q: torch.Tensor,
+    k: Tuple[torch.Tensor, torch.Tensor],
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    score_scale: Optional[float] = None,
+    head_weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """FP4 packed prefill scores; ``k`` is a ``(codes int8, sf int32)`` tuple.
+
+    Same column semantics as ``deepgemm_qsa_mqa_prefill``.  The query is
+    e2m1-quantized here (group-32 ue8m0 scales) through the DeepSeek-V4
+    indexer quantization kernel; keys arrive pre-quantized (BF16 pools
+    quantize the slab once per forward at the call site, fp4 index caches
+    gather it straight out of the pages).  ``head_weights`` ([rows, heads])
+    carries the tokenwise indexer's per-head weights (folded as
+    ``head_weights / score_scale``, mirroring the fp8 weighted path);
+    without it all heads weigh uniformly ``1 / score_scale`` (the
+    weight-free compressed indexer).
+    """
+
+    _require_deepgemm(fp4=True)
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+        quantize_fp4_indexer_tensor,
+    )
+
+    _validate_q(q)
+    rows, heads, head_dim = q.shape
+    if head_dim != 128:
+        raise ValueError("QSA FP4 MQA requires head_dim 128 (packed 64 B/token)")
+    k_fp4, k_sf = k
+    if k_fp4.shape[-1] != head_dim // 2:
+        raise ValueError("QSA FP4 key codes must be head_dim/2 bytes per token")
+    keys = k_fp4.shape[0]
+    padded_heads = next((h for h in _DEEPGEMM_ALLOWED_HEADS if h >= heads), None)
+    if padded_heads is None:
+        raise ValueError(f"QSA FP4 MQA cannot pad {heads} query heads")
+    q_pad = q if padded_heads == heads else torch.nn.functional.pad(
+        q, (0, 0, 0, padded_heads - heads)
+    )
+    weights = q.new_zeros((rows, padded_heads), dtype=torch.float32)
+    if head_weights is None:
+        weights[:, :heads] = 1.0 / (score_scale or math.sqrt(head_dim))
+    else:
+        if head_weights.shape != (rows, heads):
+            raise ValueError("QSA FP4 head_weights must be [rows, heads]")
+        weights[:, :heads] = (
+            head_weights.float() / (score_scale or math.sqrt(head_dim))
+        )
+    q_codes, q_sf = quantize_fp4_indexer_tensor(
+        q_pad.contiguous().reshape(rows * padded_heads, head_dim)
+    )
+    return deep_gemm.fp8_fp4_mqa_logits(
+        (
+            q_codes.view(torch.int8).view(rows, padded_heads, head_dim // 2),
+            q_sf.view(rows, padded_heads),
+        ),
+        (k_fp4.contiguous(), k_sf.contiguous()),
         weights,
         row_starts.to(torch.int32),
         row_ends.to(torch.int32),
@@ -533,6 +604,10 @@ def qsa_mqa_prefill(
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
+    if isinstance(k, tuple):
+        # FP4 keys arrive as a (codes, scales) pair; the packed scorer
+        # quantizes the query itself.
+        return deepgemm_qsa_mqa_prefill_fp4(q, k, row_starts, row_ends, score_scale)
     if k.dtype == torch.float8_e4m3fn:
         return deepgemm_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
     if q.is_cuda and HAS_TILELANG:
@@ -567,6 +642,7 @@ __all__ = [
     "qsa_mqa_prefill",
     "deepgemm_qsa_mqa_decode",
     "deepgemm_qsa_mqa_prefill",
+    "deepgemm_qsa_mqa_prefill_fp4",
     "tilelang_qsa_mqa_decode",
     "tilelang_qsa_mqa_prefill",
     "torch_qsa_mqa_decode",
