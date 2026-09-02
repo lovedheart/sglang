@@ -33,6 +33,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
+    qwen_sparse_kv_extraction_gathered_rows_triton,
     qwen_sparse_valid_counts_triton,
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
@@ -226,7 +227,12 @@ class QwenSparseAttnBackend(AttentionBackend):
         req_pool = getattr(runner, "req_to_token_pool", None)
         self.req_to_token = getattr(req_pool, "req_to_token", None)
         self.req_to_token_pool = req_pool
+        # KV access for quantized pools: QSA gathers only the rows it consumes
+        # and dequantizes those into scratch, so FP4 storage is never read as
+        # plain contiguous KV.  Unquantized pools keep this set to None and the
+        # byte-identical pre-FP4 read path.
         self.kv_cache_quant_method = None
+        self._fp4_attn_dtype = torch.bfloat16
         get_quant_method = getattr(
             self.token_to_kv_pool, "get_kv_cache_quant_method", None
         )
@@ -235,9 +241,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             if getattr(quant_method, "name", "unquantized") != "unquantized":
                 self.kv_cache_quant_method = quant_method
                 for phase in ("prefill", "decode"):
-                    self._check_kv_attention_access(
-                        phase, quant_method.resolve_attention_access(phase, "qsa")
-                    )
+                    access = quant_method.resolve_attention_access(phase, "qsa")
+                    self._check_kv_attention_access(phase, access)
+                    if access.attention_kv_dtype is not None:
+                        self._fp4_attn_dtype = access.attention_kv_dtype
         self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
         self._cuda_graph_metadata: Dict[
             Tuple[ForwardMode, int], QwenSparseAttnMetadata
@@ -273,6 +280,40 @@ class QwenSparseAttnBackend(AttentionBackend):
         raise ValueError(
             f"KV cache method {method_name!r} does not support {phase} with "
             f"qsa attention backend. Available {phase} accesses: {available}."
+        )
+
+    def _gather_kv_fp4(
+        self, layer_id: int, slots: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gather physical token slots from packed FP4 storage and dequantize
+        only those rows, for the GATHER_DEQUANT access.
+
+        Packed FP4 rows cannot be element-indexed (two FP4 values per byte
+        plus per-block scales), so whole rows are dequantized into scratch of
+        the access's compute dtype.  ``slots`` may hold -1 for invalid rows;
+        those read row 0 and callers mask them downstream.
+        """
+        pool = self.token_to_kv_pool
+        k_fp4, v_fp4, k_scales, v_scales = pool.get_raw_kv_buffer(layer_id)
+        safe = slots.clamp(min=0).long()
+        gather_dtype = k_fp4.dtype
+        if gather_dtype == torch.uint8 and k_fp4.element_size() != 1:
+            gather_dtype = torch.uint8
+        k_rows = k_fp4.index_select(0, safe).view(gather_dtype)
+        v_rows = v_fp4.index_select(0, safe).view(gather_dtype)
+        k_scale_rows = k_scales.index_select(0, safe)
+        v_scale_rows = v_scales.index_select(0, safe)
+        if k_scale_rows.dtype == torch.float8_e4m3fn:
+            k_scale_rows = k_scale_rows.view(torch.uint8)
+        if v_scale_rows.dtype == torch.float8_e4m3fn:
+            v_scale_rows = v_scale_rows.view(torch.uint8)
+        return self.kv_cache_quant_method.dequantize_gathered_kv(
+            k_rows,
+            k_scale_rows,
+            v_rows,
+            v_scale_rows,
+            layer_id,
+            dtype=self._fp4_attn_dtype,
         )
 
     @staticmethod
@@ -1465,10 +1506,24 @@ class QwenSparseAttnBackend(AttentionBackend):
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
             pool = self.token_to_kv_pool
+            if self.kv_cache_quant_method is not None:
+                # Packed FP4 rows cannot be element-indexed; dequantize the
+                # selected rows and address them by their gathered position.
+                flat = slots.reshape(-1)
+                k_rows, v_rows = self._gather_kv_fp4(layer.layer_id, flat)
+                rows = slots.shape[1]
+                address = torch.arange(
+                    slots.shape[0] * rows, device=slots.device
+                ).reshape(slots.shape)
+                slots = torch.where(slots >= 0, address, slots)
+                k_buffer, v_buffer = k_rows, v_rows
+            else:
+                k_buffer = pool.get_key_buffer(layer.layer_id)
+                v_buffer = pool.get_value_buffer(layer.layer_id)
             output = qsa_sparse_attention(
                 q,
-                pool.get_key_buffer(layer.layer_id),
-                pool.get_value_buffer(layer.layer_id),
+                k_buffer,
+                v_buffer,
                 slots,
                 layer.scaling,
             )
@@ -1499,22 +1554,43 @@ class QwenSparseAttnBackend(AttentionBackend):
         # The validated chunk-prefill kernel consumes tightly packed full-context
         # K/V. Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
-        k_buffer = pool.get_key_buffer(layer.layer_id)
-        v_buffer = pool.get_value_buffer(layer.layer_id)
         req_to_token = self.req_to_token_pool.req_to_token
         req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+        if self.kv_cache_quant_method is not None:
+            # Gather the full-context slots in one shot and dequantize only
+            # those rows; the per-sequence slices line up with the same cat
+            # order the plain path builds below.
+            all_slots = torch.cat(
+                [
+                    req_to_token[req_indices[i], : sequence_lens[i]].long()
+                    for i in range(len(sequence_lens))
+                ]
             )
-            for i in range(len(sequence_lens))
-        ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
+            k_all, v_all = self._gather_kv_fp4(layer.layer_id, all_slots)
+            offsets = [0]
+            for length in sequence_lens:
+                offsets.append(offsets[-1] + length)
+            k_parts = [
+                k_all[offsets[i] : offsets[i + 1]] for i in range(len(sequence_lens))
+            ]
+            v_parts = [
+                v_all[offsets[i] : offsets[i + 1]] for i in range(len(sequence_lens))
+            ]
+        else:
+            k_buffer = pool.get_key_buffer(layer.layer_id)
+            v_buffer = pool.get_value_buffer(layer.layer_id)
+            k_parts = [
+                k_buffer.index_select(
+                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+                )
+                for i in range(len(sequence_lens))
+            ]
+            v_parts = [
+                v_buffer.index_select(
+                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+                )
+                for i in range(len(sequence_lens))
+            ]
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
@@ -1595,6 +1671,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         metadata,
         topk_indices: torch.Tensor,
         trtllm_decode,
+        gathered_rows: bool = False,
     ) -> torch.Tensor:
         """Selected KV packs into page-aligned row strides so a static
         arange block table can drive the trtllm-gen paged decode kernel;
@@ -1628,23 +1705,36 @@ class QwenSparseAttnBackend(AttentionBackend):
             k_buffer.dtype,
             k_buffer.device,
         )
-        qwen_sparse_kv_extraction_compact_triton(
-            k_buffer,
-            v_buffer,
-            self.req_to_token_pool.req_to_token,
-            (
-                metadata.row_req_pool_indices
-                if metadata.row_req_pool_indices is not None
-                else forward_batch.req_pool_indices
-            ),
-            topk_indices,
-            sequence_lens,
-            cu_strided,
-            packed_k,
-            packed_v,
-            batch,
-            topk,
-        )
+        if gathered_rows:
+            qwen_sparse_kv_extraction_gathered_rows_triton(
+                k_buffer,
+                v_buffer,
+                topk_indices,
+                sequence_lens,
+                cu_strided,
+                packed_k,
+                packed_v,
+                batch,
+                topk,
+            )
+        else:
+            qwen_sparse_kv_extraction_compact_triton(
+                k_buffer,
+                v_buffer,
+                self.req_to_token_pool.req_to_token,
+                (
+                    metadata.row_req_pool_indices
+                    if metadata.row_req_pool_indices is not None
+                    else forward_batch.req_pool_indices
+                ),
+                topk_indices,
+                sequence_lens,
+                cu_strided,
+                packed_k,
+                packed_v,
+                batch,
+                topk,
+            )
         num_kv_heads = k_buffer.shape[1]
         head_dim = k_buffer.shape[2]
         kc = (
@@ -1693,6 +1783,22 @@ class QwenSparseAttnBackend(AttentionBackend):
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
+    def _gather_topk_rows_fp4(
+        self, layer, forward_batch, metadata, topk_indices: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Row-gather + dequantize the selected (batch, topk) KV rows of an
+        FP4 pool; the result is addressed by ``batch * topk + col`` and is
+        consumed by ``_compact_kv_gathered_rows`` downstream."""
+        req_to_token = self.req_to_token_pool.req_to_token
+        req_indices = (
+            metadata.row_req_pool_indices
+            if metadata.row_req_pool_indices is not None
+            else forward_batch.req_pool_indices
+        )
+        positions = topk_indices.clamp(min=0).long()
+        slots = req_to_token[req_indices.long().unsqueeze(1), positions]
+        return self._gather_kv_fp4(layer.layer_id, slots.reshape(-1))
+
     def _forward_paged_attention(
         self,
         q: torch.Tensor,
@@ -1701,16 +1807,36 @@ class QwenSparseAttnBackend(AttentionBackend):
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
         pool = self.token_to_kv_pool
-        k_buffer = pool.get_key_buffer(layer.layer_id)
-        v_buffer = pool.get_value_buffer(layer.layer_id)
+        quantized = self.kv_cache_quant_method is not None
         if not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
+            if quantized:
+                # Packed FP4 rows cannot be element-indexed; dequantize the
+                # selected rows and address them by their gathered position.
+                k_buffer, v_buffer = self._gather_kv_fp4(
+                    layer.layer_id, slots.reshape(-1)
+                )
+                address = (
+                    torch.arange(slots.numel(), device=slots.device)
+                    .reshape(slots.shape)
+                )
+                slots = torch.where(slots >= 0, address, slots)
+            else:
+                k_buffer = pool.get_key_buffer(layer.layer_id)
+                v_buffer = pool.get_value_buffer(layer.layer_id)
             output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
             return output.reshape(q.shape[0], -1)
 
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
+        if quantized:
+            k_buffer, v_buffer = self._gather_topk_rows_fp4(
+                layer, forward_batch, metadata, topk_indices
+            )
+        else:
+            k_buffer = pool.get_key_buffer(layer.layer_id)
+            v_buffer = pool.get_value_buffer(layer.layer_id)
         trtllm_decode = _resolve_trtllm_sparse_decode()
         if trtllm_decode is not None:
             return self._forward_trtllm_sparse(
@@ -1722,6 +1848,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 metadata,
                 topk_indices,
                 trtllm_decode,
+                gathered_rows=quantized,
             )
 
         flash_attn_varlen_func = _resolve_flash_attn_varlen_func()
@@ -1757,23 +1884,36 @@ class QwenSparseAttnBackend(AttentionBackend):
             k_buffer.dtype,
             k_buffer.device,
         )
-        qwen_sparse_kv_extraction_compact_triton(
-            k_buffer,
-            v_buffer,
-            self.req_to_token_pool.req_to_token,
-            (
-                metadata.row_req_pool_indices
-                if metadata.row_req_pool_indices is not None
-                else forward_batch.req_pool_indices
-            ),
-            topk_indices,
-            sequence_lens,
-            cu_seqlens_k,
-            packed_k,
-            packed_v,
-            batch,
-            topk,
-        )
+        if quantized:
+            qwen_sparse_kv_extraction_gathered_rows_triton(
+                k_buffer,
+                v_buffer,
+                topk_indices,
+                sequence_lens,
+                cu_seqlens_k,
+                packed_k,
+                packed_v,
+                batch,
+                topk,
+            )
+        else:
+            qwen_sparse_kv_extraction_compact_triton(
+                k_buffer,
+                v_buffer,
+                self.req_to_token_pool.req_to_token,
+                (
+                    metadata.row_req_pool_indices
+                    if metadata.row_req_pool_indices is not None
+                    else forward_batch.req_pool_indices
+                ),
+                topk_indices,
+                sequence_lens,
+                cu_seqlens_k,
+                packed_k,
+                packed_v,
+                batch,
+                topk,
+            )
         output = flash_attn_varlen_func(
             q=q,
             k=packed_k,

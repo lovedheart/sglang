@@ -406,6 +406,42 @@ def _compact_kv(
     tl.store(out_v + dst, tl.load(v + src, mask=mask, other=0.0), mask=mask)
 
 
+@triton.jit
+def _compact_kv_gathered_rows(
+    k,
+    v,
+    indices,
+    seq_lens,
+    cu_k,
+    out_k,
+    out_v,
+    topk: tl.constexpr,
+    heads: tl.constexpr,
+    dim: tl.constexpr,
+    idx_stride: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Pack KV rows that were already gathered (one source row per
+    (batch, column), addressed by ``batch * topk + col``) into the packed
+    layout.  Same validity rules as ``_compact_kv``; consumers that must
+    dequantize whole rows before element access (FP4 quantized pools) hand
+    in row-order buffers here because they cannot element-index the pool."""
+    batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
+    dims = tl.arange(0, BLOCK_D)
+    length = tl.load(seq_lens + batch)
+    pack_start = tl.load(cu_k + batch)
+    valid_count = tl.load(cu_k + batch + 1) - pack_start
+    positions = tl.load(indices + batch * idx_stride + cols, mask=cols < topk, other=-1)
+    valid = (cols < valid_count) & (positions >= 0) & (positions < length)
+    src = (batch * topk + cols)[:, None] * heads * dim + head * dim + dims[None, :]
+    dst = (pack_start + cols)[:, None] * heads * dim + head * dim + dims[None, :]
+    mask = valid[:, None] & (dims[None, :] < dim)
+    tl.store(out_k + dst, tl.load(k + src, mask=mask, other=0.0), mask=mask)
+    tl.store(out_v + dst, tl.load(v + src, mask=mask, other=0.0), mask=mask)
+
+
 def qwen_sparse_valid_counts_triton(seq_lens, indices, counts, batch, topk):
     """Valid-count pass alone, for consumers that need per-row lengths but
     not the packed cu_seqlens prefix sum (trtllm paged decode packs rows at
@@ -447,10 +483,36 @@ def qwen_sparse_kv_extraction_compact_triton(
     )
 
 
+def qwen_sparse_kv_extraction_gathered_rows_triton(
+    k, v, indices, seq_lens, cu_k, out_k, out_v, batch, topk
+):
+    """Pack row-gathered KV (``k``/``v`` shaped [batch*topk, heads, dim]) into
+    the packed layout; see ``_compact_kv_gathered_rows``."""
+    _, heads, dim = k.shape
+    block_topk = 16
+    _compact_kv_gathered_rows[(batch, heads, triton.cdiv(topk, block_topk))](
+        k,
+        v,
+        indices,
+        seq_lens,
+        cu_k,
+        out_k,
+        out_v,
+        topk,
+        heads,
+        dim,
+        indices.stride(0),
+        BLOCK_TOPK=block_topk,
+        BLOCK_D=triton.next_power_of_2(dim),
+        num_warps=8,
+    )
+
+
 __all__ = [
     "qwen_sparse_fa2_cu_seqlens_triton",
     "qwen_sparse_valid_counts_triton",
     "qwen_sparse_kv_extraction_compact_triton",
+    "qwen_sparse_kv_extraction_gathered_rows_triton",
     "sparse_gqa_fwd_interface_triton",
     "sparse_gqa_fwd_interface_triton_ck",
 ]

@@ -284,6 +284,26 @@ class KVCacheQuantMethodBase(ABC):
             f"KV cache method {self.name!r} does not support plain KV dequant reads."
         )
 
+    def dequantize_gathered_kv(
+        self,
+        k_fp4: Tensor,
+        k_scales: Tensor,
+        v_fp4: Tensor,
+        v_scales: Tensor,
+        layer_id: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Dequantize row-gathered packed FP4 KV to the attention compute dtype.
+
+        Unlike ``dequantize_prev_kv`` (whose output dtype is tied to a
+        workspace-consuming backend), this honors GATHER_DEQUANT access's
+        requested dtype so gather-style backends can feed attention directly.
+        """
+        raise NotImplementedError(
+            f"KV cache method {self.name!r} does not support gathered FP4 KV "
+            "dequant reads."
+        )
+
     @abstractmethod
     def compute_cell_size(
         self, head_num: int, head_dim: int, num_layers: int, kv_size: int
@@ -538,6 +558,35 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         )
         return k_bf16.to(torch.float8_e4m3fn), v_bf16.to(torch.float8_e4m3fn)
 
+    def dequantize_gathered_kv(
+        self,
+        k_fp4: Tensor,
+        k_scales: Tensor,
+        v_fp4: Tensor,
+        v_scales: Tensor,
+        layer_id: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Dequantize FP4 KV (indexed tokens) to the attention compute dtype."""
+        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
+
+        target_dtype = dtype or torch.bfloat16
+        # Gather scratch keeps scales as raw bytes; the pool hands them out
+        # already viewed as FP8 E4M3.
+        if k_scales.dtype == torch.uint8:
+            k_scales = k_scales.view(torch.float8_e4m3fn)
+        if v_scales.dtype == torch.uint8:
+            v_scales = v_scales.view(torch.float8_e4m3fn)
+        cur_k_scale = self.k_scales_gpu[layer_id : layer_id + 1]
+        cur_v_scale = self.v_scales_gpu[layer_id : layer_id + 1]
+        k = NVFP4KVQuantizeUtil.dequantize(
+            k_fp4.view(torch.uint8), k_scales, cur_k_scale, dtype=target_dtype
+        )
+        v = NVFP4KVQuantizeUtil.dequantize(
+            v_fp4.view(torch.uint8), v_scales, cur_v_scale, dtype=target_dtype
+        )
+        return k, v
+
     def compute_cell_size(
         self, head_num: int, head_dim: int, num_layers: int, kv_size: int
     ) -> int:
@@ -682,6 +731,20 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
         return (
             self.dequantize_kv_tensor(k_fp4, k_scales, layer_id),
             self.dequantize_kv_tensor(v_fp4, v_scales, layer_id),
+        )
+
+    def dequantize_gathered_kv(
+        self,
+        k_fp4: Tensor,
+        k_scales: Tensor,
+        v_fp4: Tensor,
+        v_scales: Tensor,
+        layer_id: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> tuple[Tensor, Tensor]:
+        return (
+            self.dequantize_kv_tensor(k_fp4, k_scales, layer_id, dtype),
+            self.dequantize_kv_tensor(v_fp4, v_scales, layer_id, dtype),
         )
 
     def compute_cell_size(
