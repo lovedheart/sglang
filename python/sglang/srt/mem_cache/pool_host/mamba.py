@@ -74,6 +74,25 @@ class MambaPoolHost(HostKVCache):
         self.conv_dtype = device_pool.mamba_cache.conv[0].dtype
         self.temporal_dtype = device_pool.mamba_cache.temporal.dtype
         self.dtype = self.conv_dtype
+
+        # Per-request PLE sibling tables (short-conv + n-gram context) ride on
+        # the mamba slot lifecycle on the DEVICE pool (MambaPool._slot_siblings:
+        # clear/copy/retraction carry them). The L2 host mirror must too, or a
+        # slot restored from this pool resurrects conv/ssm state with stale
+        # sibling rows. We mirror each sibling's device table (slot dim resized
+        # to the host pool) and move them with every backup/load-back.
+        # Collected before get_size_per_token(), which budgets their bytes.
+        self.slot_siblings = list(getattr(device_pool, "_slot_siblings", ()))
+        self._sibling_device_tensors = []
+        for sibling in self.slot_siblings:
+            # SlotIndexedState implementations store their table in
+            # .conv_state (ShortConvPool, slot dim 1) or .context (NGramPool,
+            # slot dim 0); disabled pools keep None and mirror nothing.
+            tensor = getattr(sibling, "conv_state", None)
+            if tensor is None:
+                tensor = getattr(sibling, "context", None)
+            self._sibling_device_tensors.append(tensor)
+
         self.size_per_token = self.get_size_per_token()
 
         if host_size > 0:
@@ -150,6 +169,61 @@ class MambaPoolHost(HostKVCache):
                     int(np.prod(dims[1:])) * dtype.itemsize
                 ),
             )
+
+        # Host mirrors of the PLE sibling tables (short-conv / n-gram context).
+        # Same shape as the device table but with the slot dim resized to this
+        # pool (plus one reserved row, mirroring the device convention), so
+        # host slot indices address them exactly like conv/temporal. Only the
+        # persistent per-slot tables are mirrored; spec "intermediate" buffers
+        # are per-step scratch and are not part of any round-trip (see
+        # SlotIndexedState.get_cpu_slots, which omits them too).
+        self.sibling_slot_dims = [
+            # SlotIndexedState implementations: ShortConvPool stores
+            # [layers, slots, ...] (slot dim 1); NGramPool stores
+            # [slots, context] (slot dim 0).
+            1 if getattr(s, "conv_state", None) is not None else 0
+            for s in self.slot_siblings
+        ]
+        self.sibling_buffers = []
+        for dev_tensor, slot_dim in zip(
+            self._sibling_device_tensors, self.sibling_slot_dims
+        ):
+            if dev_tensor is None:
+                self.sibling_buffers.append(None)
+                continue
+            dims = list(dev_tensor.shape)
+            dims[slot_dim] = self.size + 1
+            self.sibling_buffers.append(
+                alloc_func(
+                    tuple(dims),
+                    dtype=dev_tensor.dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
+            )
+        # Initialize mirrors to each sibling's "empty" value so a host slot
+        # that was freed without a clean backup never restores a real stale
+        # row: n-gram rows must read as all-<eos>, short-conv rows as zeros.
+        for buf, sibling in zip(self.sibling_buffers, self.slot_siblings):
+            if buf is None:
+                continue
+            eos = getattr(sibling, "eos_token_id", None)
+            if eos is not None:
+                buf.fill_(eos)
+            else:
+                buf.zero_()
+        self._sibling_pairs = list(zip(self.sibling_slot_dims, self.sibling_buffers))
+        # Page-representation helpers enumerate conv/temporal only; sibling
+        # rows are transferred through _copy_siblings instead (their element
+        # dtypes/widths differ from the KV byte-page format). Keep the
+        # zero-copy storage path honest if someone enables both.
+        if self.sibling_buffers and any(
+            b is not None and b.numel() > 0 for b in self.sibling_buffers
+        ):
+            self._has_ple_siblings = True
+        else:
+            self._has_ple_siblings = False
 
         if self.layout in ["page_first", "page_first_direct"]:
             # page-first: (page_num, num_layers, 1, *shape) — per-page data is contiguous
@@ -281,7 +355,15 @@ class MambaPoolHost(HostKVCache):
             for conv_elem_size in self.conv_state_elem_sizes
         )
         temporal_size = self.temporal_state_elem_size * self.temporal_dtype.itemsize
-        return (conv_total_size + temporal_size) * self.num_mamba_layers
+        # PLE sibling bytes per slot (short-conv rows + n-gram context rows),
+        # counted once (not per layer) so the host budget check covers the
+        # mirrors allocated in init_kv_buffer.
+        sibling_size = sum(
+            int(np.prod(t.shape[1:])) * t.element_size()
+            for t in self._sibling_device_tensors
+            if t is not None
+        )
+        return (conv_total_size + temporal_size) * self.num_mamba_layers + sibling_size
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
@@ -417,6 +499,12 @@ class MambaPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
+        # PLE siblings are layer-major packed tables: mirror the device-side
+        # lifecycle ops (MambaPool.copy_from moves them in ONE shot) by moving
+        # the whole sibling tables once per transfer, gated on the first local
+        # mamba layer so the per-layer driver loop does not repeat them.
+        if layer_id == 0:
+            self._copy_siblings(host_indices, device_indices, host_to_device=True)
         if self.layout in ["page_first", "page_first_direct"]:
             # no ssm state on conv-only models: nothing to transfer
             if self.temporal_state_elem_size > 0:
@@ -459,6 +547,9 @@ class MambaPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
+        # Mirror siblings once per transfer (same rationale as in
+        # load_to_device_per_layer: layer-major packed tables, one shot).
+        self._copy_siblings(host_indices, device_indices, host_to_device=False)
         if self.layout in ["page_first", "page_first_direct"]:
             # no ssm state on conv-only models: a 0-size batched memcpy errors
             if self.temporal_state_elem_size > 0:
@@ -503,7 +594,37 @@ class MambaPoolHost(HostKVCache):
                         io_backend,
                     )
 
+    def _copy_siblings(self, host_indices, device_indices, *, host_to_device) -> None:
+        """Move PLE sibling rows between the host mirrors and the device
+        tables. Mirrors what MambaPool.get_cpu_copy/load_cpu_copy do for the
+        same tables — plain indexed copies, no new kernel — so this simply
+        runs on the caller's (transfer) stream alongside the conv/temporal
+        copies. Slot rows keep identical layout on both sides; only the slot
+        index space differs (host vs device pool indices)."""
+        if not self.sibling_buffers or host_indices.numel() == 0:
+            return
+        host_idx = host_indices.cpu().long()
+        dev_idx = device_indices.cpu().long()
+        for (slot_dim, buf), dev_tensor in zip(
+            self._sibling_pairs, self._sibling_device_tensors
+        ):
+            if buf is None or dev_tensor is None:
+                continue
+            if host_to_device:
+                src_idx, dst_idx, src, dst = host_idx, dev_idx, buf, dev_tensor
+            else:
+                src_idx, dst_idx, src, dst = dev_idx, host_idx, dev_tensor, buf
+            if src.dim() == 2:  # NGramPool [slots, context]
+                dst[dst_idx] = src[src_idx].to(dst.device, non_blocking=True)
+            else:  # ShortConvPool [layers, slots, *state]
+                dst[:, dst_idx] = src[:, src_idx].to(dst.device, non_blocking=True)
+
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        # The byte-page format enumerates conv/temporal only, so with PLE
+        # siblings present a page round-trip through a storage backend would
+        # silently restore stale n-gram/short-conv rows. Fail loudly until the
+        # page format grows sibling components.
+        self._reject_storage_pages()
         data_page = torch.cat(
             [
                 self._flatten_tensor_bytes(tensor)
@@ -525,6 +646,7 @@ class MambaPoolHost(HostKVCache):
         index: int,
         data_page: torch.Tensor,
     ) -> None:
+        self._reject_storage_pages()  # see get_data_page
         flat_bytes = data_page.contiguous().view(torch.uint8).reshape(-1)
         start = 0
         for tensor in self._iter_page_tensors(index):
@@ -534,12 +656,21 @@ class MambaPoolHost(HostKVCache):
             restored = tensor_bytes.view(dtype=tensor.dtype).reshape(tensor.shape)
             tensor.copy_(restored)
 
+    def _reject_storage_pages(self) -> None:
+        if getattr(self, "_has_ple_siblings", False):
+            raise NotImplementedError(
+                "Mamba host page storage I/O does not yet carry PLE sibling"
+                " tables (short-conv / n-gram); use the kernel/direct L2 path"
+                " or disable the storage backend for this pool."
+            )
+
     def get_page_buffer_meta(self, indices):
         """Meta data for zero-copy storage I/O.
 
         Only page-first layouts are supported for mamba storage zero-copy because
         each page slot in temporal/conv buffers is directly addressable.
         """
+        self._reject_storage_pages()  # see get_data_page
         assert len(indices) % self.page_size == 0
         if self.layout not in ["page_first", "page_first_direct"]:
             raise ValueError(
