@@ -2510,5 +2510,30 @@ def test_qsa_fp4_paged_reference_matches_dequantized_pool(quant_name):
     torch.testing.assert_close(output.reshape(2, -1), expected.reshape(2, -1))
 
 
+def test_qsa_fp4_pool_write_ignores_cpu_scale_defaults():
+    """HybridLinearKVPool.set_kv_buffer defaults k_scale/v_scale to the CPU
+    float 1.0; an FP4 pool must ignore those and use its on-device global
+    scales (a CPU scalar reaching the quantize kernel breaks CUDA graph
+    capture and would silently mis-scale the cache)."""
+    pool, quant_method = _make_fp4_qsa_pool("fp4_mx_block16")
+    torch.manual_seed(11)
+    loc = torch.tensor([1, 4], dtype=torch.int64)
+    k = torch.randn(2, 2, 16, dtype=torch.bfloat16)
+    v = torch.randn(2, 2, 16, dtype=torch.bfloat16)
+    layer = SimpleNamespace(layer_id=0)
+    pool.set_kv_buffer(layer, loc, k, v, k_scale=1.0, v_scale=1.0)
+    k_fp4, v_fp4, k_scales, v_scales = pool.get_raw_kv_buffer(0)
+    k_rows, v_rows = quant_method.dequantize_gathered_kv(
+        k_fp4.index_select(0, loc),
+        k_scales.index_select(0, loc),
+        v_fp4.index_select(0, loc),
+        v_scales.index_select(0, loc),
+        0,
+        dtype=torch.bfloat16,
+    )
+    torch.testing.assert_close(k_rows, k, rtol=0.5, atol=0.5)
+    torch.testing.assert_close(v_rows, v, rtol=0.5, atol=0.5)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
