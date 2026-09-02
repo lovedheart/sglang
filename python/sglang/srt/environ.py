@@ -1075,6 +1075,11 @@ class Envs:
     SGLANG_BF16_GEMM_LOG_SHAPES = EnvBool(False)
     # Split the HC combine gate dot across CTAs instead of one CTA per row.
     SGLANG_HC_COMBINE_SPLIT = EnvBool(True)
+    # Route decode-size HC mix through the persistent Triton kernel (device-
+    # scope atomic accumulation, non-deterministic summation order). Set 0 to
+    # fall back to the plain-torch mix without enabling full deterministic
+    # inference.
+    SGLANG_HC_MIX_TRITON = EnvBool(True)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
