@@ -315,6 +315,12 @@ class Envs:
     SGLANG_QSA_USE_FP8_INDEXER = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_QWEN_DSA_USE_FP8_INDEXER"
     )
+    # Sort the QSA top-k block selection into a deterministic order. The CUDA
+    # top-k kernels deposit slots with atomicAdd, so their per-row output
+    # ORDER (not the selected set) varies run to run; sparse attention merges
+    # blocks in list order, making logits run-dependent. Set 0 to keep the raw
+    # atomic order (faster by one small sort, nondeterministic).
+    SGLANG_QSA_SORT_TOPK = EnvBool(True)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)

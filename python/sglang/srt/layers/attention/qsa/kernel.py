@@ -20,13 +20,36 @@ def average_pool_qsa_keys(key_groups: torch.Tensor) -> torch.Tensor:
     return key_groups.float().mean(dim=1).to(key_groups.dtype)
 
 
+def _sort_qsa_topk_indices(indices: torch.Tensor) -> torch.Tensor:
+    """Return a run-deterministic ordering of per-row top-k selections.
+
+    The CUDA top-k kernels deposit slots with atomicAdd, so their per-row
+    output order varies across runs. Downstream sparse attention merges the
+    selected blocks in list order, so an unordered list makes logits (and
+    greedy argmax) depend on atomic timing. Sorting by index value is
+    order-independent by construction and keeps -1 padding last (valid
+    indices are >= 0), preserving the "valid blocks precede padding" contract
+    that expand_qsa_block_indices relies on.
+    """
+    from sglang.srt.environ import envs
+
+    if indices.is_cuda and envs.SGLANG_QSA_SORT_TOPK.get():
+        return indices.sort(dim=-1, descending=True).values
+    return indices
+
+
 def qsa_fast_topk(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     topk: int,
 ) -> torch.Tensor:
-    """Select compressed blocks, with a compatibility fallback for top-k 512."""
+    """Select compressed blocks, with a compatibility fallback for top-k 512.
+
+    The CUDA kernels select the correct SET of blocks but emit it in atomic
+    (run-varying) slot order; see ``_sort_qsa_topk_indices`` for the
+    determinism fix applied on every CUDA return path.
+    """
 
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
     starts = row_starts.to(device=logits.device, dtype=torch.int32)
@@ -36,7 +59,9 @@ def qsa_fast_topk(
             # so top-k 512 works regardless of the installed sgl_kernel version.
             from sglang.kernels.ops.elementwise.fast_topk import fast_topk
 
-            return fast_topk(logits, lengths, topk=512, row_starts=starts)
+            return _sort_qsa_topk_indices(
+                fast_topk(logits, lengths, topk=512, row_starts=starts)
+            )
 
         from sgl_kernel import top_k as top_k_module
 
@@ -44,8 +69,10 @@ def qsa_fast_topk(
             top_k_module, "_FAST_TOPK_SUPPORTED_K", (2048,)
         )
         if topk in supported_topk:
-            return top_k_module.fast_topk_v2(
-                logits, lengths, topk=topk, row_starts=starts
+            return _sort_qsa_topk_indices(
+                top_k_module.fast_topk_v2(
+                    logits, lengths, topk=topk, row_starts=starts
+                )
             )
         if topk != 512 or 2048 not in supported_topk:
             raise ValueError(
@@ -55,7 +82,9 @@ def qsa_fast_topk(
         candidates = top_k_module.fast_topk_v2(
             logits, lengths, topk=2048, row_starts=starts
         )
-        return _rerank_qsa_topk_candidates(logits, candidates, starts, topk)
+        return _sort_qsa_topk_indices(
+            _rerank_qsa_topk_candidates(logits, candidates, starts, topk)
+        )
 
     # CPU/reference path mirrors the CUDA operator's fixed-width, relative output.
     output = torch.full(
