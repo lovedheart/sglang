@@ -315,6 +315,17 @@ class Envs:
     SGLANG_QSA_USE_FP8_INDEXER = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_QWEN_DSA_USE_FP8_INDEXER"
     )
+    # Select the FP4 (e2m1 + group-32 ue8m0 scales, DeepGEMM sm120
+    # fp8_fp4_paged_mqa_logits) QSA indexer scoring, mirroring the FP8 flag:
+    # the tokenwise QwenDSAIndexer stores index-K as packed fp4 pages
+    # (head_dim/2 + 4 bytes/token) and scores both phases in FP4 (query and
+    # keys quantized with the DeepSeek-V4 indexer quant kernels); the
+    # compressed QSAIndexer quantizes its BF16 pool keys at the packed
+    # prefill call site only and keeps the TileLang BF16 paged decode path
+    # (the paged FP4 kernel hard-requires 64-token pages).  Takes precedence
+    # over SGLANG_QSA_USE_FP8_INDEXER.  Requires DeepGEMM with SM120 FP4 MQA
+    # logits; fails loudly when unavailable.  Default off: FP8/BF16 behavior.
+    SGLANG_QSA_USE_FP4_INDEXER = EnvBool(False)
     # Sort the QSA top-k block selection into a deterministic order. The CUDA
     # top-k kernels deposit slots with atomicAdd, so their per-row output
     # ORDER (not the selected set) varies run to run; sparse attention merges
