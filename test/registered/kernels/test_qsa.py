@@ -758,16 +758,23 @@ def test_qsa_target_verify_rejects_branching_speculation():
         assert "topk=1" in str(exc)
     else:
         raise AssertionError("QSA target verification must reject tree branches")
-    # The pending-group ring keys state by position % ratio: a verify window
-    # wider than the ratio would collide within one forward.
+    # The pending-group ring strides 2*ratio positions (one group plus one
+    # speculation window, see qsa_ring_stride), so verify windows up to
+    # 2*ratio cannot clobber a member still needed by this forward's
+    # compression; wider windows could wrap onto one.
     try:
         backend._require_chain_speculation(
-            ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=1, draft_token_num=5)
+            ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=1, draft_token_num=9)
         )
     except NotImplementedError as exc:
         assert "compress ratio" in str(exc)
     else:
-        raise AssertionError("QSA must reject draft windows wider than the ratio")
+        raise AssertionError(
+            "QSA must reject draft windows wider than 2 * the ratio"
+        )
+    backend._require_chain_speculation(
+        ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=1, draft_token_num=8)
+    )
     backend._require_chain_speculation(
         ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=1, draft_token_num=4)
     )
@@ -2242,6 +2249,92 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
         mode=0, bs=4, num_rows=4, seq_lens=[256, 1024, 1025, 4096],
         extend_lens=None, extend_len=0, num_padding=0,
     )
+
+
+@pytest.mark.parametrize("compress_ratio", [2, 4])
+@pytest.mark.parametrize("prefix", [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 641])
+def test_qsa_verify_window_does_not_clobber_pending_group(compress_ratio, prefix):
+    """Regression: a speculative verify forward stores its whole draft window
+    into the pending ring before compressing the boundary group. With the
+    historical ring stride == ratio, the window's later rows overwrote
+    members of the group being compressed (positions p and p+ratio aliased),
+    permanently corrupting the compressed key (the pool is write-once). The
+    stride must be 2*ratio (qsa_ring_stride): sweep every prefix alignment
+    and every boundary row of a full-width window and require the members the
+    compress step reads to be exactly the group's positions.
+    """
+    from sglang.srt.layers.attention.qsa.metadata import (
+        build_group_ring_slots,
+        build_pending_ring_slots,
+        qsa_ring_stride,
+    )
+
+    ratio = compress_ratio
+    stride = qsa_ring_stride(ratio)
+    req = 7
+    rows = torch.zeros(ratio, dtype=torch.long)
+    seq_lens = torch.tensor([prefix + 1 + j for j in range(ratio)])
+    positions = seq_lens - 1  # position each row processes
+
+    # History: one token per position before the prefix, decoded in order.
+    ring = {}
+    hist_positions = torch.arange(prefix, dtype=torch.long)
+    hist_slots = build_pending_ring_slots(
+        token_to_batch_idx=torch.zeros(hist_positions.numel(), dtype=torch.long),
+        req_pool_indices=torch.tensor([req]),
+        sequence_lengths=torch.zeros(1, dtype=torch.long),
+        logical_positions=hist_positions,
+        compress_ratio=ratio,
+        is_extend=False,
+    )
+    for slot, position in zip(hist_slots.tolist(), hist_positions.tolist()):
+        ring[slot] = position
+
+    # This forward: all window stores land before any compress (model kernel
+    # ordering: one store launch for every row, then one compress launch).
+    store_slots = build_pending_ring_slots(
+        token_to_batch_idx=rows,
+        req_pool_indices=torch.tensor([req]),
+        sequence_lengths=seq_lens,
+        logical_positions=positions,
+        compress_ratio=ratio,
+        is_extend=False,
+    )
+    for slot, position in zip(store_slots.tolist(), positions.tolist()):
+        ring[slot] = position
+
+    boundaries = [j for j in range(ratio) if seq_lens[j] % ratio == 0]
+    assert boundaries, "window must cross a group boundary"
+    group_locs = build_group_ring_slots(
+        req_pool_indices=torch.tensor([req]),
+        group_end_positions=positions[boundaries],
+        sequence_ids=torch.zeros(len(boundaries), dtype=torch.long),
+        compress_ratio=ratio,
+    )
+    for i, j in enumerate(boundaries):
+        end = int(seq_lens[j])
+        want = list(range(end - ratio, end))
+        got = [ring[slot] for slot in group_locs[i].tolist()]
+        assert got == want, (
+            f"ratio={ratio} prefix={prefix} group ending {end}: members "
+            f"{got} clobbered the pending group {want}"
+        )
+
+
+def test_qsa_ring_stride_separates_speculation_window():
+    """The ring stride is the single source of truth: pool sizing, eager
+    builders, and the graph kernels must all read qsa_ring_stride. Guard the
+    algebra directly: positions inside one window never alias, and p and
+    p+ratio (the bug's alias pair) stay distinct slots."""
+    from sglang.srt.layers.attention.qsa.metadata import qsa_ring_stride
+
+    ratio = 4
+    stride = qsa_ring_stride(ratio)
+    assert stride == 2 * ratio
+    base = 7 * stride
+    window = [(base + (5 + d) % stride) for d in range(ratio + 1)]
+    assert len(set(window)) == ratio + 1, "window rows alias in the ring"
+    assert (base + 5 % stride) != (base + (5 + ratio) % stride)
 
 
 if __name__ == "__main__":
