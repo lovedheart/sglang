@@ -58,6 +58,11 @@ class KVCacheAttentionAccessKind(str, Enum):
     DEQUANT_WORKSPACE = "dequant_workspace"
     # Attention backend directly consumes FP4 KV cache storage and scales.
     NATIVE_FP4 = "native_fp4"
+    # Attention backend gathers selected KV rows from packed FP4 storage and
+    # dequantizes only those rows into backend-owned scratch (no full-pool
+    # dequant, no pool-owned dequant workspace).  Used by gather-style sparse
+    # backends like QSA, which never read the pool as plain contiguous KV.
+    GATHER_DEQUANT = "gather_dequant"
 
 
 @dataclass(frozen=True)
@@ -705,7 +710,9 @@ _DECODE = KVCacheAttentionPhase.DECODE
 _PLAIN_KIND = KVCacheAttentionAccessKind.PLAIN
 _DQ_WORKSPACE_KIND = KVCacheAttentionAccessKind.DEQUANT_WORKSPACE
 _NATIVE_FP4_KIND = KVCacheAttentionAccessKind.NATIVE_FP4
+_GATHER_DEQUANT_KIND = KVCacheAttentionAccessKind.GATHER_DEQUANT
 _ANY_BACKEND = KVCacheBackendMatcher(any_backend=True)
+_QSA_BACKEND = frozenset({"qsa"})
 _NVFP4_SCALE = "nvfp4"
 _FP4_MX_SCALE = "fp4_mx_block16"
 _FP8_E4M3 = torch.float8_e4m3fn
@@ -774,6 +781,20 @@ def _native_fp4(
     )
 
 
+def _gather_dequant(
+    phase: KVCacheAttentionPhase,
+    backends,
+    attention_dtype: torch.dtype,
+) -> KVCacheAttentionAccess:
+    return KVCacheAttentionAccess(
+        phase,
+        _GATHER_DEQUANT_KIND,
+        _backend_matcher(backends),
+        storage_dtype=torch.uint8,
+        attention_kv_dtype=attention_dtype,
+    )
+
+
 KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]] = {
     UnquantizedKVCacheMethod.name: (
         _plain(_PREFILL, _ANY_BACKEND),
@@ -782,10 +803,14 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
     NVFP4KVCacheMethod.name: (
         _dq_workspace(_PREFILL, _NVFP4_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),
         _native_fp4(_DECODE, _NVFP4_DECODE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
+        _gather_dequant(_PREFILL, _QSA_BACKEND, _BF16),
+        _gather_dequant(_DECODE, _QSA_BACKEND, _BF16),
     ),
     FP4MXBlock16KVCacheMethod.name: (
         _plain(_PREFILL, _FP4_MX_PREFILL_BACKENDS, _FP4_MX_SCALE, _BF16),
         _plain(_DECODE, _FP4_MX_MHA_BACKENDS, _FP4_MX_SCALE, _BF16),
+        _gather_dequant(_PREFILL, _QSA_BACKEND, _BF16),
+        _gather_dequant(_DECODE, _QSA_BACKEND, _BF16),
     ),
 }
 

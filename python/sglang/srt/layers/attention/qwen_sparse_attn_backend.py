@@ -226,6 +226,18 @@ class QwenSparseAttnBackend(AttentionBackend):
         req_pool = getattr(runner, "req_to_token_pool", None)
         self.req_to_token = getattr(req_pool, "req_to_token", None)
         self.req_to_token_pool = req_pool
+        self.kv_cache_quant_method = None
+        get_quant_method = getattr(
+            self.token_to_kv_pool, "get_kv_cache_quant_method", None
+        )
+        if get_quant_method is not None:
+            quant_method = get_quant_method()
+            if getattr(quant_method, "name", "unquantized") != "unquantized":
+                self.kv_cache_quant_method = quant_method
+                for phase in ("prefill", "decode"):
+                    self._check_kv_attention_access(
+                        phase, quant_method.resolve_attention_access(phase, "qsa")
+                    )
         self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
         self._cuda_graph_metadata: Dict[
             Tuple[ForwardMode, int], QwenSparseAttnMetadata
@@ -252,6 +264,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+
+    def _check_kv_attention_access(self, phase: str, access) -> None:
+        if access is not None:
+            return
+        method_name = getattr(self.kv_cache_quant_method, "name", "unknown")
+        available = self.kv_cache_quant_method.describe_attention_accesses(phase)
+        raise ValueError(
+            f"KV cache method {method_name!r} does not support {phase} with "
+            f"qsa attention backend. Available {phase} accesses: {available}."
+        )
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
