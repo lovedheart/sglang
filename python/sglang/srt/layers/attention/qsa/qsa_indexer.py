@@ -544,12 +544,17 @@ class QSAIndexer(MultiPlatformOp):
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
             from sglang.kernels.ops.attention.fast_topk import fast_topk
+            from sglang.srt.layers.attention.qsa.kernel import (
+                _sort_qsa_topk_indices,
+            )
 
-            block_indices = fast_topk(
-                logits,
-                compressed_lengths.to(torch.int32),
-                topk=self.block_topk,
-                row_starts=None,
+            block_indices = _sort_qsa_topk_indices(
+                fast_topk(
+                    logits,
+                    compressed_lengths.to(torch.int32),
+                    topk=self.block_topk,
+                    row_starts=None,
+                )
             )
         else:
             row_starts = torch.zeros_like(compressed_lengths, dtype=torch.int32)
