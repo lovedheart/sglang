@@ -1010,6 +1010,25 @@ def commit_mamba_states_after_verify(
                 batch.mamba_track_indices,
                 mamba_steps_to_track,
             )
+        # PLE side states (ngram / short-conv) keep their own per-step
+        # intermediate scratch regardless of ReplaySSM, so the circular path
+        # must scatter them too -- otherwise they freeze for the whole spec run
+        # (same bug the fold branch already guards against; upstream moved
+        # GDN off the fold path into this circular path without it).
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            update_ple_state_after_mtp_verify,
+        )
+
+        track_idx = batch.mamba_track_indices
+        if track_idx is not None:
+            track_idx = req_pool.translate_mamba_indices(track_idx)
+        update_ple_state_after_mtp_verify(
+            req_pool,
+            state_batch_indices,
+            last_correct_step_indices,
+            track_idx,
+            mamba_steps_to_track,
+        )
         return
 
     # KDA ReplaySSM (fold-every-commit): KDA keeps its own recurrent verify kernel
