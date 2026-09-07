@@ -897,6 +897,15 @@ class ReqKvInfo:
     mamba_cow_src_index: Optional[torch.Tensor] = None
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
     mamba_needs_clear: bool = False
+    # Deferred clear: freshly allocated ping-pong track slots need zeroing on the
+    # forward stream (they are recycled from a shared pool and never zeroed, so a
+    # skipped boundary write would donate another request's residue to the radix tree).
+    mamba_ping_pong_needs_clear: bool = False
+    # Slots swapped in after request start (ping-pong donate swap / lazy
+    # boundary alloc). Same never-zeroed-recycle hazard as the flag above, but
+    # slot-specific: keep whatever the buffer already holds and clear only
+    # these slots on the next extend forward.
+    mamba_slot_clear_queue: Optional[List[torch.Tensor]] = None
 
     def swa_dead_lo(self, page_size: int) -> int:
         # Lowest SWA position this request may free itself: above the tree-owned
@@ -1843,6 +1852,7 @@ class Req(ReqDllmMixin):
         self.mamba_branching_seqlen = None
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
+        self.kv.mamba_ping_pong_needs_clear = False
         self.already_computed = 0
         assert not self.kv.holds_kv, "expect it is already released"
         self.kv.kv_committed_len = 0
@@ -2916,6 +2926,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         cow_dst_tensors = []
         clear_tensors = []
         for req in reqs:
+            if req.kv.mamba_ping_pong_needs_clear:
+                buf = req.kv.mamba_ping_pong_track_buffer
+                if buf is not None:
+                    # Drop the -1 placeholders (lazy's second slot); clear
+                    # whatever physical slots were freshly recycled in.
+                    fresh_pp = buf[buf != -1]
+                    if fresh_pp.numel() > 0:
+                        clear_tensors.append(fresh_pp)
+                req.kv.mamba_ping_pong_needs_clear = False
+            if req.kv.mamba_slot_clear_queue:
+                clear_tensors.extend(req.kv.mamba_slot_clear_queue)
+                req.kv.mamba_slot_clear_queue = None
             if req.kv.mamba_cow_src_index is not None:
                 cow_src_tensors.append(req.kv.mamba_cow_src_index)
                 cow_dst_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))

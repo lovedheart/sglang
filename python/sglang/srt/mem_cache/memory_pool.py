@@ -1565,6 +1565,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         buf[:n] = slots
         req.kv.mamba_ping_pong_track_buffer = buf
+        # Freshly recycled from the shared pool; these slots are never zeroed on
+        # free, so stage a deferred forward-stream clear (see
+        # _collect_deferred_mamba_cow_and_clear). Without it a skipped boundary
+        # write would donate the previous owner's state to the radix tree.
+        req.kv.mamba_ping_pong_needs_clear = True
         req.kv.mamba_next_track_idx = 0
         req.kv.mamba_last_track_idx = (
             0
@@ -1605,6 +1610,17 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 f"rid={req.rid}"
             )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
+        # The swapped-in slot is recycled pool memory (never zeroed on free).
+        # Stage a deferred clear like _alloc_ping_pong_buffer does: with spec
+        # verify a boundary that fails to cross leaves the slot unwritten, and
+        # the next donate would hand the radix tree the previous owner's
+        # residue. The slot holds only future track scratch (the live state is
+        # mamba_pool_idx; the donated slot went to the tree), so zeroing it
+        # before the next forward destroys nothing.
+        queue = req.kv.mamba_slot_clear_queue
+        if queue is None:
+            queue = req.kv.mamba_slot_clear_queue = []
+        queue.append(new_slot.clone())
         return mamba_value_donated
 
     def free_mamba_cache(
