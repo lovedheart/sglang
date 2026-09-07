@@ -199,9 +199,12 @@ SGL_DEVICE void radix_select_topk(
           index[pos] = idx;
         } else if (bin == threshold_bin) {
           if (round == 3) {
-            const auto pos = ::atomicAdd(&s_last_remain, -1);
-            if (pos > 0) {
-              index[kTopK - pos] = idx;
+            // Bit-identical values: collect now, deposit below by ascending
+            // index rank. The old arrival-order `atomicAdd(&s_last_remain,-1)`
+            // deposit made the selected SET depend on warp scheduling.
+            const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
+            if (pos < int(SMEM_INPUT_SIZE)) {
+              s_input_idx[r_idx ^ 1][pos] = idx;
             }
           } else {
             const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
@@ -216,6 +219,50 @@ SGL_DEVICE void radix_select_topk(
         }
       }
       __syncthreads();
+
+      if (round == 3) {
+        // Final tie-bin deposit: every candidate left here is bit-identical.
+        // Select by ascending index rank (torch.topk convention): a candidate
+        // wins iff fewer than `remain` smaller-indexed candidates tie with it.
+        // Counting is a pure function of the candidate set, so the selected
+        // SET is run-invariant. The tie list caps at SMEM_INPUT_SIZE; a pop
+        // that large (only reachable with >4096 identical scores) falls back
+        // to the legacy arrival-order deposit.
+        int tie_count = min(s_num_input[r_idx ^ 1], int(SMEM_INPUT_SIZE));
+        int* tie_list = s_input_idx[r_idx ^ 1];
+        if (s_num_input[r_idx ^ 1] > int(SMEM_INPUT_SIZE)) {
+          for (int i = tx; i < tie_count; i += BLOCK_SIZE) {
+            const auto idx = tie_list[i];
+            const auto pos = ::atomicAdd(&s_last_remain, -1);
+            if (pos > 0) {
+              index[kTopK - pos] = idx;
+            }
+          }
+        } else {
+          // Every candidate in the list is bit-identical after 4 exact 8-bit
+          // radix passes, so all of them tie. `topk` is already the number of
+          // slots left after strictly-greater deposits this round.
+          const int remain = topk;
+          for (int i = tx; i < tie_count; i += BLOCK_SIZE) {
+            const auto idx = tie_list[i];
+            const auto key = convert_to_uint32(input[idx + row_start]);
+            int rank = 0;
+            for (int j = 0; j < tie_count; ++j) {
+              const auto idx2 = tie_list[j];
+              if (idx2 < idx &&
+                  convert_to_uint32(input[idx2 + row_start]) == key) {
+                ++rank;
+              }
+            }
+            if (rank < remain) {
+              const auto pos = ::atomicAdd(&s_counter, 1);
+              index[pos] = idx;
+            }
+          }
+        }
+        __syncthreads();
+        break;
+      }
     }
   }
 }
