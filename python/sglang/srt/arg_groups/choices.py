@@ -184,8 +184,8 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutedsl",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
+    "flashinfer_b12x",
     "marlin",
-]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "tlru"]
 
