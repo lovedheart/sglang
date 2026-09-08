@@ -25,6 +25,7 @@ from __future__ import annotations
 import abc
 import copy
 import dataclasses
+import hashlib
 import logging
 import math
 import os
@@ -1614,13 +1615,33 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # Stage a deferred clear like _alloc_ping_pong_buffer does: with spec
         # verify a boundary that fails to cross leaves the slot unwritten, and
         # the next donate would hand the radix tree the previous owner's
-        # residue. The slot holds only future track scratch (the live state is
+        # residue (observed: FP4 indexer + fp8 KV alternate ABAB across cold
+        # runs). The slot holds only future track scratch (the live state is
         # mamba_pool_idx; the donated slot went to the tree), so zeroing it
         # before the next forward destroys nothing.
         queue = req.kv.mamba_slot_clear_queue
         if queue is None:
             queue = req.kv.mamba_slot_clear_queue = []
         queue.append(new_slot.clone())
+        import os as _os
+
+        if (
+            _os.environ.get("SGLANG_PPTRACE") == "1"
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            def _h(slots):
+                t = self.mamba_pool.mamba_cache.temporal[:, slots].float()
+                head = t[:, :, :4].contiguous().cpu().numpy().tobytes()
+                tail = t[:, :, -4:].contiguous().cpu().numpy().tobytes()
+                return hashlib.sha256(head + tail).hexdigest()[:12]
+
+            with open("/tmp/pptrace.log", "a") as f:
+                f.write(
+                    f"D donate_idx={donate_idx} donated_slot={mamba_value_donated.item()} "
+                    f"new_slot={int(new_slot[0])} buf={req.kv.mamba_ping_pong_track_buffer.tolist()} "
+                    f"nxt={req.kv.mamba_next_track_idx} rid={req.rid} "
+                    f"hh_donated={_h(mamba_value_donated)} hh_active={_h(req.kv.mamba_pool_idx)}\n"
+                )
         return mamba_value_donated
 
     def free_mamba_cache(

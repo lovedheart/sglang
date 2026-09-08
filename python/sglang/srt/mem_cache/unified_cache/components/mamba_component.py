@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -561,6 +562,28 @@ class MambaComponent(TreeComponent):
                 active_value = (
                     req.kv.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
                 )
+                if (
+                    os.environ.get("SGLANG_PPTRACE") == "1"
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    import hashlib
+
+                    t = (
+                        self.cache.req_to_token_pool.mamba_pool.mamba_cache.temporal[
+                            :, active_value
+                        ]
+                        .float()
+                        .cpu()
+                    )
+                    hh = hashlib.sha256(
+                        t[:, :, :4].contiguous().numpy().tobytes()
+                    ).hexdigest()[:12]
+                    with open("/tmp/pptrace.log", "a") as f:
+                        f.write(
+                            f"F finish keep_idx={keep_idx} slot={active_value.item()} "
+                            f"buf={req.kv.mamba_ping_pong_track_buffer.tolist()} "
+                            f"cache_len={cache_len} hh={hh} rid={req.rid}\n"
+                        )
             else:
                 active_value = req.kv.mamba_pool_idx.unsqueeze(-1).clone()
             if self.int8_ckpt_pool is not None:

@@ -593,6 +593,15 @@ class QSAIndexer(MultiPlatformOp):
             block_indices = qsa_fast_topk(
                 logits, row_starts, compressed_lengths, topk=self.block_topk
             )
+        import hashlib
+        import os
+
+        if os.environ.get("SGLANG_PPTRACE") == "1" and not torch.cuda.is_current_stream_capturing():
+            with open("/tmp/pptrace.log", "a") as f:
+                f.write(
+                    f"T layer={self.layer_id} L={compressed_lengths.tolist()} "
+                    f"topk={hashlib.sha256(block_indices[:1].contiguous().cpu().numpy().tobytes()).hexdigest()[:10]}\n"
+                )
         return expand_qsa_block_indices(
             block_indices,
             query_positions,
