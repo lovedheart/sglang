@@ -839,7 +839,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # scheduler -- e.g. input-length validation rejecting an over-context
             # request -- would otherwise leak those entries forever. Drop
             # undelivered states, but abort dispatched requests for scheduler-side
-            # cleanup.
+            # cleanup (otherwise a client disconnect would leave the request
+            # decoding to max_tokens as a zombie).
             self._release_req_states_on_failure(request_rids)
             raise
 
@@ -1999,14 +2000,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
+        # NOTE: Do not gate the dispatch on rid_to_state. The scheduler owns the
+        # real request lifecycle; rid_to_state is only HTTP/stream-response
+        # bookkeeping and may already be gone (e.g. cleaned up on client
+        # disconnect) while the request is still decoding. Unknown rids are a
+        # safe no-op on the scheduler side.
         state = None if abort_all else self.rid_to_state.get(rid)
-        if not abort_all:
-            if state is not None:
-                if state.abort_sent:
-                    return
-                state.abort_sent = True
-            elif get_serving().tokenizer_worker_num == 1:
+        if not abort_all and state is not None:
+            if state.abort_sent:
                 return
+            state.abort_sent = True
         req = AbortReq(rid=rid, abort_all=abort_all)
         try:
             self._dispatch_to_scheduler(req)
@@ -3496,7 +3499,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Release rid_to_state entries created for a failed handler.
 
         Undelivered states are removed locally. Dispatched requests are aborted
-        and retained until the scheduler response removes them.
+        and retained until the scheduler response removes them. Aborting BEFORE
+        dropping the state matters: once rid_to_state is gone, no code path is
+        left that can tell the scheduler to stop the request (a client
+        disconnect would otherwise leave it decoding to max_tokens as a zombie).
         """
         for rid in rids:
             state = self.rid_to_state.get(rid)

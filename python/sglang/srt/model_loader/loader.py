@@ -148,6 +148,10 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
+    if not getattr(module, "is_gpu_resident_layer", True):
+        yield module
+        return
+
     if target_device.type == "cpu":
         yield module
         return
@@ -1043,6 +1047,9 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         for _, module in model.named_modules():
+            from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+            if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
+                module.process_weights_after_loading()
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 # When quant methods need to process weights after loading
@@ -1052,6 +1059,9 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+            if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
+                module.clean_weights_after_loading() 
+                setattr(module, "process_lk_moe_already_called", True)
 
 
 class LayeredModelLoader(DefaultModelLoader):
