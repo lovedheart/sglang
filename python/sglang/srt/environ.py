@@ -304,6 +304,21 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # QSA indexer scoring modes (fork): FP8/FP4 (deep_gemm) on the packed
+    # prefill path; TileLang BF16 stays on the paged decode path.  FP4 takes
+    # precedence over FP8.  Both fail loudly when the required DeepGEMM SM120
+    # MQA-logits build is missing.  Unset keeps BF16 scoring.
+    SGLANG_QSA_USE_FP8_INDEXER = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_QWEN_DSA_USE_FP8_INDEXER"
+    )
+    SGLANG_QSA_USE_FP4_INDEXER = EnvBool(False)
+    # Sort the QSA top-k block selection into a deterministic order (the CUDA
+    # top-k kernels emit slots in atomic order; sparse attention merges in
+    # list order, making logits run-dependent).  0 keeps the raw order.
+    SGLANG_QSA_SORT_TOPK = EnvBool(True)
+    # Route decode-size HC mix through the persistent Triton kernel; 0 falls
+    # back to the plain-torch mix without full deterministic inference.
+    SGLANG_HC_MIX_TRITON = EnvBool(True)
     # --ple-offload-backend file: where the sparse, file-backed PLE table lives
     # (deterministic name, reused across restarts), whether prefill-sized
     # gathers hint the page cache first, and an escape hatch for the device
@@ -316,35 +331,6 @@ class Envs:
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
-
-    # Select the FP8 (deep_gemm) QSA indexer scoring: the tokenwise
-    # QwenDSAIndexer scores both phases in FP8 (fp8_mqa_logits prefill +
-    # fp8_paged_mqa_logits decode); the compressed QSAIndexer uses the packed
-    # fp8_mqa_logits kernel on PREFILL only (BF16 pool keys cast at the call
-    # site) and keeps the TileLang BF16 paged path on decode, where a gathered
-    # fp8 kernel is slower.  Requires DeepGEMM with SM120 MQA logits; fails
-    # loudly when unavailable.  Unset keeps today's behavior: both indexer
-    # variants score in BF16 (torch/TileLang).
-    SGLANG_QSA_USE_FP8_INDEXER = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_QWEN_DSA_USE_FP8_INDEXER"
-    )
-    # Select the FP4 (e2m1 + group-32 ue8m0 scales, DeepGEMM sm120
-    # fp8_fp4_paged_mqa_logits) QSA indexer scoring, mirroring the FP8 flag:
-    # the tokenwise QwenDSAIndexer stores index-K as packed fp4 pages
-    # (head_dim/2 + 4 bytes/token) and scores both phases in FP4 (query and
-    # keys quantized with the DeepSeek-V4 indexer quant kernels); the
-    # compressed QSAIndexer quantizes its BF16 pool keys at the packed
-    # prefill call site only and keeps the TileLang BF16 paged decode path
-    # (the paged FP4 kernel hard-requires 64-token pages).  Takes precedence
-    # over SGLANG_QSA_USE_FP8_INDEXER.  Requires DeepGEMM with SM120 FP4 MQA
-    # logits; fails loudly when unavailable.  Default off: FP8/BF16 behavior.
-    SGLANG_QSA_USE_FP4_INDEXER = EnvBool(False)
-    # Sort the QSA top-k block selection into a deterministic order. The CUDA
-    # top-k kernels deposit slots with atomicAdd, so their per-row output
-    # ORDER (not the selected set) varies run to run; sparse attention merges
-    # blocks in list order, making logits run-dependent. Set 0 to keep the raw
-    # atomic order (faster by one small sort, nondeterministic).
-    SGLANG_QSA_SORT_TOPK = EnvBool(True)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
@@ -1183,11 +1169,6 @@ class Envs:
     # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
     # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
     SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
-    # Route decode-size HC mix through the persistent Triton kernel (device-
-    # scope atomic accumulation, non-deterministic summation order). Set 0 to
-    # fall back to the plain-torch mix without enabling full deterministic
-    # inference.
-    SGLANG_HC_MIX_TRITON = EnvBool(True)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
