@@ -1599,29 +1599,61 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         # Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
+        req_to_token = self.req_to_token_pool.req_to_token
+        num_sequences = len(sequence_lens)
+        total_context = sum(sequence_lens)
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         if self.kv_cache_quant_method is not None:
-            # Quantized pools cannot be element-indexed; gather the
-            # full-context slots in one shot and dequantize only those rows.
-            # The gathered rows are already in the packed (per-sequence cat)
-            # order that pack_qsa_prefill_kv produces for plain pools.
-            req_to_token = self.req_to_token_pool.req_to_token
-            if is_in_breakable_cuda_graph():
-                # Reuse the prepared slot table to avoid a D2H sync per layer
-                # on replay.
-                req_to_token = self._resolve_metadata(forward_batch).token_slot_table
-                req_indices: object = range(len(sequence_lens))
+            # Quantized pools cannot be element-indexed by the pack kernel;
+            # build the flat slot index (sequence b owns
+            # [cu_k[b], cu_k[b] + len[b])) and dequantize only the gathered
+            # rows. The row order matches the packed layout that
+            # pack_qsa_prefill_kv produces for plain pools.
+            if envs.SGLANG_QSA_VECTOR_PREFILL_GATHER.get():
+                if num_sequences == 1:
+                    # A single sequence is already a contiguous row of the
+                    # table, so the slice is a view and no index math is
+                    # needed at all.
+                    all_slots = req_to_token[
+                        forward_batch.req_pool_indices[0], :total_context
+                    ]
+                elif total_context:
+                    row_ids = torch.repeat_interleave(
+                        torch.arange(num_sequences, dtype=torch.int32, device=q.device),
+                        sequence_lens_tensor,
+                        output_size=total_context,
+                    )
+                    columns = torch.arange(
+                        total_context, dtype=torch.int32, device=q.device
+                    ) - cu_seqlens_k[:-1].index_select(0, row_ids)
+                    req_rows = forward_batch.req_pool_indices.index_select(0, row_ids)
+                    all_slots = req_to_token[req_rows.long(), columns.long()]
+                else:
+                    all_slots = req_to_token.new_empty((0,))
             else:
-                req_indices = forward_batch.req_pool_indices.tolist()
-            all_slots = torch.cat(
-                [
-                    req_to_token[req_indices[i], : sequence_lens[i]].long()
-                    for i in range(len(sequence_lens))
-                ]
-            )
+                if is_in_breakable_cuda_graph():
+                    # Reuse the prepared slot table to avoid a D2H sync per
+                    # layer on replay.
+                    req_to_token = self._resolve_metadata(
+                        forward_batch
+                    ).token_slot_table
+                    all_slots = torch.cat(
+                        [
+                            req_to_token[i, : sequence_lens[i]].long()
+                            for i in range(num_sequences)
+                        ]
+                    )
+                else:
+                    req_indices = forward_batch.req_pool_indices.tolist()
+                    all_slots = torch.cat(
+                        [
+                            req_to_token[req_indices[i], : sequence_lens[i]].long()
+                            for i in range(num_sequences)
+                        ]
+                    )
             packed_k, packed_v = self._gather_kv_fp4(layer.layer_id, all_slots)
         else:
             packed_k, packed_v = pack_qsa_prefill_kv(
@@ -1630,7 +1662,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 req_to_token=self.req_to_token_pool.req_to_token,
                 req_indices=forward_batch.req_pool_indices,
                 cu_k=cu_seqlens_k,
-                total_k=sum(sequence_lens),
+                total_k=total_context,
                 max_k=max(sequence_lens, default=1),
                 output_dtype=q.dtype,
             )

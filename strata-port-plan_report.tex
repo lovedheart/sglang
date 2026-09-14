@@ -1,0 +1,175 @@
+\documentclass[11pt,a4paper]{ctexart}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage[table]{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\usepackage{longtable}
+
+\definecolor{codebg}{RGB}{247,248,250}
+\definecolor{codeframe}{RGB}{200,205,215}
+\definecolor{kwcol}{RGB}{0,80,160}
+\definecolor{tabhead}{RGB}{235,240,248}
+\lstdefinestyle{c}{basicstyle=\ttfamily\scriptsize,backgroundcolor=\color{codebg},
+  frame=single,rulecolor=\color{codeframe},frameround=fttt,
+  language=Python,keywordstyle=\color{kwcol}\bfseries,commentstyle=\itshape\color{gray},
+  showstringspaces=false,breaklines=true,xleftmargin=6pt,xrightmargin=6pt,
+  columns=fullflexible,keepspaces=true}
+
+\emergencystretch=2em
+\pagestyle{fancy}\fancyhf{}
+\fancyhead[L]{\footnotesize Strata $\rightarrow$ Lsglang(LK-MoE) 移植方案}
+\fancyhead[R]{\footnotesize \thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\newcommand{\code}[1]{{\footnotesize\color{kwcol}\ttfamily\detokenize{#1}}}
+
+\title{\bfseries 把 Strata 的 MoE 混合推理机制移植进 Lsglang\\[6pt]
+  \large 源码级移植方案：机制拆解、落点核对、分级实施与验收}
+\author{Strata v0.1.41 (fb58e0db) $\rightarrow$ guqiong96/Lsglang@4f19944c5（LK-MoE 子系统）}
+\date{2026年10月9日}
+
+\begin{document}
+\maketitle
+\begin{abstract}
+\noindent
+本报告回答"如何把 Strata 的混合推理优势移植进 Lsglang（LK-MoE）"。两侧源码均已逐行核对，结论有三。\textbf{其一，比想象中可行}：Strata 引擎里调度与量化格式仅通过一张每专家字节表耦合，换成 Lsglang 的专家步长表后，四个机制（动态份额、热专家缓存、预取环、三路流水）都是格式无关的纯调度逻辑；唯一的 ggml 依赖是 CPU 专家 kernel，而 lk\_moe 自带 AMX/AVX-512 kernel，保留即可。\textbf{其二，比想象中更近}：LK-MoE 已存在这套机制的半成品——GPU 槽位池（\code{pool\_gpu\_half}，含槽位表和 triton gather kernel）、prefill 双路（CPU/GPU 各半 + event）、双缓冲搬运类（dwdp weight\_manager）与 pinned staging ring（expert\_pack），移植大半是"给已有骨架接上 Strata 的决策神经"。\textbf{其三，比想象中更险}：LK-MoE 私有路径在 fork 的 CI 里\textbf{零测试覆盖}，CUDA graph 静默降级、MIXED 批次 token 语义失真、专家权重是 pageable 主机指针（非 pinned）这三处会静默坑人，必须按 §3 清单逐项设防。§4 给出 P0--P4 五阶段计划与三件套验收法。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%============================================================
+\section{移植总览}
+
+\subsection{四机制与 Lsglang 现状差距}
+
+\begin{center}\small
+\begin{tabular}{@{}p{2.9cm}p{4.8cm}p{4.9cm}p{2.6cm}@{}}
+\toprule
+\rowcolor{tabhead}
+\textbf{机制} & \textbf{Strata 做法} & \textbf{LK-MoE 现状} & \textbf{差距} \\
+\midrule
+M1 动态份额 & 闭式 $g/(c+g)$ + 双臂闸 + 29 层探针 & 静态阈值（token 数比较）+ capture 早退 & 纯策略，改动最小 \\
+M2 热专家缓存 & 驻留表 + 衰减计数 + 先逐后纳 & 层级三分类静态；但 pool GPU 半区已有\textbf{槽位机制} & 决策层缺失，槽位基建已在 \\
+M3 预取双缓冲 & 环 + issuer 线程跨层提前 DMA & \code{\_gpu\_prefill} 引擎内自搬、无跨层预取；dwdp 有同类双缓冲（P2P 源） & 需 issuer + 预载 API \\
+M4 三路流水 & 门铃 + 计划先发 + 自旋 flag 进 graph & \code{\_cpu\_decode} 全 CPU（pool 半区已 GPU 并行） & 弱化版两步可达，忠实版不建议 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{一个决定移植成本的发现}
+
+LK-MoE 的 GPU pool 半区（\code{layer.py:2377} \code{\_init\_pool\_gpu\_half}）已经把"专家按槽驻留显存、triton 按槽地址 gather 计算"实现了：\code{pool\_layer\_info()} 返回 \code{slot\_weight\_bytes/snapshot\_addr}，\code{slot\_table\_fill} 填槽表，\code{pool\_gpu\_report} 报命中——\textbf{这正是 Strata ExpertCache 的 GPU 端}，只是槽内容当前是加载时冻结的快照（源码注释："same frozen snapshot on both sides"）。M2 因此从"新建缓存子系统"降级为"把冻结快照换成 adapt 驱动的滚动晋升"，槽位协议、triton kernel、graph 兼容全部复用。
+
+%============================================================
+\section{四机制：Strata 实现与移植落点}
+
+\subsection{M1：在线计时替代静态阈值}
+
+\textbf{Strata 侧}（\code{prefill.cpp:2971--3105}，源码逐字核对）：每专家 GPU/CPU 均时 EMA（$\alpha{=}0.25$）后取\textbf{闭式}
+\[
+x=\mathrm{clamp}\!\left(\frac{g}{c+g},\;0.05,\;0.9\right)
+\]
+（CPU 做 $xN$ 个耗时 $xc$，GPU 做 $(1{-}x)N$ 个耗时 $(1{-}x)g$，令相等即两边同收工）。计时用 CUDA events 两对：一对算 share（下一层路由 sync 后回收，不阻塞当前层）；一对算闸门——相邻两层分别跑"共享/不共享"两臂，每非驻留专家墙钟比值的中位数 $<1$ 才开闸，稳态每第 29 层（素数，探针漂过所有层号）跑一次反臂保持双侧测量。选谁给 CPU：未驻留专家按本 chunk 路由 token 数\textbf{升序}（越冷门越先给 CPU），限 $\le 8$。
+
+\textbf{Lsglang 落点}：决策点 \code{should\_use\_gpu\_prefill}（layer.py:1907--1912）现为
+\begin{lstlisting}[style=c]
+return self.is_gpu_prefill_layer and \
+  hidden_states.size(0) >= self.gpu_prefill_min_batch_size
+\end{lstlisting}
+改造四步：① 每层挂 \code{(ema\_c, ema\_g, gate\_ratios)} 状态（\code{self.\_lk\_share}），开关 \code{LK\_MOE\_SHARE=off|auto} 走 common.py 的 LK\_ 通道；② 计时寄生现有路径——\code{\_cpu\_prefill}（:2532）本就有 GPU 半区 event（\code{gpu\_ev}），补一对 event 计整层 GPU 臂、Python \code{perf\_counter} 计 CPU 臂，下层回收、零新增 sync；③ 二选一扩为三态：阈值上方 GPU 全算不变；阈值附近（chunk $\le$ \code{LK\_SHARE\_MAX}=1024）按 $x$ 把冷专家划给 CPU——\textbf{接口现成}：\code{cpu\_prefill(..., pool\_skip)} 已支持"跳过某槽集合"，把冻结槽集换成动态冷门集即可；④ 闸门/探针照抄 Strata。
+
+\textbf{两个语义坑}（源码核实）：a) 层内看不到 \code{forward\_mode}（ForwardContext frozen 只带 attn\_backend，forward\_context.py:35），MIXED 批里 decode 尾行被计入 token 数（mix\_with\_running，schedule\_batch.py:3016--3087）——阈值与 $N$ 都失真，需仿 \code{is\_extend\_in\_batch} 在 ForwardFlags 加"纯 extend token 数"标志（runtime\_context.py:640--700 模式）；b) capture 中该函数恒 False，M1 天然只在 eager prefill 生效，与 graph 无冲突。
+
+\subsection{M2：显存热专家槽位缓存}
+
+\textbf{Strata 侧}（\code{expert\_cache.hpp:81--243} + \code{generate.cpp:7437--7560}）：驻留表 $[L{\times}E]\rightarrow$槽号/$-1$（GPU 持镜像，kernel O(1) 查）；热度$=$衰减计数（每 verify window 路由 $+1$，每 4 窗全体 $\times 0.7$，单计数总贡献收敛 $1/(1{-}0.7)$）；\code{adapt()} 每 4 窗一轮：未驻留且 usage$\ge 2.0$ 的候选对层内最冷驻留者，增益 $>1.5$ 才换、全局按增益降序截断 96 次/轮，\textbf{必须配层内私有槽区间}（全局计数器版曾让头两层吃光槽位、命中率锁死 2.97\%，头注 R4.2g）；\textbf{先逐后纳}三步（Finding 10，实测 91.7$\rightarrow$94.4 tok/s）：D2H 被逐者进 exchange 缓冲 $\rightarrow$ RAM 视图改指（CPU 立刻可算被逐者）$\rightarrow$ 新专家 H2D 入槽且 $-1$ 先生效；最后 commit 把 exchange 写进 RAM 中\emph{新专家的原位置}——RAM 副本恒等于"VRAM 不持有集合"，换出永不读盘。learned profile（STRP 格式）跨重启按热度预填。
+
+\textbf{Lsglang 落点}：
+\begin{enumerate}[leftmargin=2em,itemsep=1pt]
+  \item \textbf{复用 pool 槽位}：给 \code{slot\_table\_fill} 的输入从冻结快照换成 adapt 结果——Python 侧每层一个常驻 \code{residency} 张量 + 槽号$\leftrightarrow$专家反向表，图外 \code{copy\_} 更新（graph 合法，仿 \code{req\_pool} 模式）。
+  \item \textbf{热度源}：scheduler 每步本有全层 \code{topk\_ids}（GPU），每 $k$ 步一次 \code{scatter\_add} 进 $[L,E]$ 计数、adapt 轮 $\times0.7$，$O(B\cdot K)$/步可忽略。
+  \item \textbf{显存来源}：不走 torch 残余——lk\_moe 有独立 device arena，KV 定容前已按 \code{lk\_moe.get\_device\_mem\_usage()}$+$\code{LK\_GPU\_RESERVE\_GB} 预留（kv\_cache\_configurator.py:165--193），热槽预算从这里出，与 KV 池零竞争。
+  \item \textbf{swap 写回}：非 resident 层权重构造期即分配在 CPU 且运行时 GPU 属性被 \code{delattr}（fp8.py:1229、loader 权重清理 :1968），exchange memcpy 是纯 CPU 操作、微秒级；被逐槽 D2H 走 copy stream 不占 compute。
+  \item \textbf{adapt 时机}：并发下热度取全局和，晋升挂在 scheduler 队列排空点（Strata \code{--pipeline-windows} 的等价物），避免在飞窗口读到半更新槽表。
+\end{enumerate}
+\textbf{硬指标}：长会话 miss 率曲线单调下降（\code{pool\_gpu\_report} 已能报命中）。
+
+\subsection{M3：Prefill 层间专家预取双缓冲}
+
+\textbf{Strata 侧}（\code{prefill.cpp:237--292, 2233--2368}）：槽按\textbf{字节预算}折算（Finding 8：大 blob 量化自然少槽，4 卡 rig 实测 chunk 1024$\rightarrow$6144、87$\rightarrow$402 tok/s）；\textbf{issuer 线程}沿"整 chunk 跨全部 48 层预展开的 (层, 专家) 流"按 $a_{\text{consumed}}+N_{\text{ring}}$ 水位提前排 DMA——\textbf{下一层专家在本层 attention 期间已在飞}；未路由的预发专家只退租不算 kernel。
+
+\textbf{Lsglang 落点}（三级递进）：
+\begin{enumerate}[leftmargin=2em,itemsep=1pt]
+  \item \textbf{先修债}：\code{\_cpu\_prefill}（:2532--2578）现状每层一次 \code{current\_stream.synchronize()} \textbf{全阻塞}，且三个 D2H 目标是 \textbf{pageable} CPU 张量——\code{non\_blocking=True} 对 pageable 缓冲根本不会异步。换 pinned 缓冲 + event 回收（fork 内现成范式：\code{expert\_pack.py:388} 的 pin\_memory staging ring + 专用 stream），仅此一步 prefill 每层省一次全同步。
+  \item \textbf{同层双缓冲}：chunk 路由后按去重专家序 stage 8 个在飞（Strata staged 模式等价物）。dwdp/weight\_manager.py 的双 buffer + prefetch/consume event 骨架直接可抄（已有"prefetch layer${}+2$ + WAR 等待"完整水位逻辑），只把源从 P2P 换成 pinned host。
+  \item \textbf{跨层 issuer}：需要 lk\_moe 暴露"按 $(l,e)$ 子集预载"的 API——lk\_moe 是闭源 .so，\code{gpu\_prefill} 引擎内自搬权重、外部无法插入。\textbf{诚实评估：完整 issuer 是四机制里唯一被闭源边界卡住的一件}；推作者加 API，或用 ②+M2 的 resident 跳过拿八成收益。
+\end{enumerate}
+
+\textbf{graph 纪律}：新 stream/event/buffer 必须构造期预建（runtime\_context.py:994 注释明示创建要留在 capture 外）；prefill 被 piecewise/full graph 捕获时预取线程必须停车——full graph 后端已有先例：capture 包 \code{lk\_moe.pool\_capture\_pause/resume}（full\_cuda\_graph\_backend.py:52--62，权重泵停车是踩过的坑），照抄同款。
+
+\subsection{M4：decode 三路流水}
+
+\textbf{Strata 侧}（\code{expert\_pool\_dispatch\_multi}，expert\_source.cpp:3106--3290）：GPU 每层把路由 id 写 pinned 门铃，池线程\textbf{先发计划再开算}：显存命中组 flagA 即算；路由序\textbf{尾部} $m=(n_{\text{miss}}\cdot\text{frac})\gg 8$ 个 miss 标上传组、flagB（DMA 落地）后 grouped kernel 二段算；其余本线程 CPU 就地算写 mapped 行；barrier 全是自旋 flag kernel，整段包进\textbf{一个 CUDA graph}，host 零 sync API。注意\textbf{不存在}带宽比闭式 $q^*$：只有经验基值（i-quant 0.55 / Q2\_0 0.2，Finding 9）$\times$ 链路修正 $\min(1,\text{gbps}/20)$（generate.cpp:1556--1559，启动一次 H2D 实测）。
+
+\textbf{Lsglang 落点}——两条路收益/成本差一个量级：
+\begin{itemize}[leftmargin=2em,itemsep=1pt]
+  \item \textbf{M4$^-$ 弱化版（推荐）}：\code{\_cpu\_decode}（:2487--2530）现状已是两路并行——GPU pool 半区跑私有 stream（\code{\_pool\_gpu\_launch} :2423），CPU 算余下，\code{wait\_stream} 合流（:2511），全程 graph-safe（静态 fp32 \code{output\_gpu} :2363--2374）。把"槽位$=$冻结快照"换成 M2 的动态驻留表，即"GPU 算命中、CPU 算未命中"，\textbf{不动 graph、不加新同步原语}；再补"尾部 $m$ 个上传"规则即接近 Strata 三路中 PCIe 路收益。
+  \item \textbf{忠实版（不建议）}：需 graph 内自旋 flag kernel、门铃监听线程、lk\_moe \code{cpu\_decode} 改异步提交——它现在是同步调用（Python 侧不 sync、由 .so 内部按 stream 定序），改造横跨 Python/CUDA/闭源 .so 三层，收益只比弱化版多 PCIe 一段。
+\end{itemize}
+
+%============================================================
+\section{风险清单（全部经源码核实）}
+
+\begin{center}\small
+\begin{longtable}{@{}p{4.2cm}p{11.0cm}@{}}
+\toprule
+\rowcolor{tabhead}
+\textbf{风险} & \textbf{事实与对策} \\
+\midrule
+\endhead
+LK 私有路径\textbf{零 CI 覆盖} & \code{test/} 无任何 lk/LVLLM 用例——私有行为坏了 CI 不会响。每步移植自带回归（放 \code{test/registered/unit/layers/moe/}），并跑受波及的上游用例：\code{test\_fused\_moe\_native}、\code{test\_copy\_weight\_views\_before\_h2d}、\code{test\_nvfp4\_moe\_backends}、decode/prefill cuda graph runner 与 breakable/piecewise graph 全套。 \\
+CUDA graph 静默降级 & prefill 被 piecewise/full graph 捕获时 capture 标志令 CPU 层走 \code{\_cpu\_decode}（\code{should\_use\_gpu\_prefill} 恒 False）——share/adapt 逻辑同样 capture 早退；新 stream/event 构造期预建；capture 包 pause/resume（照抄 full graph 后端先例）。 \\
+MIXED 批语义失真 & \code{mix\_with\_running}（schedule\_batch.py:3016--3087）把 decode 行追加尾部，\code{size(0)} 混入 decode token，M1 阈值/$N$/计数全失真。加"纯 extend token 数"ForwardFlags 标志前，MIXED/TARGET\_VERIFY 保守走现状路径。 \\
+权重是 pageable 主机指针 & 非 resident 层权重构造期分配在 CPU、\textbf{无显式 pinned}（fp8.py:1229--1231；\code{register\_numa\_weights} 在 srt 侧未被 MoE 调用，仅 n-gram embedding 用）——"线性 DMA"假设不成立，M3 第一步就是 pinned staging；NUMA 效果现仅靠线程绑核/interleave（\code{LK\_NUMA\_INTERLEAVE}）。 \\
+lk\_moe 闭源边界 & 纯 .so 无接口声明：内部同步语义、pool 槽容量、泵送节奏不可见；\code{\_process\_wna16}（:2012--2021）把 \code{.cpu().transpose().contiguous()} 临时张量指针交给 .so 长期持有——W4A16 路径移植前先实测所有权（潜在悬垂指针）。跨层预载 API（M3 完整版、M4 忠实版）依赖作者配合。 \\
+数值一致性 & M1 动态拆分改变求和顺序（Strata 同类改动实测 KL 均值 0.004--0.006）；M2 使同一专家的 GPU/CPU 舍入路径随槽位漂移（Strata \#410 同类问题）。新开关全部默认 off，开启文档写明数值影响。 \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+配置规范：新开关一律 \code{LK\_*} 前缀进 common.py 集中区（:4892--5035，带 \code{get\_*\_env\_var} 访问器），\textbf{不进} environ.py 的 Envs（那是上游 \code{SGLANG\_*} 通道；旧 \code{LVLLM\_*} 经 \code{\_LK\_ENV\_RENAMES} 迁移，common.py:1297--1320）。
+
+%============================================================
+\section{分阶段实施与验收}
+
+\begin{center}\small
+\begin{tabular}{@{}llp{5.9cm}p{4.4cm}@{}}
+\toprule
+\rowcolor{tabhead}
+\textbf{阶段} & \textbf{工期} & \textbf{内容} & \textbf{验收} \\
+\midrule
+P0 & 1 周 & 计时基建：prefill/decode 路径 event 对 + 每层路由直方图 \code{scatter\_add} + NVTX 打点（复用 \code{--enable-layerwise-nvtx-marker}）；KL 基线入 CI & 零行为变更，逐字节一致 \\
+P1 & 2 周 & M1 三态决策 + 闸门/探针；顺手做 \code{\_cpu\_prefill} pinned 化（清每层全同步债） & 512/1k chunk prompt $-15\%$ 起；KL $<0.01$ \\
+P2 & 3 周 & M2：驻留表接 \code{slot\_table\_fill}、scheduler 热度计数、排空点 adapt（先逐后纳）、层内配额 & 2h 会话 miss 率单调降；decode $+5\%$ 起；graph 重录不劣化 \\
+P3 & 2 周 & M3 同层双缓冲（weight\_manager 骨架 + pinned 源）+ 与 resident 跳过联动 & 8k prompt $-10\%$；叠加 P2 再 $+5\%$ \\
+P4 & 评估后 & M4$^-$ 尾部 $m$ 规则；M3 完整版视 lk\_moe API 可得性 & decode 尾延 $-10\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{验收三件套}（每 PR 必跑）：① \textbf{正确性}——fork 现成 \code{kl\_test\_utils.py:101} \code{compare\_kl\_divergence} 守 prefill/decode logprob 一致，开关 off 时逐字节回归；② \textbf{性能 A/B}——同 chunk 交替跑开关臂取中位数（Strata 探针法，防频率/温度漂移）；③ \textbf{行为曲线}——M2 看 miss 率单调性、M3 看 issuer 水位利用率，异常即回退开关。
+
+%============================================================
+\section*{附录：证据锚点}
+
+\textbf{Strata v0.1.41 (fb58e0db)}：\code{expert\_cache.hpp:81--243}；\code{expert\_cache.cpp:72--210}；\code{generate.cpp} L253--300 / L4305--4347 / L7437--7560 / L1556--1559 / L5756--5810；\code{prefill.cpp} L241--292 / L2233--2368 / L2971--3105 / L3190--3228；\code{expert\_source.cpp} L2825--2849 / L3106--3290；\code{verify.cpp} L1411--1480 / L2144--2196；docs/paper/Strata-Paper.pdf（Finding 8/9/10）。完整调研：\code{strata\_port\_notes.md}。
+
+\textbf{Lsglang 4f19944c5}：\code{fused\_moe\_triton/layer.py}——run\_moe\_core :1668--1700、\code{should\_use\_gpu\_prefill} :1907--1912、\code{\_cpu\_decode} :2487--2530、\code{\_cpu\_prefill} :2532--2578、\code{\_gpu\_prefill} :2593、pool 半区 :2377--2485、\code{output\_gpu} :2363--2374、MOEConfigV2 模板 :2117--2141、\code{\_process\_wna16} :2012--2021、权重清理 :1968；\code{fp8.py:1229--1231}；\code{kv\_cache\_configurator.py:165--193}；\code{expert\_pack.py:372,388}；\code{dwdp/weight\_manager.py}（整文件）；\code{schedule\_batch.py:3016--3087}；\code{forward\_context.py:35}；\code{runtime\_context.py:640--700, 994}；\code{capture\_mode.py:44}；\code{full\_cuda\_graph\_backend.py:52--62}；\code{common.py:1262--1320, 4892--5035}；\code{kl\_test\_utils.py:101}。完整调研：\code{lsglang-strata-porting-survey.md}。
+
+\end{document}
