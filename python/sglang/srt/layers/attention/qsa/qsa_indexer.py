@@ -576,19 +576,29 @@ class QSAIndexer(MultiPlatformOp):
             # themselves; calling the JIT kernel directly skips the zeros_like
             # fill + subtract of the generic path.
             from sglang.kernels.ops.elementwise.fast_topk import fast_topk
+            from sglang.srt.environ import envs
             from sglang.srt.layers.attention.qsa.kernel import (
                 _sort_qsa_topk_indices,
             )
 
-            block_indices = _sort_qsa_topk_indices(
-                fast_topk(
-                    logits,
-                    compressed_lengths.to(torch.int32),
-                    topk=self.block_topk,
-                    row_starts=None,
-                )
+            # Fold the determinism sort into the expand kernel below (one
+            # launch instead of the five-launch torch.sort chain); when the
+            # env kill-switch is off the fold is off and behavior matches
+            # SORT_TOPK=0 exactly.
+            fold_sort = envs.SGLANG_QSA_SORT_TOPK.get()
+            topk_indices = fast_topk(
+                logits,
+                compressed_lengths.to(torch.int32),
+                topk=self.block_topk,
+                row_starts=None,
+            )
+            block_indices = (
+                topk_indices
+                if fold_sort
+                else _sort_qsa_topk_indices(topk_indices)
             )
         else:
+            fold_sort = False
             row_starts = torch.zeros_like(compressed_lengths, dtype=torch.int32)
             block_indices = qsa_fast_topk(
                 logits, row_starts, compressed_lengths, topk=self.block_topk
@@ -608,6 +618,7 @@ class QSAIndexer(MultiPlatformOp):
             sequence_lengths,
             compress_ratio=self.compress_ratio,
             token_topk=self.token_topk,
+            sort_input=fold_sort,
         )
 
     def _forward_impl(
