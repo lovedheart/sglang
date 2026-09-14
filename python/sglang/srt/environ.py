@@ -316,6 +316,11 @@ class Envs:
     # materialization + packed-scratch repack) into one Triton kernel that reads
     # the packed pool directly; 0 keeps the multi-kernel legacy path.
     SGLANG_QSA_FUSED_FP4_GATHER = EnvBool(True)
+    # Build the QSA chunk-prefill context with one vectorized slot gather and
+    # hand it to the kernel directly; 0 restores the per-sequence slice/cat
+    # loop (a gather plus a full-context copy per sequence, plus two host
+    # synchronizations per layer).
+    SGLANG_QSA_VECTOR_PREFILL_GATHER = EnvBool(True)
     # Sort the QSA top-k block selection into a deterministic order (the CUDA
     # top-k kernels emit slots in atomic order; sparse attention merges in
     # list order, making logits run-dependent).  0 keeps the raw order.
