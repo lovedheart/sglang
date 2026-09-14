@@ -1789,8 +1789,9 @@ def test_qsa_chunk_prefill_removes_device_round_trips():
     vector_syncs, vectorized = count_syncs(backend, queries, layer, forward_batch, indices, True)
     assert torch.equal(vectorized, legacy)
     # Both paths still stage the host length lists onto the device; the legacy
-    # loop adds two more reads (req_pool_indices, and cu_q back for max_q).
-    assert legacy_syncs - vector_syncs == 2, (legacy_syncs, vector_syncs)
+    # loop adds one more read (req_pool_indices). The query-row maximum is
+    # taken from the host-side extend lengths on both paths.
+    assert legacy_syncs - vector_syncs == 1, (legacy_syncs, vector_syncs)
 
 
 if __name__ == "__main__":
