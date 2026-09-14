@@ -1542,5 +1542,82 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
     )
 
 
+def _fold_sort_case(rows, seed, pad_rows=80):
+    torch.manual_seed(seed)
+    bi = torch.randint(0, 6000, (rows, BLOCK_TOPK), device="cuda", dtype=torch.int32)
+    for r in range(rows):
+        pad = int(torch.randint(0, pad_rows, (1,)))
+        if pad:
+            bi[r, BLOCK_TOPK - pad :] = -1
+    query_positions = torch.randint(
+        100, 90000, (rows,), device="cuda", dtype=torch.int64
+    )
+    sequence_lengths = torch.randint(
+        50, 90000, (rows,), device="cuda", dtype=torch.int32
+    )
+    return bi, query_positions, sequence_lengths
+
+
+def test_qsa_fold_sort_matches_sort_then_expand():
+    """sort_input=True must equal the torch.sort -> expand pipeline exactly.
+
+    The fold replaces the 5-launch torch.sort chain on the decode path; it
+    sorts the row inside the expand kernel (bitonic networks are data-order
+    independent, preserving the run-determinism contract) and reorders
+    ``block_indices`` in place.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    for seed, rows in ((0, 1), (1, 3), (2, 8), (3, 4)):
+        bi, qp, sl = _fold_sort_case(rows, seed)
+        expected = triton_expand_qsa_block_indices(
+            bi.sort(dim=-1, descending=True).values, qp, sl, COMPRESS_RATIO, TOKEN_TOPK
+        )
+        actual = triton_expand_qsa_block_indices(
+            bi.clone(), qp, sl, COMPRESS_RATIO, TOKEN_TOPK, sort_input=True
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(actual, expected), (seed, rows)
+
+
+def test_qsa_fold_sort_reorders_input_in_place():
+    bi, qp, sl = _fold_sort_case(2, seed=7)
+    before = bi.clone()
+    expand_qsa_block_indices(
+        bi, qp, sl, COMPRESS_RATIO, TOKEN_TOPK, sort_input=True
+    )
+    torch.cuda.synchronize()
+    assert not torch.equal(bi, before)
+    assert torch.equal(bi, before.sort(dim=-1, descending=True).values)
+
+
+def test_qsa_fold_sort_cuda_graph_capture_replay():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    bi, qp, sl = _fold_sort_case(4, seed=11)
+
+    def run(buffer):
+        return expand_qsa_block_indices(
+            buffer, qp, sl, COMPRESS_RATIO, TOKEN_TOPK, sort_input=True
+        )
+
+    eager = run(bi.clone())
+    graph_input = bi.clone()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        run(graph_input)  # warm the JIT outside capture
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    static = bi.clone()
+    with torch.cuda.graph(graph):
+        captured = run(static)
+    # Replay on freshly re-sorted inputs: the in-place fold re-sorts each
+    # replay, so replaying over an unsorted copy must reproduce eager.
+    static.copy_(bi)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, eager)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
