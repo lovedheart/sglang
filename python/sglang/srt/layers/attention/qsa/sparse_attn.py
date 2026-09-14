@@ -573,11 +573,185 @@ def qwen_sparse_kv_extraction_gathered_rows_triton(
     )
 
 
+@triton.jit
+def _nvfp4_nibbles_to_f32(nib):
+    """E2M1 nibble (0..15, sign bit at 3) to fp32, matching E2M1_VALUES."""
+    m = nib & 7
+    v = tl.where(
+        m == 0,
+        0.0,
+        tl.where(
+            m == 1,
+            0.5,
+            tl.where(
+                m == 2,
+                1.0,
+                tl.where(
+                    m == 3,
+                    1.5,
+                    tl.where(
+                        m == 4, 2.0, tl.where(m == 5, 3.0, tl.where(m == 6, 4.0, 6.0))
+                    ),
+                ),
+            ),
+        ),
+    )
+    # multiply, do not negate: triton lowers -v as 0.0 - v, which maps the
+    # E2M1 negative zero (nibble 8) back to +0.0.
+    return v * tl.where(((nib >> 3) & 1) == 1, -1.0, 1.0)
+
+
+@triton.jit
+def _gather_dequant_fp4_kv(
+    k_fp4,
+    v_fp4,
+    k_sf,
+    v_sf,
+    k_gs,
+    v_gs,
+    req_to_token,
+    req_indices,
+    indices,
+    seq_lens,
+    cu_k,
+    out_k,
+    out_v,
+    topk: tl.constexpr,
+    heads: tl.constexpr,
+    dim: tl.constexpr,
+    fp4_row_stride,
+    sf_row_stride,
+    req_stride,
+    idx_stride,
+    pad_cols,
+    BLOCK_TOPK: tl.constexpr,
+    ZERO_FILL: tl.constexpr,
+):
+    """Gather top-k KV rows straight out of packed NVFP4 storage, dequantize
+    in registers and write the result into the packed attention scratch.
+
+    Fuses the historical gather (4 index_selects + full-tensor dequant
+    materialization) and the gathered-rows packing into one launch. Validity
+    rules match _compact_kv_gathered_rows: invalid columns leave the scratch
+    untouched, exactly as before.
+    """
+    batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
+    d2 = tl.arange(0, dim // 2)
+    sf_j = tl.arange(0, dim // 16)
+    length = tl.load(seq_lens + batch)
+    req = tl.load(req_indices + batch)
+    pack_start = tl.load(cu_k + batch)
+    valid_count = tl.load(cu_k + batch + 1) - pack_start
+    positions = tl.load(indices + batch * idx_stride + cols, mask=cols < topk, other=-1)
+    valid = (cols < valid_count) & (positions >= 0) & (positions < length)
+    if ZERO_FILL:
+        # Strided (page-aligned) packing: like _compact_kv, the paged decode
+        # kernel reads whole pages, so every slot in [valid_count, pad_cols) is
+        # zeroed here instead of staying stale scratch bytes.
+        store_cols = cols < pad_cols
+    else:
+        store_cols = valid
+    slots = tl.load(
+        req_to_token + req * req_stride + tl.where(valid, positions, 0),
+        mask=valid,
+        other=0,
+    ).to(tl.int64)
+
+    fp4_base = slots[:, None] * fp4_row_stride + head * (dim // 2) + d2[None, :]
+    sf_base = slots[:, None] * sf_row_stride + head * (dim // 16) + sf_j[None, :]
+    dst = (
+        (pack_start + cols).to(tl.int64)[:, None] * heads * dim
+        + head * dim
+        + tl.arange(0, dim)[None, :]
+    )
+    out_dtype = out_k.dtype.element_ty
+    gs_k = tl.load(k_gs + 0)
+    gs_v = tl.load(v_gs + 0)
+    for kv in tl.static_range(2):
+        if kv == 0:
+            fp4, sf_ptr, gs, out = k_fp4, k_sf, gs_k, out_k
+        else:
+            fp4, sf_ptr, gs, out = v_fp4, v_sf, gs_v, out_v
+        packed = tl.load(fp4 + fp4_base, mask=valid[:, None], other=0)
+        lo = _nvfp4_nibbles_to_f32((packed & 0xF).to(tl.int32))
+        hi = _nvfp4_nibbles_to_f32(((packed >> 4) & 0xF).to(tl.int32))
+        vals = tl.interleave(lo, hi)
+        sf = tl.load(sf_ptr + sf_base, mask=valid[:, None], other=0).to(
+            tl.float8e4nv, bitcast=True
+        )
+        sf = sf.to(tl.float32)
+        for _ in tl.static_range(4):
+            sf = tl.interleave(sf, sf)
+        tl.store(out + dst, ((vals * sf) * gs).to(out_dtype), mask=store_cols[:, None])
+
+
+def qwen_sparse_kv_gather_dequant_fp4_triton(
+    k_fp4,
+    v_fp4,
+    k_sf,
+    v_sf,
+    k_gs,
+    v_gs,
+    req_to_token,
+    req_indices,
+    indices,
+    seq_lens,
+    cu_k,
+    out_k,
+    out_v,
+    batch,
+    topk,
+    heads,
+    dim,
+    zero_fill_cols: int = 0,
+):
+    """Gather + dequantize the selected (batch, topk) NVFP4 KV rows into the
+    packed layout addressed by cu_k.  ``zero_fill_cols`` > 0 selects the strided
+    (page-aligned) layout, mirroring qwen_sparse_kv_extraction_compact_triton.
+
+    k_fp4/v_fp4 are the pool's packed uint8 buffers, k_sf/v_sf the raw scale
+    bytes (viewed as uint8) and k_gs/v_gs the layer's fp32 [1] global scales,
+    sliced host-side (a view, graph-safe) so no layer index reaches the kernel
+    (a traced int argument would be baked into the compiled kernel).
+    """
+    block_topk = 16
+    zero_fill = zero_fill_cols > 0
+    num_cols = zero_fill_cols if zero_fill else topk
+    _gather_dequant_fp4_kv[(batch, heads, triton.cdiv(num_cols, block_topk))](
+        k_fp4,
+        v_fp4,
+        k_sf,
+        v_sf,
+        k_gs,
+        v_gs,
+        req_to_token,
+        req_indices,
+        indices,
+        seq_lens,
+        cu_k,
+        out_k,
+        out_v,
+        topk,
+        heads,
+        dim,
+        k_fp4.stride(0),
+        k_sf.stride(0),
+        req_to_token.stride(0),
+        indices.stride(0),
+        num_cols,
+        BLOCK_TOPK=block_topk,
+        ZERO_FILL=zero_fill,
+        num_warps=4,
+    )
+
+
 __all__ = [
     "qwen_sparse_fa2_cu_seqlens_triton",
     "qwen_sparse_valid_counts_triton",
     "qwen_sparse_kv_extraction_compact_triton",
     "qwen_sparse_kv_extraction_gathered_rows_triton",
+    "qwen_sparse_kv_gather_dequant_fp4_triton",
     "sparse_gqa_fwd_interface_triton",
     "sparse_gqa_fwd_interface_triton_ck",
 ]

@@ -312,6 +312,10 @@ class Envs:
         False, deprecated_name="SGLANG_QWEN_DSA_USE_FP8_INDEXER"
     )
     SGLANG_QSA_USE_FP4_INDEXER = EnvBool(False)
+    # Fuse the QSA FP4 decode gather (row index_selects + whole-row dequant
+    # materialization + packed-scratch repack) into one Triton kernel that reads
+    # the packed pool directly; 0 keeps the multi-kernel legacy path.
+    SGLANG_QSA_FUSED_FP4_GATHER = EnvBool(True)
     # Sort the QSA top-k block selection into a deterministic order (the CUDA
     # top-k kernels emit slots in atomic order; sparse attention merges in
     # list order, making logits run-dependent).  0 keeps the raw order.
