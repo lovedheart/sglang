@@ -29,6 +29,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_kv_extraction_compact_triton,
     sparse_gqa_fwd_interface_triton_ck,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseMultiStepDraftBackend,
@@ -1635,6 +1636,161 @@ def test_qsa_fold_sort_cuda_graph_capture_replay():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(captured, eager)
+
+
+
+def _make_chunk_prefill_backend(prefix_lens, extend_lens, req_pool_indices, seed):
+    """Chunk-prefill attention over a ragged batch with random KV."""
+    device = "cuda"
+    sequence_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+    torch.manual_seed(seed)
+    table = torch.zeros(
+        max(req_pool_indices) + 2,
+        max(sequence_lens, default=1) + 8,
+        dtype=torch.int32,
+        device=device,
+    )
+    used = 0
+    for row, length in zip(req_pool_indices, sequence_lens):
+        table[row, :length] = torch.arange(
+            used, used + length, dtype=torch.int32, device=device
+        )
+        used += length
+
+    class Pool:
+        def set_kv_buffer(self, layer, loc, k, v):
+            pass
+
+        def get_key_buffer(self, layer_id):
+            return k_buffer
+
+        def get_value_buffer(self, layer_id):
+            return v_buffer
+
+    k_buffer = torch.randn(used + 8, 1, 32, dtype=torch.bfloat16, device=device)
+    v_buffer = torch.randn(used + 8, 1, 32, dtype=torch.bfloat16, device=device)
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.token_to_kv_pool = Pool()
+    backend.req_to_token_pool = SimpleNamespace(req_to_token=table)
+    backend.kv_cache_quant_method = None
+    backend.forward_metadata = None
+
+    query_rows = max(sum(extend_lens), 1)
+    # Keep every selection inside what the query row can see, so nothing is
+    # masked out and both gather paths must read the same K/V rows.
+    indices = torch.stack(
+        [
+            torch.randint(
+                0, prefix + offset + 1, (8,), dtype=torch.int32, device=device
+            )
+            for prefix, extend in zip(prefix_lens, extend_lens)
+            for offset in range(extend)
+        ]
+    ).reshape(query_rows, 8)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        token_to_kv_pool=backend.token_to_kv_pool,
+        req_to_token_pool=backend.req_to_token_pool,
+        req_pool_indices=torch.tensor(
+            req_pool_indices, dtype=torch.int32, device=device
+        ),
+        seq_lens=torch.tensor(sequence_lens, dtype=torch.int32, device=device),
+        seq_lens_cpu=torch.tensor(sequence_lens, dtype=torch.int32, device=device),
+        extend_seq_lens=torch.tensor(extend_lens, dtype=torch.int32, device=device),
+        extend_seq_lens_cpu=list(extend_lens),
+        out_cache_loc=torch.arange(query_rows, dtype=torch.int32, device=device),
+    )
+    layer = SimpleNamespace(tp_q_head_num=4, head_dim=32, layer_id=0, scaling=0.1)
+    queries = torch.randn(query_rows, 4, 32, dtype=torch.bfloat16, device=device)
+    return backend, queries, layer, forward_batch, indices
+
+
+@pytest.mark.parametrize(
+    ("prefix_lens", "extend_lens", "req_pool_indices"),
+    [
+        ([3000], [900], [0]),
+        ([1000, 0, 2500, 7], [640, 33, 129, 90], [0, 1, 2, 3]),
+        ([2048, 4096], [1, 1], [2, 5]),
+        ([60000], [512], [0]),
+        ([7000] * 8, [1] * 8, list(range(8))),
+    ],
+)
+def test_qsa_chunk_prefill_vector_gather_matches_legacy(
+    prefix_lens, extend_lens, req_pool_indices
+):
+    """The one-shot slot gather must reproduce the per-sequence slice/cat loop
+    bit for bit: same addresses, same order, no reordering."""
+    backend, queries, layer, forward_batch, indices = _make_chunk_prefill_backend(
+        prefix_lens, extend_lens, req_pool_indices, seed=len(prefix_lens) * 7 + 1
+    )
+
+    def run():
+        return backend.forward_extend(
+            queries,
+            queries.clone(),
+            queries.clone(),
+            layer,
+            forward_batch,
+            save_kv_cache=False,
+            topk_indices=indices,
+        )
+
+    with envs.SGLANG_QSA_VECTOR_PREFILL_GATHER.override(True):
+        vectorized = run()
+    with envs.SGLANG_QSA_VECTOR_PREFILL_GATHER.override(False):
+        legacy = run()
+    assert torch.equal(vectorized, legacy)
+    assert torch.isfinite(vectorized).all()
+
+def test_qsa_chunk_prefill_removes_device_round_trips():
+    """The vectorized gather must drop the legacy loop's device reads: it never
+    sends req_pool_indices back to the host and takes the query-row maximum
+    from host-side metadata instead of reading it off the device."""
+    import warnings
+
+    def count_syncs(backend, queries, layer, forward_batch, indices, flag):
+        with envs.SGLANG_QSA_VECTOR_PREFILL_GATHER.override(flag):
+            for _ in range(3):  # JIT/module load may block legitimately
+                backend.forward_extend(
+                    queries,
+                    queries.clone(),
+                    queries.clone(),
+                    layer,
+                    forward_batch,
+                    save_kv_cache=False,
+                    topk_indices=indices,
+                )
+            torch.cuda.synchronize()
+            torch.cuda.set_sync_debug_mode(1)
+            try:
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    out = backend.forward_extend(
+                        queries,
+                        queries.clone(),
+                        queries.clone(),
+                        layer,
+                        forward_batch,
+                        save_kv_cache=False,
+                        topk_indices=indices,
+                    )
+            finally:
+                torch.cuda.set_sync_debug_mode(0)
+        torch.cuda.synchronize()
+        return (
+            sum("synchroniz" in str(warning.message).lower() for warning in caught),
+            out,
+        )
+
+    backend, queries, layer, forward_batch, indices = _make_chunk_prefill_backend(
+        [1500, 400], [128, 64], [1, 0], seed=11
+    )
+    legacy_syncs, legacy = count_syncs(backend, queries, layer, forward_batch, indices, False)
+    vector_syncs, vectorized = count_syncs(backend, queries, layer, forward_batch, indices, True)
+    assert torch.equal(vectorized, legacy)
+    # Both paths still stage the host length lists onto the device; the legacy
+    # loop adds two more reads (req_pool_indices, and cu_q back for max_q).
+    assert legacy_syncs - vector_syncs == 2, (legacy_syncs, vector_syncs)
 
 
 if __name__ == "__main__":
