@@ -16,6 +16,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
@@ -37,6 +38,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_kv_extraction_gathered_rows_triton,
+    qwen_sparse_kv_gather_dequant_fp4_triton,
     qwen_sparse_valid_counts_triton,
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
@@ -237,6 +239,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         # byte-identical pre-FP4 read path.
         self.kv_cache_quant_method = None
         self._fp4_attn_dtype = torch.bfloat16
+        self._fused_fp4_gather = False
         get_quant_method = getattr(
             self.token_to_kv_pool, "get_kv_cache_quant_method", None
         )
@@ -249,6 +252,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                     self._check_kv_attention_access(phase, access)
                     if access.attention_kv_dtype is not None:
                         self._fp4_attn_dtype = access.attention_kv_dtype
+                self._fused_fp4_gather = bool(
+                    envs.SGLANG_QSA_FUSED_FP4_GATHER.get()
+                    and getattr(quant_method, "name", "") == "nvfp4"
+                )
         self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
         self._cuda_graph_metadata: Dict[
             Tuple[ForwardMode, int], QwenSparseAttnMetadata
@@ -1815,6 +1822,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.compress_ratio if self._uses_block_indices(topk_indices) else 1
         )
         topk = topk * compress_ratio + compress_ratio - 1
+        fused_fp4 = gathered_rows and self._fused_fp4_gather
         page = _TRTLLM_SPARSE_PAGE_SIZE
         pages_per_row = (topk + page - 1) // page
         stride = pages_per_row * page
@@ -1865,6 +1873,42 @@ class QwenSparseAttnBackend(AttentionBackend):
                     if compress_ratio > 1
                     else None
                 ),
+            )
+        elif fused_fp4:
+            # Fused gather + dequant + strided pack: reads the packed FP4 pool
+            # directly and dequantizes into the scratch in one launch.  The
+            # gathered_rows/quantized flags below are set for the legacy path
+            # only, so the buffers they name are never materialized here.
+            k_fp4, v_fp4, k_sf, v_sf = self.token_to_kv_pool.get_raw_kv_buffer(
+                layer.layer_id
+            )
+            if k_sf.dtype == torch.float8_e4m3fn:
+                k_sf = k_sf.view(torch.uint8)
+                v_sf = v_sf.view(torch.uint8)
+            method = self.kv_cache_quant_method
+            qwen_sparse_kv_gather_dequant_fp4_triton(
+                k_fp4.view(torch.uint8),
+                v_fp4.view(torch.uint8),
+                k_sf,
+                v_sf,
+                method.k_scales_gpu[layer.layer_id : layer.layer_id + 1],
+                method.v_scales_gpu[layer.layer_id : layer.layer_id + 1],
+                self.req_to_token_pool.req_to_token,
+                (
+                    metadata.row_req_pool_indices
+                    if metadata.row_req_pool_indices is not None
+                    else forward_batch.req_pool_indices
+                ),
+                topk_indices,
+                sequence_lens,
+                cu_strided,
+                packed_k,
+                packed_v,
+                batch,
+                topk,
+                k_fp4.shape[1],
+                k_fp4.shape[2] * 2,
+                zero_fill_cols=stride,
             )
         elif gathered_rows:
             qwen_sparse_kv_extraction_gathered_rows_triton(
@@ -2016,9 +2060,20 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         topk_indices = topk_indices.to(torch.int32).contiguous()
         if quantized:
-            k_buffer, v_buffer = self._gather_topk_rows_fp4(
-                layer, forward_batch, metadata, topk_indices
-            )
+            if self._fused_fp4_gather:
+                # The fused kernel reads the packed pool directly; the buffers
+                # below only carry shape/device metadata for the packers.
+                k_fp4 = pool.get_raw_kv_buffer(layer.layer_id)[0]
+                k_buffer = torch.empty(
+                    (0, k_fp4.shape[1], k_fp4.shape[2] * 2),
+                    dtype=self._fp4_attn_dtype,
+                    device=k_fp4.device,
+                )
+                v_buffer = k_buffer
+            else:
+                k_buffer, v_buffer = self._gather_topk_rows_fp4(
+                    layer, forward_batch, metadata, topk_indices
+                )
         else:
             k_buffer = pool.get_key_buffer(layer.layer_id)
             v_buffer = pool.get_value_buffer(layer.layer_id)
@@ -2068,7 +2123,36 @@ class QwenSparseAttnBackend(AttentionBackend):
             q.dtype,
             k_buffer.device,
         )
-        if quantized:
+        if quantized and self._fused_fp4_gather:
+            k_fp4, v_fp4, k_sf, v_sf = pool.get_raw_kv_buffer(layer.layer_id)
+            if k_sf.dtype == torch.float8_e4m3fn:
+                k_sf = k_sf.view(torch.uint8)
+                v_sf = v_sf.view(torch.uint8)
+            method = self.kv_cache_quant_method
+            qwen_sparse_kv_gather_dequant_fp4_triton(
+                k_fp4.view(torch.uint8),
+                v_fp4.view(torch.uint8),
+                k_sf,
+                v_sf,
+                method.k_scales_gpu[layer.layer_id : layer.layer_id + 1],
+                method.v_scales_gpu[layer.layer_id : layer.layer_id + 1],
+                self.req_to_token_pool.req_to_token,
+                (
+                    metadata.row_req_pool_indices
+                    if metadata.row_req_pool_indices is not None
+                    else forward_batch.req_pool_indices
+                ),
+                topk_indices,
+                sequence_lens,
+                cu_seqlens_k,
+                packed_k,
+                packed_v,
+                batch,
+                topk,
+                k_fp4.shape[1],
+                k_fp4.shape[2] * 2,
+            )
+        elif quantized:
             qwen_sparse_kv_extraction_gathered_rows_triton(
                 k_buffer,
                 v_buffer,
