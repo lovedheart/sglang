@@ -1,0 +1,193 @@
+\documentclass[11pt,a4paper]{ctexart}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage[table]{xcolor}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\usepackage{longtable}
+
+\definecolor{kwcol}{RGB}{0,80,160}
+\definecolor{tabhead}{RGB}{235,240,248}
+
+\emergencystretch=2em
+\pagestyle{fancy}\fancyhf{}
+\fancyhead[L]{\footnotesize Lsglang $\times$ Strata 核心差异对比报告}
+\fancyhead[R]{\footnotesize \thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\newcommand{\code}[1]{{\footnotesize\color{kwcol}\ttfamily\detokenize{#1}}}
+
+\title{\bfseries Lsglang（LK-MoE）与 Strata 核心差异对比报告\\[6pt]
+  \large 面向 MoE 混合推理的两种 CPU/GPU 协同路线}
+\author{基于 \texttt{guqiong96/Lsglang} 与 \texttt{Niko1221/Strata} v0.1.41 源码与设计文档核对}
+\date{2026年10月9日}
+
+\begin{document}
+\maketitle
+\begin{abstract}
+\noindent
+两份代码解决的是同一个物理问题：Qwen3.8-Flash-Next 这类超大 MoE（48 层、24{,}576 个专家、每 token 激活 10 个专家）远超单卡显存，必须让 GPU、CPU（RAM）乃至 SSD 分担专家计算。但两者的工程哲学截然不同：\textbf{Lsglang（LK-MoE）}在 SGLang serving 栈内做\emph{静态}的层分类与 batch 阈值分流，追求多请求吞吐；\textbf{Strata}是为单卡 PC 从零写的 C++ 引擎，用\emph{自适应专家缓存}加\emph{实测闭环的 CPU/GPU 动态划分}追求单流极致延迟。本报告逐机制对比（第 2--5 节），量化差异来源（第 6 节），并给出结论与互相借鉴的可行点（第 7--8 节）。所有结论均有源码路径或文档出处支撑。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%============================================================
+\section{一句话定位}
+
+\begin{center}
+\begin{tabular}{@{}p{3.2cm}p{6.1cm}p{6.1cm}@{}}
+\toprule
+\rowcolor{tabhead}
+\textbf{维度} & \textbf{Lsglang (LK-MoE)} & \textbf{Strata} \\
+\midrule
+本质 & SGLang 深度定制 fork + 闭源 \code{lk\_moe} 2.3.3 引擎（.so） & 自研 C++/CUDA 单机推理引擎，llama.cpp/ggml 为 kernel 底座 \\
+目标场景 & 服务器多并发 serving（OpenAI API、continuous batching） & 12--24 GB 消费级显卡的 PC 单用户（NVIDIA CUDA / AMD HIP 同码编译） \\
+模型形态 & FP8 / NVFP4 / MXFP4 / WNA16 量化权重（model\_opt、compressed-tensors） & GGUF i-quant（IQ2\_XS--IQ3\_S、Q2\_0）及原生 pack \\
+权重驻留 & MoE 专家驻 CPU/NUMA（pinned），注意力等驻 GPU & 专家全量驻 RAM（pinned），注意力+共享专家+热专家驻 VRAM，n-gram 表在 SSD \\
+代码规模感 & 26{,}000+ commits 的 SGLang 全栈，LK-MoE 是其中一条旁路 & 单引擎 \texttt{src/} 目录，机制全部内聚 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Lsglang 的 ``混合推理'' 是 serving 栈里给 MoE 层加的一条 CPU/GPU 旁路；Strata 的 ``混合推理'' 是整个引擎的存在方式——没有 GPU-only 路径。
+
+%============================================================
+\section{Lsglang（LK-MoE）机制}
+
+\subsection{三层决策：层分类 + batch 阈值}
+
+LK-MoE（开关 \code{LVLLM\_MOE\_NUMA\_ENABLED}，新名 \code{LK\_MOE\_HYBRID\_ENABLED}，见 \code{python/sglang/srt/utils/common.py:1299} 的别名映射）把每个 MoE 层在\textbf{加载时}静态分为三类（\code{common.py:4965} 起 \code{is\_lk\_moe\_cpu\_layer / is\_lk\_moe\_gpu\_prefill\_layer / is\_lk\_moe\_gpu\_resident\_layer}），运行时在 \code{fused\_moe\_triton/layer.py} 的 \code{run\_moe\_core}（约 1670--1700 行）四选一：
+
+\begin{enumerate}[leftmargin=2em,itemsep=2pt]
+  \item \textbf{gpu\_resident 层} $\rightarrow$ 原始 GPU 量化 kernel 路径，完全不动；
+  \item \textbf{decode（CUDA graph capture 中）} $\rightarrow$ \code{\_cpu\_decode()}：调 lk\_moe 引擎的 \code{cpu\_decode()}，写静态 \code{FusedMoE.output\_gpu} fp32 缓冲，兼容 CUDA graph 重放；
+  \item \textbf{prefill 且 token 数 $\geq$ \code{LVLLM\_GPU\_PREFILL\_MIN\_BATCH\_SIZE}} $\rightarrow$ \code{\_gpu\_prefill()}：由引擎把该 chunk 需要的专家权重 CPU$\rightarrow$GPU 流水搬运后在 GPU 上算（\code{layer.py:1907} \code{should\_use\_gpu\_prefill}，capture 中恒为 False）；
+  \item \textbf{prefill 且 batch 小} $\rightarrow$ \code{\_cpu\_prefill()}：CPU 直接算，末尾 \code{stream.synchronize()} 全同步。
+\end{enumerate}
+
+决策变量\textbf{只有一个}：本批 token 数量是否过阈值。哪个专家在 GPU、哪层走 CPU 全部是加载时定死的配置。
+
+\subsection{lk\_moe 引擎 API（2.3.3 实测）}
+
+10 个引擎类 = \{BF16, FP8, WNA16, NVFP4, MXFP4\} $\times$ \{BF16, FP16 激活\}，构造签名统一为裸指针 \code{MOE\_XXX(cfg, w13\_ptr, w2\_ptr, w13\_scale\_ptr, w2\_scale\_ptr, ...)}。三个计算方法对应上面三条旁路：\code{cpu\_decode(stream,...)}（graph 兼容）、\code{cpu\_prefill(...)}（全同步）、\code{gpu\_prefill(...)}（引擎自搬权重）。CPU kernel 按 \code{/proc/cpuinfo} 自动选 AVX2 / AVX-512 / VNNI / \textbf{AMX} 五种 .so 之一；另有 \code{register/unregister\_numa\_weights} 做多 NUMA 权重注册。
+
+\subsection{栈侧能力}
+
+radix 前缀缓存、continuous batching、chunked prefill、prefill CUDA graph、TP/PP/EP、多量化后端、投机解码（NEXTN/MTP）等 SGLang 全家族能力都在；上游另有 \code{utils/offloader.py} OffloaderV1/V2 做层粒度专家 offload（默认关）。LK-MoE 是在这套栈之上、以 MoE 层为粒度的 hybrid 扩展。
+
+%============================================================
+\section{Strata 机制（v0.1.41）}
+
+\subsection{三级内存分层 + 自适应专家缓存}
+
+\begin{itemize}[leftmargin=2em,itemsep=2pt]
+  \item \textbf{VRAM}：注意力 / DeltaNet 混合器、gated-residual、router、共享专家、输出头、MTP 草稿层、KV cache（长上下文只驻最热部分，其余流式），剩余空间全部填满\textbf{专家缓存}——按当前会话热度动态装入最常命中的专家，边聊边换（\code{--adapt-every/--adapt-decay}），每 GB 约多容纳 700 个专家；缓存学到的热度可跨重启保留（opt-in）。
+  \item \textbf{RAM}：全部 24{,}576 个专家，pinned。GPU 缓存未命中的专家由 \textbf{CPU 就地计算}（AVX-512/AVX2、i-quant 用 ggml kernel），与 GPU 对命中专家的计算\textbf{并行}，两边不互相等待。miss 中还可按比例划一部分走 PCIe 上传由 GPU 算（\code{--pcie-frac}）。
+  \item \textbf{SSD}：28.8 GB n-gram 表（PLE 提示查重的基础），每 token 只读几行，默认 O\_DIRECT。
+\end{itemize}
+
+也就是说：\textbf{放置是运行时闭环}——专家身份（在 VRAM / 在 RAM / 需上传）不是一次配置，而是每 \code{adapt-every} 步按命中率重排。
+
+\subsection{Decode：双引擎并行}
+
+每个 decode 步，命中缓存的专家在 GPU 算、未命中的在 CPU RAM 就地算，两路同时进行；\code{--pcie-frac} 再按 ``PCIe 传输 vs CPU 计算谁快'' 把一部分 miss 划给 GPU。这与 Lsglang ``decode 全走 \code{cpu\_decode}'' 形成对照：Strata 的 GPU 永远在算它缓存内的专家，CPU 只补差额。
+
+\subsection{Prefill：流式专家环 + CPU 动态分担（0.1.41 关键更新）}
+
+\begin{itemize}[leftmargin=2em,itemsep=2pt]
+  \item 长 prompt 按至多 8{,}192 token 分块（\code{--prefill auto} 自动挑使 PCIe 环形缓冲满载的最大块），本层专家沿 PCIe 流入 GPU 环，与上一层的注意力计算\textbf{双缓冲重叠}。
+  \item \textbf{\code{PREFILL\_CPU\_SHARE=auto}（0.1.41 起单卡 CUDA 构建默认开）}：对 $\leq$1K token 的短 chunk，把该 chunk 中``被少量 token 路由到''的专家交给 CPU，\textbf{逐层实测}两侧耗时、把份额调到两边同时收工；还会隔层复测，若分担反而慢则自动退回纯 GPU（AMD ROCm 上即测出无收益、保持关闭）。实测（中位数，8 轮交替）：
+\end{itemize}
+
+\begin{center}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\rowcolor{tabhead}
+\textbf{机器} & \textbf{512 token} & \textbf{1{,}000 token} & \textbf{2K/4K/16K} \\
+\midrule
+RTX 5070 + R5 7600 (Q2\_0) & $-26\%$ & $-22\%$ & 持平 \\
+RTX 3060 + Ultra 7 265 (IQ3\_XXS) & $-28\%$ & $-19\%$ & 持平 \\
+Tesla P100 + Xeon (IQ3\_XXS) & $-35\%$ & $-25\%$ & 持平 \\
+RTX 5070 Ti (PCIe 3.0 x8, mmap) & $-49\%$ & $-41\%$ & $-38\%$ (2K) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent 质量代价：首 token KL 均值 0.004--0.006（max 0.026），可一键 \code{=0} 回到逐字节一致的旧路径。
+
+\subsection{解码加速}
+
+模型自带 MTP 层草稿至多 3 token，一次 48 层验证窗口平均产出 2.4--3.2 token；回复引用上下文时启用 prompt lookup 草稿至多 5 token（代码编辑类快 6--11\%）。另有 batch slots（\code{--batch N}，多个会话共享同一验证窗口的权重读取；实测 2--4 客户端总吞吐 $+31\%\text{--}+39\%$）、KV K8V4/流式驻留、多卡分层与 helper 卡去重（opt-in 后 $+15.5\%$）等。
+
+%============================================================
+\section{MoE 混合推理逐项对比}
+
+\begin{center}
+\small
+\begin{longtable}{@{}p{2.6cm}p{6.3cm}p{6.5cm}@{}}
+\toprule
+\rowcolor{tabhead}
+\textbf{维度} & \textbf{Lsglang (LK-MoE)} & \textbf{Strata} \\
+\midrule
+\endhead
+专家放置 & 加载时静态：层三分类钉死（resident / gpu\_prefill / cpu） & 运行时自适应：VRAM 专家缓存按会话热度持续晋升/换出，可跨重启保留 \\
+CPU/GPU 分工依据 & \textbf{静态阈值}：本批 token 数 $\geq$ \code{GPU\_PREFILL\_MIN\_BATCH\_SIZE} 一个开关量 & \textbf{实测闭环}：逐层计时两侧耗时，解出``同时收工''的份额，随时测、不划算即退回 \\
+Decode 未命中专家 & CPU 算（lk\_moe \code{cpu\_decode}，AMX/AVX-512，CUDA-graph 兼容） & CPU 在 pinned RAM \textbf{就地}算，与 GPU 命中部分\textbf{并行}；另一部分按 \code{--pcie-frac} 上传 GPU \\
+Prefill 权重搬运 & \code{gpu\_prefill} 引擎内搬（层粒度），无层间预取描述 & 专家流入 GPU 环形缓冲，与上一层注意力 PCIe/计算双缓冲重叠；环按字节自适应 \\
+短 prefill & batch 小 $\rightarrow$ 全 CPU、全同步（GPU 空转） & 默认把冷专家分给 CPU，$-20\%\text{--}-35\%$ prompt 时间（实测表） \\
+同步模型 & \code{cpu\_prefill} 路径 \code{stream.synchronize()} 全同步阻塞 & 设计目标即 ``neither waits''，CPU/GPU/PCIe 三路流水 \\
+量化 & NVFP4 / MXFP4 / FP8 / WNA16，走 Tensor Core（int4/int8 MMA） & GGUF i-quant（IQ 系列）+ 融合 int8 tensor-core kernel（0.1.36 起 prefill 专家） \\
+硬件覆盖 & NVIDIA 数据中心/消费卡 + NUMA 多路 CPU & NVIDIA RTX20--50 / AMD / 老卡(P40/V100) / Arc / Strix Halo，同码编译 \\
+并发 & continuous batching、radix 前缀缓存、多请求流 & 单请求为主；\code{--batch N} 让多会话共享同一验证窗口的权重读取 \\
+投机解码 & NEXTN/MTP 走 SGLang 全套验证流水线 & 自带 MTP 草稿 + prompt lookup，验证窗口即 batch 槽 \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+%============================================================
+\section{为什么 Strata 的 MoE 混合推理``显得''更高效}
+
+三点本质差异（前两点是机制级的，第三点是标定级）：
+
+\begin{enumerate}[leftmargin=2em,itemsep=3pt]
+  \item \textbf{静态配置 vs 自适应缓存。} LK-MoE 里``哪个专家在哪''由启动配置决定，会话跑一小时后命中分布完全变了也不动；Strata 把 VRAM 剩余空间做成 LRU 式热专家池，``越用越热''——同一会话后半程 miss 率单调下降，等效于把 PCIe 带宽问题随时间摊销掉。LK-MoE 没有任何专家级缓存。
+  \item \textbf{一个阈值 vs 逐层实测闭环。} LK-MoE 的 \code{should\_use\_gpu\_prefill} 只看本批 token 数：同样的 512 token，PCIe 4.0 x16 与 PCIe 3.0 x8、CPU 有 AMX 与只有 AVX2，最优选择截然不同，一个常量不可能都对。Strata 0.1.41 的做法是\textbf{在线计时 + 解出负载平衡点 + 定期回归复测}，这正确得多，也解释了它实测能白捡 20--35\% 的短 prompt 时间。
+  \item \textbf{decode 路径的并行度。} LK-MoE decode 时 GPU 的 Tensor Core 在 MoE 段基本让位给 CPU（gpu\_resident 层除外），CPU 全算；Strata 让 GPU（缓存命中专家）与 CPU（未命中）各算各的、同时进行，两侧算力都被吃掉。
+\end{enumerate}
+
+代价与边界：Strata 的闭环以\textbf{单请求、引擎内}为前提——它计时的``两边''就是这一个请求的两路；多请求 continuous batching 下每步的 batch 组合是调度器决定的，无法照搬逐层调份额。
+
+%============================================================
+\section{反过来：Lsglang 仍然占优的地方}
+
+\begin{itemize}[leftmargin=2em,itemsep=2pt]
+  \item \textbf{吞吐 / 多并发}：continuous batching + radix 缓存 + CUDA graph + TP/EP，这是 serving 引擎的核心竞争力，Strata 的 \code{--batch N} 只是单卡省权重读取的补丁。
+  \item \textbf{精度上限}：NVFP4/MXFP4 走 Tensor Core，精度与算力都优于 GGUF 2--3 bit i-quant；数据中心全显存常驻场景 Lsglang 直接走原始 kernel，LK-MoE 整条旁路都不启用。
+  \item \textbf{工程整合}：LK-MoE 与 SGLang 的调度器、graph capture、多量化后端共存；Strata 是独立引擎，不具备这些接口面。
+\end{itemize}
+
+%============================================================
+\section{结论与借鉴}
+
+\textbf{结论}：两者是同一约束（专家放不进显存）下的两种解法——Lsglang 用``配置时静态分类 + 单一阈值''换取与 serving 栈的低耦合和可预测性；Strata 用``运行时自适应 + 逐层实测闭环 + CPU/GPU/PCIe 三路流水''换取单机单流延迟的极致。``Strata 在 MoE 混合推理上更高效''在\textbf{单用户 PC / 低并发}场景成立且有实测支撑；在数据中心多并发场景，Lsglang 的整体吞吐仍是唯一选择。这与此前 FreeToken 论文对比的结论一致：单机超显存 MoE 的三个关键件（自适应放置、带宽/算力动态划分、层间流水）恰好都是 LK-MoE 目前的空白。
+
+\textbf{LK-MoE 可直接移植的三件事}（按性价比排序）：
+\begin{enumerate}[leftmargin=2em,itemsep=2pt]
+  \item 把 \code{should\_use\_gpu\_prefill} 的固定阈值换成 Strata 式在线计时（计时基础设施lk\_moe 引擎里现成有）；
+  \item 专家级 LRU 缓存进显存（lk\_moe 已有 \code{register\_numa\_weights}，缺的是 GPU 侧槽位管理与热度统计）；
+  \item prefill 层间专家预取双缓冲（与 FreeToken 论文的 double-buffer 同构）。
+\end{enumerate}
+
+\textbf{Strata 侧可参考 Lsglang 的}：radix/前缀树粒度的 KV 复用，以及 serving 化的请求队列——它的 \code{--batch} 已有雏形。
+
+\vfill
+\begin{center}
+\footnotesize\color{gray}
+证据：Lsglang \code{main@4f19944c5}（layer.py:1670--1700, 1907；common.py:1299, 4965）+ lk\_moe 2.3.3 API 实测记录；\\
+Strata \texttt{Niko1221/Strata@fb58e0db (v0.1.41)}：README、docs/HOW\_IT\_WORKS.md、docs/DETAILS.md（PREFILL\_CPU\_SHARE 实测表、--pcie-frac、expert cache 各节）、docs/BATCHING.md。
+\end{center}
+\end{document}
