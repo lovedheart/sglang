@@ -115,6 +115,7 @@ def _qsa_graph_row_metadata_kernel(
     RATIO: tl.constexpr,
     STRIDE: tl.constexpr,  # pending-ring slots per request (2 * RATIO)
     FULL_PAGE: tl.constexpr,  # full-KV tokens per page
+    COMPRESSED_PAGE: tl.constexpr,  # compressed slots per page
     PAGE_BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -151,10 +152,19 @@ def _qsa_graph_row_metadata_kernel(
     # compressed slots as page_id * (FULL_PAGE // RATIO) + block_in_page.
     table_row = page_table_ptr + row.to(tl.int64) * max_pages
     offs = tl.arange(0, PAGE_BLOCK)
+    # Only the first ceil(compressed / COMPRESSED_PAGE) columns are ever read
+    # (every consumer masks by compressed_lens; see the stale-but-unread note
+    # in metadata.compressed_decode_view), so the gather loop is bounded by the
+    # row's own page count instead of max_pages. Columns past it keep their
+    # prior contents (buffer-init zeros, or a previous replay's ids) and are
+    # never observed. The trip count is read from memory at replay, so the
+    # data-dependent bound stays CUDA-graph safe.
     row_width_pages = req_to_token_row_stride // FULL_PAGE
-    for p0 in range(0, max_pages, PAGE_BLOCK):
+    used_pages = (compressed + COMPRESSED_PAGE - 1) // COMPRESSED_PAGE
+    filled_pages = tl.minimum(tl.minimum(max_pages, row_width_pages), used_pages)
+    for p0 in range(0, filled_pages, PAGE_BLOCK):
         idx = p0 + offs
-        valid = idx < tl.minimum(max_pages, row_width_pages)
+        valid = idx < filled_pages
         loc = tl.load(
             req_to_token_ptr + token_row + idx * FULL_PAGE, mask=valid, other=0
         )
@@ -223,6 +233,7 @@ def launch_graph_metadata(
         RATIO=indexer.compress_ratio,
         STRIDE=qsa_ring_stride(indexer.compress_ratio),
         FULL_PAGE=pool.qsa_compressed_page_size * indexer.compress_ratio,
+        COMPRESSED_PAGE=pool.qsa_compressed_page_size,
         PAGE_BLOCK=128,
         num_warps=1,
     )
