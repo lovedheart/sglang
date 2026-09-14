@@ -1418,6 +1418,59 @@ class QwenSparseAttnBackend(AttentionBackend):
         # K/V. Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
         req_to_token = self.req_to_token_pool.req_to_token
+        num_sequences = len(sequence_lens)
+        total_context = sum(sequence_lens)
+        sequence_lens_tensor = torch.tensor(
+            sequence_lens, dtype=torch.int32, device=q.device
+        )
+        cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+        if envs.SGLANG_QSA_VECTOR_PREFILL_GATHER.get() and (
+            forward_batch.req_pool_indices.numel() >= num_sequences
+        ):
+            # One flat slot gather for the whole batch: sequence b owns
+            # [cu_k[b], cu_k[b] + len[b]), so (row, column) pairs come straight
+            # from the cumulative offsets. This is the same address order the
+            # per-sequence loop below builds, in one launch and with no host
+            # round-trip for req_pool_indices.
+            if num_sequences == 1:
+                # A single sequence is already a contiguous row of the table,
+                # so the slice is a view and no index math is needed at all.
+                all_slots = req_to_token[forward_batch.req_pool_indices[0], : total_context]
+            elif total_context:
+                row_ids = torch.repeat_interleave(
+                    torch.arange(num_sequences, dtype=torch.int32, device=q.device),
+                    sequence_lens_tensor,
+                    output_size=total_context,
+                )
+                columns = torch.arange(
+                    total_context, dtype=torch.int32, device=q.device
+                ) - cu_seqlens_k[:-1].index_select(0, row_ids)
+                req_rows = forward_batch.req_pool_indices.index_select(0, row_ids)
+                all_slots = req_to_token[req_rows.long(), columns.long()]
+            else:
+                all_slots = req_to_token.new_empty((0,))
+            if self.kv_cache_quant_method is not None:
+                k_all, v_all = self._gather_kv_fp4(layer.layer_id, all_slots)
+            else:
+                k_all = pool.get_key_buffer(layer.layer_id).index_select(
+                    0, all_slots.long()
+                )
+                v_all = pool.get_value_buffer(layer.layer_id).index_select(
+                    0, all_slots.long()
+                )
+            output = sparse_gqa_fwd_interface_triton_ck(
+                q.contiguous(),
+                k_all.to(q.dtype),
+                v_all.to(q.dtype),
+                topk_indices,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                sequence_lens_tensor,
+                layer.scaling,
+                max_q=max(extend_lens, default=1),
+            )
+            return self._pad_extend_output(output, num_output_rows)
+
         req_indices = forward_batch.req_pool_indices.tolist()
         if self.kv_cache_quant_method is not None:
             # Gather the full-context slots in one shot and dequantize only
@@ -1426,45 +1479,36 @@ class QwenSparseAttnBackend(AttentionBackend):
             all_slots = torch.cat(
                 [
                     req_to_token[req_indices[i], : sequence_lens[i]].long()
-                    for i in range(len(sequence_lens))
+                    for i in range(num_sequences)
                 ]
             )
             k_all, v_all = self._gather_kv_fp4(layer.layer_id, all_slots)
-            offsets = [0]
-            for length in sequence_lens:
-                offsets.append(offsets[-1] + length)
-            k_parts = [
-                k_all[offsets[i] : offsets[i + 1]] for i in range(len(sequence_lens))
-            ]
-            v_parts = [
-                v_all[offsets[i] : offsets[i + 1]] for i in range(len(sequence_lens))
-            ]
         else:
             k_buffer = pool.get_key_buffer(layer.layer_id)
             v_buffer = pool.get_value_buffer(layer.layer_id)
-            k_parts = [
-                k_buffer.index_select(
-                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-                )
-                for i in range(len(sequence_lens))
-            ]
-            v_parts = [
-                v_buffer.index_select(
-                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-                )
-                for i in range(len(sequence_lens))
-            ]
-        sequence_lens_tensor = torch.tensor(
-            sequence_lens, dtype=torch.int32, device=q.device
-        )
-        cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+            k_all = torch.cat(
+                [
+                    k_buffer.index_select(
+                        0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+                    )
+                    for i in range(num_sequences)
+                ]
+            )
+            v_all = torch.cat(
+                [
+                    v_buffer.index_select(
+                        0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+                    )
+                    for i in range(num_sequences)
+                ]
+            )
         # fp8 KV buffers carry implicit scale 1.0; widening back to the
         # compute dtype is lossless for the gathered rows and keeps the
         # Triton kernel single-dtype (tl.dot cannot mix bf16 q with fp8 k).
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
-            torch.cat(k_parts).to(q.dtype),
-            torch.cat(v_parts).to(q.dtype),
+            k_all.to(q.dtype),
+            v_all.to(q.dtype),
             topk_indices,
             cu_seqlens_q,
             cu_seqlens_k,
