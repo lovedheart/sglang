@@ -636,6 +636,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "mis-mapped to requests"
             )
         speculative_paged = self._is_speculative_paged_mode(forward_batch.forward_mode)
+        # Packed length of the compressed-K slab; set where the lengths are
+        # already on the host so the per-layer gather skips its own readback.
+        compressed_capacity = None
         if speculative_paged:
             logical_positions = forward_batch.positions
             if logical_positions.ndim == 2:
@@ -663,8 +666,19 @@ class QwenSparseAttnBackend(AttentionBackend):
             sequence_lengths = forward_batch.seq_lens.to(torch.int32)
             batch_size = sequence_lengths.numel()
             if forward_batch.seq_lens_cpu is not None:
-                max_length = int(forward_batch.seq_lens_cpu[:batch_size].max())
+                host_lengths = forward_batch.seq_lens_cpu[:batch_size]
+                max_length = int(host_lengths.max())
+                # Exact packed compressed-K length, summed on the host from
+                # the same lengths the device tensor carries, so the
+                # per-layer gather needs no length readback of its own.
+                compressed_capacity = int(
+                    torch.div(
+                        host_lengths, self.compress_ratio, rounding_mode="floor"
+                    ).sum()
+                )
             else:
+                # gpu_only batches (no host-side lengths); the serving path
+                # never lands here.
                 max_length = int(sequence_lengths.max())
             row_req_pool_indices = forward_batch.req_pool_indices[:batch_size]
             token_slot_table = self.req_to_token[
@@ -787,6 +801,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             pending_ring_slots=pending_ring_slots,
             compress_group_ring_locs=compress_group_ring_locs,
             extend_rope_matrix=extend_rope_matrix,
+            compressed_capacity=compressed_capacity,
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
@@ -1516,6 +1531,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             cu_seqlens_k,
             sequence_lens_tensor,
             layer.scaling,
+            max_q=max(extend_lens, default=1),
         )
         return self._pad_extend_output(output, num_output_rows)
 
