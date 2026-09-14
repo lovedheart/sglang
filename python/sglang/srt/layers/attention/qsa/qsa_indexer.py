@@ -217,12 +217,7 @@ class QSAIndexer(MultiPlatformOp):
                 qsa_index_q_norm_rope_store,
             )
 
-            if not get_is_capture_mode() and hasattr(
-                self.rotary_emb, "_ensure_cos_sin_cache_length"
-            ):
-                self.rotary_emb._ensure_cos_sin_cache_length(
-                    int(positions.max().item())
-                )
+            self._ensure_rope_cache_for(positions)
             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
                 qk,
@@ -442,6 +437,37 @@ class QSAIndexer(MultiPlatformOp):
             return positions[0]
         return positions
 
+    def _ensure_rope_cache_for(self, positions: torch.Tensor) -> None:
+        """Grow the shared RoPE table only when it cannot cover the model.
+
+        A table of ``max_position_embeddings`` rows already covers every
+        position the model can emit, and
+        ``reserve_rope_cache_for_long_sequences`` pre-expands it past that for
+        any longer context (plus the speculative margin) at startup, so the
+        serving case is a host-side comparison.  Reading the position maximum
+        back costs a round-trip per layer and per call site, so growth falls
+        back to it only for a table that really is too short.
+
+        A table that claims coverage is still checked on the device: an out-of
+        range position is a caller bug, and the assert turns what would be a
+        silent out-of-bounds cache read into a loud failure without paying a
+        synchronization.
+        """
+
+        if get_is_capture_mode():
+            return
+        ensure = getattr(self.rotary_emb, "_ensure_cos_sin_cache_length", None)
+        if not callable(ensure):
+            return
+        cache_length = int(self.rotary_emb.cos_sin_cache.shape[0])
+        if cache_length >= int(
+            getattr(self.rotary_emb, "max_position_embeddings", cache_length)
+        ):
+            if positions.numel():
+                torch._assert_async(positions.max() < cache_length)
+            return
+        ensure(int(positions.max().item()))
+
     def apply_rope(self, positions: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.numel() == 0:
             return tensor
@@ -449,8 +475,7 @@ class QSAIndexer(MultiPlatformOp):
         num_positions = positions.shape[-1] if positions.ndim == 2 else positions.numel()
         if num_positions != tensor.shape[0]:
             raise ValueError("QSA RoPE positions must match the token dimension")
-        if not get_is_capture_mode() and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length"):
-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+        self._ensure_rope_cache_for(positions)
 
         # Let the exact Qwen4-Exp RoPE instance compose regular or three-axis
         # multimodal positions.  Its public cache view repeats cos/sin to the
