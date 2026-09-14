@@ -16,6 +16,12 @@ if TYPE_CHECKING:
 
 _FAST_TOPK_SUPPORTED_K = (512, 2048)
 
+# Persistent zero row-start buffers keyed by (device, batch): decode rows
+# start at zero, and reusing one buffer removes the zeros fill kernel from
+# every fast_topk call. The kernel only reads it and CUDA graphs need the
+# stable address, which the cache provides.
+_ZERO_ROW_STARTS: dict = {}
+
 
 @cache_once
 def _jit_fast_topk_module(topk: int) -> Module:
@@ -62,7 +68,16 @@ def fast_topk(
     """
     batch = score.shape[0]
     if row_starts is None:
-        row_starts = torch.zeros(batch, dtype=torch.int32, device=score.device)
+        key = (score.device, batch)
+        row_starts = _ZERO_ROW_STARTS.get(key)
+        if row_starts is None:
+            row_starts = torch.zeros(batch, dtype=torch.int32, device=score.device)
+            if not torch.cuda.is_current_stream_capturing():
+                # Never cache a capture-pool tensor: a graph may later free
+                # its pool while this cache still hands the address out.
+                # Warmup runs eagerly first, so capture always finds a cached
+                # eager-addressed (permanently live) buffer.
+                _ZERO_ROW_STARTS[key] = row_starts
     indices = score.new_empty((batch, topk), dtype=torch.int32)
 
     module = _jit_fast_topk_module(topk)
