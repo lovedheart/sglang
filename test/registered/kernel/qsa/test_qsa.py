@@ -482,18 +482,18 @@ def test_qsa_target_verify_rejects_branching_speculation():
         assert "topk=1" in str(exc)
     else:
         raise AssertionError("QSA target verification must reject tree branches")
-    # The pending-group ring keys state by position % ratio: a verify window
-    # wider than the ratio would collide within one forward.
+    # The pending-group ring strides 2*ratio positions (see qsa_ring_stride):
+    # a verify window wider than that could alias a member still in use.
     try:
         backend._require_chain_speculation(
-            ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=1, draft_token_num=5)
+            ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=1, draft_token_num=9)
         )
     except NotImplementedError as exc:
         assert "compress ratio" in str(exc)
     else:
         raise AssertionError("QSA must reject draft windows wider than the ratio")
     backend._require_chain_speculation(
-        ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=1, draft_token_num=4)
+        ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=1, draft_token_num=8)
     )
 
 
@@ -640,6 +640,7 @@ def _make_paged_extend_backend():
     )
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
     backend.forward_metadata = metadata
+    backend.kv_cache_quant_method = None
 
     class Pool:
         def set_kv_buffer(self, layer, loc, k, v):
