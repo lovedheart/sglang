@@ -87,6 +87,7 @@ def _qsa_graph_row_metadata_kernel(
     RATIO: tl.constexpr,
     STRIDE: tl.constexpr,  # pending-ring slots per request (2 * RATIO)
     FULL_PAGE: tl.constexpr,  # full-KV tokens per page
+    COMPRESSED_PAGE: tl.constexpr,  # compressed slots per page
     PAGE_BLOCK: tl.constexpr,
     seq_lens_ptr,
     req_pool_ptr,
@@ -150,8 +151,16 @@ def _qsa_graph_row_metadata_kernel(
     table_row = page_table_ptr + row.to(tl.int64) * max_pages
     offs = tl.arange(0, PAGE_BLOCK)
     row_width_pages = req_to_token_row_stride // FULL_PAGE
+    # Only the first ceil(compressed / COMPRESSED_PAGE) columns are ever read
+    # (every consumer masks by compressed_lens; see the stale-but-unread note
+    # in metadata.compressed_decode_view), so the gather bound is the row's
+    # own page count instead of max_pages. Columns past it keep their prior
+    # contents (buffer-init zeros, or a previous replay's ids) and are never
+    # observed. The bound is read from memory at replay, so the data-dependent
+    # masking stays CUDA-graph safe.
+    used_pages = (seq_len // RATIO + COMPRESSED_PAGE - 1) // COMPRESSED_PAGE
     idx = tl.program_id(1) * PAGE_BLOCK + offs
-    valid = idx < tl.minimum(max_pages, row_width_pages)
+    valid = idx < tl.minimum(tl.minimum(max_pages, row_width_pages), used_pages)
     loc = tl.load(req_to_token_ptr + token_row + idx * FULL_PAGE, mask=valid, other=0)
     tl.store(table_row + idx, tl.maximum(loc // FULL_PAGE, 0), mask=valid)
 
@@ -218,6 +227,7 @@ def launch_graph_metadata(
         RATIO=indexer.compress_ratio,
         STRIDE=qsa_ring_stride(indexer.compress_ratio),
         FULL_PAGE=pool.qsa_compressed_page_size * indexer.compress_ratio,
+        COMPRESSED_PAGE=pool.qsa_compressed_page_size,
         PAGE_BLOCK=128,
         seq_lens_ptr=seq_lens,
         req_pool_ptr=req_pool_indices,
@@ -244,6 +254,7 @@ def _qsa_draft_graph_metadata_kernel(
     RATIO: tl.constexpr,
     STRIDE: tl.constexpr,  # pending-ring slots per request (2 * RATIO)
     FULL_PAGE: tl.constexpr,
+    COMPRESSED_PAGE: tl.constexpr,  # compressed slots per page
 ):
     for step in tl.static_range(len(buffers)):
         if tl.program_id(2) == step:
@@ -263,6 +274,7 @@ def _qsa_draft_graph_metadata_kernel(
                 RATIO,
                 STRIDE,
                 FULL_PAGE,
+                COMPRESSED_PAGE,
                 128,
                 seq_lens,
                 req_pool,
@@ -298,11 +310,12 @@ def prepare_draft_graph_metadata(metadata, req_to_token, pool):
         pool.qsa_compress_ratio,
         qsa_ring_stride(pool.qsa_compress_ratio),
         pool.qsa_compressed_page_size * pool.qsa_compress_ratio,
+        pool.qsa_compressed_page_size,
     )
 
 
 def launch_draft_graph_metadata(args, seq_lens, req_pool_indices, bs, num_padding):
-    buffers, req_to_token, row_stride, max_pages, ratio, stride, full_page = args
+    buffers, req_to_token, row_stride, max_pages, ratio, stride, full_page, compressed_page = args
     if bs == 0:
         return
     _qsa_draft_graph_metadata_kernel[(bs, triton.cdiv(max_pages, 128), len(buffers))](
@@ -317,5 +330,6 @@ def launch_draft_graph_metadata(args, seq_lens, req_pool_indices, bs, num_paddin
         ratio,
         stride,
         full_page,
+        compressed_page,
         num_warps=1,
     )
