@@ -552,9 +552,12 @@ def tilelang_qsa_mqa_decode(
             "TileLang QSA decode requires a compressed page size of "
             f"8/16/32/64 (64-row GEMM sub-page packing), got {page_size}"
         )
-    logits = torch.full(
+    # torch.empty (not torch.full(-inf)): fast_topk scans exactly
+    # [0, context_len) and the kernel writes that prefix in full, so columns
+    # past a row's context length are never read; the wide -inf fill was
+    # pure traffic.
+    logits = torch.empty(
         (q.shape[0], max_model_len),
-        -float("inf"),
         dtype=torch.float32,
         device=q.device,
     )
