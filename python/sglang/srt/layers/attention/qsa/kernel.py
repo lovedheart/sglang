@@ -165,8 +165,25 @@ def _expand_qsa_block_indices_kernel(
     TOKEN_TOPK: tl.constexpr,
     FINAL_TOPK: tl.constexpr,
     OUTPUT_BLOCK_SIZE: tl.constexpr,
+    SORT_INPUT: tl.constexpr,
 ):
     row = tl.program_id(0)
+    if SORT_INPUT:
+        # fast_topk deposits slots in atomic order; a deterministic run order
+        # requires ascending-selection semantics before expansion. Bitonic-
+        # sorting the row here replaces the separate torch.sort launch chain
+        # (network sorts are data-order independent, hence run deterministic).
+        block_cols = tl.arange(0, BLOCK_TOPK)
+        tl.store(
+            block_indices + row * block_stride + block_cols,
+            tl.sort(
+                tl.load(block_indices + row * block_stride + block_cols),
+                dim=0,
+                descending=True,
+            ),
+        )
+        # Make the reordered row visible to the expansion loads below.
+        tl.debug_barrier()
     cols = tl.arange(0, OUTPUT_BLOCK_SIZE)
     sequence_length = tl.load(sequence_lengths + row)
 
@@ -232,8 +249,13 @@ def triton_expand_qsa_block_indices(
     sequence_lengths: torch.Tensor,
     compress_ratio: int,
     token_topk: int,
+    sort_input: bool = False,
 ) -> torch.Tensor:
-    """CUDA fast path for fast_topk_v2 output (valid blocks precede -1 padding)."""
+    """CUDA fast path for fast_topk_v2 output (valid blocks precede -1 padding).
+
+    sort_input=True folds the deterministic-ordering sort into this kernel and
+    reorders ``block_indices`` in place (the fast_topk output is dead after
+    this call); see ``_sort_qsa_topk_indices`` for the ordering contract."""
     rows, block_topk = block_indices.shape
     final_topk = token_topk + compress_ratio - 1
     output = torch.empty(
@@ -253,6 +275,7 @@ def triton_expand_qsa_block_indices(
         TOKEN_TOPK=token_topk,
         FINAL_TOPK=final_topk,
         OUTPUT_BLOCK_SIZE=triton.next_power_of_2(final_topk),
+        SORT_INPUT=sort_input,
         num_warps=8,
     )
     return output
@@ -264,8 +287,13 @@ def expand_qsa_block_indices(
     sequence_lengths: torch.Tensor,
     compress_ratio: int,
     token_topk: int,
+    sort_input: bool = False,
 ) -> torch.Tensor:
-    """Expand compressed blocks with Triton on CUDA and Torch elsewhere."""
+    """Expand compressed blocks with Triton on CUDA and Torch elsewhere.
+
+    sort_input only applies to the CUDA path (the Torch path never sorted and
+    compacts with a stable argsort instead).
+    """
 
     block_topk = (token_topk + compress_ratio - 1) // compress_ratio
     if block_indices.ndim != 2 or block_indices.shape[1] != block_topk:
@@ -285,6 +313,7 @@ def expand_qsa_block_indices(
             sequence_lengths.to(device=block_indices.device).contiguous(),
             compress_ratio,
             token_topk,
+            sort_input=sort_input,
         )
     return torch_expand_qsa_block_indices(
         block_indices,
