@@ -1348,7 +1348,6 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path():
         )
         for field in (
             "graph_write_locs",
-            "graph_compressed_page_table",
             "graph_compressed_lengths",
             "decode_logical_positions",
             "pending_ring_slots",
@@ -1357,6 +1356,25 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path():
             kernel_buf = getattr(kernel_metadata.indexer_metadata, field)
             host_buf = getattr(host_metadata.indexer_metadata, field)
             assert torch.equal(kernel_buf, host_buf), (mode, field)
+        # The page table matches exactly on the readable prefix of every row
+        # (ceil(compressed_len / compressed_page) columns). Past it the kernel
+        # skips writes for speed and the values are stale-but-unread, per the
+        # contract in metadata.compressed_decode_view.
+        kernel_table = kernel_metadata.indexer_metadata.graph_compressed_page_table
+        host_table = host_metadata.indexer_metadata.graph_compressed_page_table
+        lens = kernel_metadata.indexer_metadata.graph_compressed_lengths
+        used_pages = (lens.long() + 16 - 1) // 16  # compressed_page_size=16
+        cols = torch.arange(kernel_table.shape[1], device=device)[None, :]
+        readable = cols < used_pages[:, None]
+        assert torch.equal(
+            kernel_table.masked_fill(~readable, 0),
+            host_table.masked_fill(~readable, 0),
+        ), (mode, "graph_compressed_page_table prefix")
+        # The kernel never writes the unread tail at all: it stays at init.
+        assert torch.equal(
+            kernel_table.masked_fill(readable, 0),
+            torch.zeros_like(kernel_table),
+        ), (mode, "page table tail must stay untouched")
 
     # Decode: lengths straddling boundaries (256 is a boundary, others not).
     run_case(mode=0, bs=4, num_rows=4, seq_lens_list=[255, 256, 257, 512], extend_len=0)
