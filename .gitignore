@@ -284,3 +284,4 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+.codegraph/
