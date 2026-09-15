@@ -241,6 +241,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         self.kv_cache_quant_method = None
         self._fp4_attn_dtype = torch.bfloat16
         self._fused_fp4_gather = False
+        # Feed fp8 scratch to the paged decode kernel instead of widening KV to
+        # the query dtype first (see SGLANG_QSA_ATTN_FP8).  The dtype is resolved
+        # per call from the KV buffer; this only records that the operator asked.
+        self._attn_fp8_requested = bool(envs.SGLANG_QSA_ATTN_FP8.get())
         get_quant_method = getattr(
             self.token_to_kv_pool, "get_kv_cache_quant_method", None
         )
@@ -329,6 +333,51 @@ class QwenSparseAttnBackend(AttentionBackend):
             layer_id,
             dtype=self._fp4_attn_dtype,
         )
+
+    @staticmethod
+    def _attn_scratch_dtype(
+        requested: bool,
+        query_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        *,
+        fused_fp4: bool,
+        gathered_rows: bool,
+    ) -> torch.dtype:
+        """Pick the dtype of the packed decode scratch (bf16 by default).
+
+        fp8 is only safe where every value that reaches the scratch is exactly
+        representable or has been fully dequantized first:
+
+        * an fp8_e4m3 pool read straight by the gatherer (``gathered_rows``
+          False) -- the copy is bitwise, only the kernel sees fp8;
+        * the fused NVFP4 gatherer, which dequantizes in registers and casts to
+          the scratch dtype (one extra saturating rounding).
+
+        A non-fused FP4 gather hands in an already-dequantized bf16 buffer, and
+        a query dtype other than bf16 has no bf16-q/fp8-KV kernel path, so both
+        stay bf16.
+        """
+        if not requested or query_dtype != torch.bfloat16:
+            return query_dtype
+        if fused_fp4:
+            return torch.float8_e4m3fn
+        if not gathered_rows and kv_dtype == torch.float8_e4m3fn:
+            return torch.float8_e4m3fn
+        return query_dtype
+
+    @staticmethod
+    def _widen_kv_for_kernel(rows: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Return gathered KV rows in the sparse-prefill kernel's input dtype.
+
+        The chunk-prefill kernel casts the gathered K/V tiles to the query dtype
+        before ``tl.dot`` (Triton rejects an fp8 right-hand side), so an fp8
+        pool's rows can be handed over as they are: fp8_e4m3 -> bf16 widens
+        exactly, and skipping the host-side cast drops a full-context bf16
+        materialization per layer.  Anything else still converts eagerly.
+        """
+        if rows.dtype == dtype or rows.dtype == torch.float8_e4m3fn:
+            return rows
+        return rows.to(dtype)
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -1671,20 +1720,30 @@ class QwenSparseAttnBackend(AttentionBackend):
                     )
             packed_k, packed_v = self._gather_kv_fp4(layer.layer_id, all_slots)
         else:
+            k_buffer = pool.get_key_buffer(layer.layer_id)
+            v_buffer = pool.get_value_buffer(layer.layer_id)
+            # An fp8_e4m3 pool packs losslessly (implicit scale 1.0) and the
+            # kernel widens the tiles itself, so only widen for other dtypes.
             packed_k, packed_v = pack_qsa_prefill_kv(
-                k=pool.get_key_buffer(layer.layer_id),
-                v=pool.get_value_buffer(layer.layer_id),
+                k=k_buffer,
+                v=v_buffer,
                 req_to_token=self.req_to_token_pool.req_to_token,
                 req_indices=forward_batch.req_pool_indices,
                 cu_k=cu_seqlens_k,
                 total_k=total_context,
                 max_k=max(sequence_lens, default=1),
-                output_dtype=q.dtype,
+                output_dtype=None
+                if k_buffer.dtype == torch.float8_e4m3fn
+                else q.dtype,
             )
+        # fp8 KV buffers carry implicit scale 1.0, so the kernel can widen
+        # the gathered rows itself (it casts both K/V tiles to the query
+        # dtype before tl.dot); passing fp8 straight through skips a
+        # full-context bf16 materialization per layer bit-identically.
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
-            packed_k,
-            packed_v,
+            self._widen_kv_for_kernel(packed_k, q.dtype),
+            self._widen_kv_for_kernel(packed_v, q.dtype),
             topk_indices,
             cu_seqlens_q,
             cu_seqlens_k,
@@ -1875,13 +1934,27 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch, pages_per_row, page, device
         )
         capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
-        # Gather into the query dtype: an FP8 pool is dequantized on the way in, so the
-        # paged kernel always runs the bf16 q + bf16 KV path.
+        # By default gather into the query dtype: an FP8 pool is dequantized on
+        # the way in (exact, scale 1.0), an FP4 pool dequantizes in gather
+        # registers, and the paged kernel always runs bf16 q + bf16 KV.
+        # SGLANG_QSA_ATTN_FP8 keeps the scratch in fp8 instead: for an fp8 pool
+        # the gather is then a bitwise copy and only the kernel sees fp8 (the
+        # bf16-q/fp8-KV transform path on trtllm-gen, dequant-on-load in xqa);
+        # for the fused FP4 gather the dequantized values take one additional
+        # saturating rounding into e4m3.  The legacy (non-fused) FP4 path and
+        # the FA2-varlen fallback always keep bf16 scratch.
+        scratch_dtype = self._attn_scratch_dtype(
+            self._attn_fp8_requested,
+            q.dtype,
+            k_buffer.dtype,
+            fused_fp4=fused_fp4,
+            gathered_rows=gathered_rows,
+        )
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
             k_buffer.shape[1],
             k_buffer.shape[2],
-            q.dtype,
+            scratch_dtype,
             k_buffer.device,
         )
         if new_kv is not None:
