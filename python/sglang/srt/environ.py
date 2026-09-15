@@ -329,11 +329,18 @@ class Envs:
     # widening KV to the query dtype first.  On an fp8_e4m3 pool the cast to
     # bf16 is exact (scale 1.0), so this only switches the kernel to its
     # bf16-q/fp8-KV path (trtllm-gen transform / xqa fp8) and halves the
-    # scratch traffic.  On an NVFP4 pool (fused gather only) the gather kernel
-    # requantizes the dequantized rows to e4m3 and folds the per-layer global
-    # scales into the bmm scales -- an extra rounding on top of the FP4
-    # storage, so it is opt-in.  Unset keeps the bf16 KV path everywhere.
+    # scratch traffic.  On an NVFP4 pool (fused gather only) the gather
+    # requantizes the dequantized rows to e4m3 -- an extra rounding on top of
+    # the FP4 storage, so it is opt-in.  Unset keeps the bf16 KV path
+    # everywhere.  See SGLANG_QSA_ATTN_FP4 for the lossless native FP4 path.
     SGLANG_QSA_ATTN_FP8 = EnvBool(False)
+    # Take the native FP4-KV path in the QSA sparse-decode kernel on an NVFP4
+    # pool (fused gather only): packed nibbles + scale factors are copied
+    # through and dequantized in registers, bitwise-equal to the bf16 scratch
+    # for pow-of-two group scales (<=0.7% otherwise).  Requires an SM12x GPU
+    # (xqa); elsewhere FP4 alone stays on the bf16 path, while FP8 alone still
+    # selects the e4m3-requant scratch.  SGLANG_QSA_ATTN_FP8 also implies it.
+    SGLANG_QSA_ATTN_FP4 = EnvBool(False)
     # Route decode-size HC mix through the persistent Triton kernel; 0 falls
     # back to the plain-torch mix without full deterministic inference.
     SGLANG_HC_MIX_TRITON = EnvBool(True)
