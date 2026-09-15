@@ -673,6 +673,8 @@ def _gather_dequant_fp4_kv(
     cu_k,
     out_k,
     out_v,
+    out_k_sf,
+    out_v_sf,
     topk: tl.constexpr,
     heads: tl.constexpr,
     dim: tl.constexpr,
@@ -683,9 +685,11 @@ def _gather_dequant_fp4_kv(
     pad_cols,
     BLOCK_TOPK: tl.constexpr,
     ZERO_FILL: tl.constexpr,
+    PACKED: tl.constexpr,
 ):
     """Gather top-k KV rows straight out of packed NVFP4 storage, dequantize
     in registers and write the result into the packed attention scratch.
+    With PACKED, write the raw nibbles + SF bytes instead (native FP4 decode).
 
     Fuses the historical gather (4 index_selects + full-tensor dequant
     materialization) and the gathered-rows packing into one launch. Validity
@@ -722,25 +726,50 @@ def _gather_dequant_fp4_kv(
         + head * dim
         + tl.arange(0, dim)[None, :]
     )
-    out_dtype = out_k.dtype.element_ty
-    gs_k = tl.load(k_gs + 0)
-    gs_v = tl.load(v_gs + 0)
-    for kv in tl.static_range(2):
-        if kv == 0:
-            fp4, sf_ptr, gs, out = k_fp4, k_sf, gs_k, out_k
-        else:
-            fp4, sf_ptr, gs, out = v_fp4, v_sf, gs_v, out_v
-        packed = tl.load(fp4 + fp4_base, mask=valid[:, None], other=0)
-        lo = _nvfp4_nibbles_to_f32((packed & 0xF).to(tl.int32))
-        hi = _nvfp4_nibbles_to_f32(((packed >> 4) & 0xF).to(tl.int32))
-        vals = tl.interleave(lo, hi)
-        sf = tl.load(sf_ptr + sf_base, mask=valid[:, None], other=0).to(
-            tl.float8e4nv, bitcast=True
+    if PACKED:
+        # Native NVFP4 decode scratch: copy the packed nibbles and the raw SF
+        # bytes through untouched (the kernel dequantizes in registers and the
+        # global scales ride on the bmm scales), so this gather is a bitwise
+        # row copy.  Invalid columns land as nibble 0 with SF 0, i.e. value 0.
+        dst_p = (
+            (pack_start + cols).to(tl.int64)[:, None] * heads * (dim // 2)
+            + head * (dim // 2)
+            + d2[None, :]
         )
-        sf = sf.to(tl.float32)
-        for _ in tl.static_range(4):
-            sf = tl.interleave(sf, sf)
-        tl.store(out + dst, ((vals * sf) * gs).to(out_dtype), mask=store_cols[:, None])
+        dst_s = (
+            (pack_start + cols).to(tl.int64)[:, None] * heads * (dim // 16)
+            + head * (dim // 16)
+            + sf_j[None, :]
+        )
+        for kv in tl.static_range(2):
+            if kv == 0:
+                fp4, sf_ptr, out, out_sf = k_fp4, k_sf, out_k, out_k_sf
+            else:
+                fp4, sf_ptr, out, out_sf = v_fp4, v_sf, out_v, out_v_sf
+            packed = tl.load(fp4 + fp4_base, mask=valid[:, None], other=0)
+            tl.store(out + dst_p, packed, mask=store_cols[:, None])
+            sfb = tl.load(sf_ptr + sf_base, mask=valid[:, None], other=0)
+            tl.store(out_sf + dst_s, sfb, mask=store_cols[:, None])
+    else:
+        out_dtype = out_k.dtype.element_ty
+        gs_k = tl.load(k_gs + 0)
+        gs_v = tl.load(v_gs + 0)
+        for kv in tl.static_range(2):
+            if kv == 0:
+                fp4, sf_ptr, gs, out = k_fp4, k_sf, gs_k, out_k
+            else:
+                fp4, sf_ptr, gs, out = v_fp4, v_sf, gs_v, out_v
+            packed = tl.load(fp4 + fp4_base, mask=valid[:, None], other=0)
+            lo = _nvfp4_nibbles_to_f32((packed & 0xF).to(tl.int32))
+            hi = _nvfp4_nibbles_to_f32(((packed >> 4) & 0xF).to(tl.int32))
+            vals = tl.interleave(lo, hi)
+            sf = tl.load(sf_ptr + sf_base, mask=valid[:, None], other=0).to(
+                tl.float8e4nv, bitcast=True
+            )
+            sf = sf.to(tl.float32)
+            for _ in tl.static_range(4):
+                sf = tl.interleave(sf, sf)
+            tl.store(out + dst, ((vals * sf) * gs).to(out_dtype), mask=store_cols[:, None])
 
 
 def qwen_sparse_kv_gather_dequant_fp4_triton(
@@ -762,10 +791,16 @@ def qwen_sparse_kv_gather_dequant_fp4_triton(
     heads,
     dim,
     zero_fill_cols: int = 0,
+    out_k_sf=None,
+    out_v_sf=None,
 ):
     """Gather + dequantize the selected (batch, topk) NVFP4 KV rows into the
     packed layout addressed by cu_k.  ``zero_fill_cols`` > 0 selects the strided
     (page-aligned) layout, mirroring qwen_sparse_kv_extraction_compact_triton.
+
+    When ``out_k_sf``/``out_v_sf`` are given, out_k/out_v are uint8 packed
+    scratch buffers and the kernel copies nibbles + SF bytes through instead of
+    dequantizing (native FP4 decode; the scales ride on the bmm scales).
 
     k_fp4/v_fp4 are the pool's packed uint8 buffers, k_sf/v_sf the raw scale
     bytes (viewed as uint8) and k_gs/v_gs the layer's fp32 [1] global scales,
@@ -789,6 +824,8 @@ def qwen_sparse_kv_gather_dequant_fp4_triton(
         cu_k,
         out_k,
         out_v,
+        out_k_sf,
+        out_v_sf,
         topk,
         heads,
         dim,
@@ -799,6 +836,7 @@ def qwen_sparse_kv_gather_dequant_fp4_triton(
         num_cols,
         BLOCK_TOPK=block_topk,
         ZERO_FILL=zero_fill,
+        PACKED=out_k_sf is not None,
         num_warps=4,
     )
 
