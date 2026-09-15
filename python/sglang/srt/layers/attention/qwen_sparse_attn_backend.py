@@ -206,6 +206,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         # the query dtype first (see SGLANG_QSA_ATTN_FP8).  The dtype is resolved
         # per call from the KV buffer; this only records that the operator asked.
         self._attn_fp8_requested = bool(envs.SGLANG_QSA_ATTN_FP8.get())
+        # SGLANG_QSA_ATTN_FP4 (or FP8 on an NVFP4 pool) takes the native
+        # FP4-KV decode path where the kernel supports it (xqa on SM12x): the
+        # fused gather then copies packed nibbles + scale factors through and
+        # the kernel dequantizes in registers, which is exactly the bf16-scratch
+        # result -- no requant drift at all.  Resolved once the quant method is
+        # known below.  When unsupported, FP4 alone stays on bf16 scratch while
+        # FP8 alone falls back to the e4m3-requant scratch.
+        self._attn_fp4_requested = bool(envs.SGLANG_QSA_ATTN_FP4.get())
+        self._native_fp4_decode = False
+        self._fp4_gs_host = {}
         get_quant_method = getattr(
             self.token_to_kv_pool, "get_kv_cache_quant_method", None
         )
@@ -221,6 +231,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                 self._fused_fp4_gather = bool(
                     envs.SGLANG_QSA_FUSED_FP4_GATHER.get()
                     and getattr(quant_method, "name", "") == "nvfp4"
+                )
+                self._native_fp4_decode = bool(
+                    self._fused_fp4_gather
+                    and (self._attn_fp4_requested or self._attn_fp8_requested)
+                    and torch.cuda.get_device_capability()[0] == 12
                 )
         self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
         self._cuda_graph_metadata: Dict[
@@ -1672,8 +1687,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         # the gather is then a bitwise copy and only the kernel sees fp8 (the
         # bf16-q/fp8-KV transform path on trtllm-gen, dequant-on-load in xqa);
         # for the fused FP4 gather the dequantized values take one additional
-        # saturating rounding into e4m3.  The legacy (non-fused) FP4 path and
-        # the FA2-varlen fallback always keep bf16 scratch.
+        # saturating rounding into e4m3 (SGLANG_QSA_ATTN_FP4 upgrades that
+        # case to the lossless native FP4-KV path where supported, overriding
+        # this).  The legacy (non-fused) FP4 path and the FA2-varlen fallback
+        # always keep bf16 scratch.
         scratch_dtype = self._attn_scratch_dtype(
             self._attn_fp8_requested,
             q.dtype,
@@ -1681,10 +1698,17 @@ class QwenSparseAttnBackend(AttentionBackend):
             fused_fp4=fused_fp4,
             gathered_rows=gathered_rows,
         )
+        native_fp4 = (
+            fused_fp4
+            and self._native_fp4_decode
+            and q.dtype == torch.bfloat16
+        )
+        if native_fp4:
+            scratch_dtype = torch.uint8
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
             k_buffer.shape[1],
-            k_buffer.shape[2],
+            k_buffer.shape[2] // 2 if native_fp4 else k_buffer.shape[2],
             scratch_dtype,
             k_buffer.device,
         )
@@ -1700,6 +1724,20 @@ class QwenSparseAttnBackend(AttentionBackend):
                 k_sf = k_sf.view(torch.uint8)
                 v_sf = v_sf.view(torch.uint8)
             method = self.kv_cache_quant_method
+            if native_fp4:
+                # Native FP4 decode: packed scratch plus an SF scratch laid out
+                # like the KV scratch (page-major rows, tail dim dim/16), so
+                # the static arange block table addresses it unchanged; the
+                # global scales fold into the bmm scales at the call below.
+                packed_ksf, packed_vsf = self._get_fa2_scratch(
+                    max(capacity_rows, batch) * stride,
+                    k_sf.shape[1],
+                    k_sf.shape[2],
+                    torch.uint8,
+                    k_buffer.device,
+                )
+            else:
+                packed_ksf = packed_vsf = None
             qwen_sparse_kv_gather_dequant_fp4_triton(
                 k_fp4.view(torch.uint8),
                 v_fp4.view(torch.uint8),
@@ -1723,6 +1761,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 k_fp4.shape[1],
                 k_fp4.shape[2] * 2,
                 zero_fill_cols=stride,
+                out_k_sf=packed_ksf,
+                out_v_sf=packed_vsf,
             )
         elif gathered_rows:
             qwen_sparse_kv_extraction_gathered_rows_triton(
@@ -1757,16 +1797,37 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         num_kv_heads = k_buffer.shape[1]
         head_dim = k_buffer.shape[2]
-        kc = (
-            packed_k[: batch * stride]
-            .view(-1, page, num_kv_heads, head_dim)
-            .permute(0, 2, 1, 3)
-        )
-        vc = (
-            packed_v[: batch * stride]
-            .view(-1, page, num_kv_heads, head_dim)
-            .permute(0, 2, 1, 3)
-        )
+        kv_rows = packed_k[: batch * stride]
+        kv_rows_v = packed_v[: batch * stride]
+        if native_fp4:
+            # Packed nibble pages; head_dim is reported in bytes here, the
+            # kernel unpacks 2 fp4 per byte (QK == VO assumed).
+            kc = kv_rows.view(-1, page, num_kv_heads, head_dim // 2).permute(0, 2, 1, 3)
+            vc = kv_rows_v.view(-1, page, num_kv_heads, head_dim // 2).permute(
+                0, 2, 1, 3
+            )
+            kv_cache_sf = (
+                packed_ksf[: batch * stride]
+                .view(-1, page, num_kv_heads, head_dim // 16)
+                .permute(0, 2, 1, 3)
+                .view(torch.float8_e4m3fn),
+                packed_vsf[: batch * stride]
+                .view(-1, page, num_kv_heads, head_dim // 16)
+                .permute(0, 2, 1, 3)
+                .view(torch.float8_e4m3fn),
+            )
+            # The kernel applies only the per-block SFs; fold the pool's global
+            # scales into the bmm scales (graph-safe fp32 tensor views).
+            method = self.kv_cache_quant_method
+            bmm1 = layer.scaling * method.k_scales_gpu[
+                layer.layer_id : layer.layer_id + 1
+            ]
+            bmm2 = method.v_scales_gpu[layer.layer_id : layer.layer_id + 1]
+        else:
+            kc = kv_rows.view(-1, page, num_kv_heads, head_dim).permute(0, 2, 1, 3)
+            vc = kv_rows_v.view(-1, page, num_kv_heads, head_dim).permute(0, 2, 1, 3)
+            kv_cache_sf = None
+            bmm1, bmm2 = layer.scaling, 1.0
         if self._trtllm_workspace is None:
             self._trtllm_workspace = torch.zeros(
                 128 * 1024 * 1024, dtype=torch.uint8, device=device
@@ -1778,8 +1839,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             block_tables=block_tables,
             seq_lens=valid_counts,
             max_seq_len=stride,
-            bmm1_scale=layer.scaling,
-            bmm2_scale=1.0,
+            bmm1_scale=bmm1,
+            bmm2_scale=bmm2,
+            **({"kv_cache_sf": kv_cache_sf} if native_fp4 else {}),
         )
         return output.reshape(q.shape[0], -1)
 
