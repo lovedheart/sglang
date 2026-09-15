@@ -246,3 +246,135 @@ def test_chunk_prefill_fp8_passthrough_is_bitwise():
     assert torch.isfinite(direct).all()
     assert torch.equal(direct.view(BF16), cast.view(BF16))
 
+
+def _packed_gather_world(seed=0):
+    import test.registered.kernel.qsa.test_qsa_attn_fp8 as self_mod
+
+    batch, topk, heads, dim, pool_rows = 4, 512, 2, 256, 65536
+    w = self_mod._make_fp4_world(
+        batch, topk, heads, dim, pool_rows, torch.device("cuda"), seed=seed
+    )
+    # calibrated (in-range) scales: block scale 1.0, pow2 global scale so the
+    # folded bmm scales are exact.
+    w["k_sf"].fill_(56)
+    w["v_sf"].fill_(56)
+    w["k_gs"].fill_(0.25)
+    w["v_gs"].fill_(0.25)
+    return w, batch, topk, heads, dim
+
+
+def test_fp4_fused_gather_into_packed_scratch_is_bitwise():
+    # Native FP4 decode mode: the gather copies packed nibbles and SF bytes
+    # through untouched (kernel dequantizes in registers), so the packed and SF
+    # scratch must match a torch row-gather of the raw pool bitwise, with the
+    # strided tail and invalid columns stored as zero (nibble 0 / SF 0).
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    w, batch, topk, heads, dim = _packed_gather_world()
+    stride = ((topk + PAGE - 1) // PAGE) * PAGE
+    cu = torch.arange(batch + 1, dtype=torch.int32, device="cuda") * stride
+    pk = torch.zeros(batch * stride, heads, dim // 2, dtype=torch.uint8, device="cuda")
+    pv = torch.zeros_like(pk)
+    pk_sf = torch.zeros(batch * stride, heads, dim // 16, dtype=torch.uint8, device="cuda")
+    pv_sf = torch.zeros_like(pk_sf)
+    qwen_sparse_kv_gather_dequant_fp4_triton(
+        w["k_fp4"], w["v_fp4"], w["k_sf"], w["v_sf"],
+        w["k_gs"][1:2], w["v_gs"][1:2],
+        w["req_to_token"], w["req_indices"], w["indices"], w["seq_lens"], cu,
+        pk, pv, batch, topk, heads, dim,
+        zero_fill_cols=stride, out_k_sf=pk_sf, out_v_sf=pv_sf,
+    )
+    idx = w["indices"].long()
+    valid = (idx >= 0) & (idx < w["seq_lens"].long()[:, None])
+    slots = w["req_to_token"][
+        w["req_indices"].long()[:, None], idx.clamp(min=0)
+    ]
+    for name, pool, sf, out, out_sf in (
+        ("K", w["k_fp4"], w["k_sf"], pk, pk_sf),
+        ("V", w["v_fp4"], w["v_sf"], pv, pv_sf),
+    ):
+        got = out.view(batch, stride, heads, dim // 2)
+        got_sf = out_sf.view(batch, stride, heads, dim // 16)
+        ref = pool[slots.reshape(-1).clamp(max=pool.shape[0] - 1)].reshape(
+            batch, topk, heads, dim // 2
+        )
+        ref_sf = sf[slots.reshape(-1).clamp(max=sf.shape[0] - 1)].reshape(
+            batch, topk, heads, dim // 16
+        )
+        ref = torch.where(valid[:, :, None, None], ref, torch.zeros_like(ref))
+        ref_sf = torch.where(valid[:, :, None, None], ref_sf, torch.zeros_like(ref_sf))
+        assert torch.equal(got[:, :topk], ref), name
+        assert torch.equal(got_sf[:, :topk], ref_sf), name
+        for b in range(batch):
+            assert got[b, int(w["seq_lens"][b]) :].eq(0).all(), name
+            assert got_sf[b, int(w["seq_lens"][b]) :].eq(0).all(), name
+
+
+@pytest.mark.parametrize("gs", [0.25, 0.2])
+def test_native_fp4_decode_matches_bf16_scratch(gs):
+    # The xqa NVFP4 path (packed KV + kv_cache_sf, global scales folded into
+    # the bmm scales) must reproduce the bf16-scratch dequantized decode.  A
+    # pow2 global scale is bitwise; a calibrated non-pow2 one costs the extra
+    # fp32-fold rounding only (rel_l2 < 1%).
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("xqa NVFP4 KV requires an SM12x GPU")
+    from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+
+    w, batch, topk, heads, dim = _packed_gather_world()
+    w["k_gs"].fill_(gs)
+    w["v_gs"].fill_(gs)
+    stride = ((topk + PAGE - 1) // PAGE) * PAGE
+    pages = batch * stride // PAGE
+    cu = torch.arange(batch + 1, dtype=torch.int32, device="cuda") * stride
+    pk = torch.zeros(batch * stride, heads, dim // 2, dtype=torch.uint8, device="cuda")
+    pv = torch.zeros_like(pk)
+    pk_sf = torch.zeros(batch * stride, heads, dim // 16, dtype=torch.uint8, device="cuda")
+    pv_sf = torch.zeros_like(pk_sf)
+    bk = torch.zeros(batch * stride, heads, dim, dtype=BF16, device="cuda")
+    bv = torch.zeros_like(bk)
+    args = (
+        w["k_fp4"], w["v_fp4"], w["k_sf"], w["v_sf"],
+        w["k_gs"][1:2], w["v_gs"][1:2],
+        w["req_to_token"], w["req_indices"], w["indices"], w["seq_lens"], cu,
+    )
+    qwen_sparse_kv_gather_dequant_fp4_triton(
+        *args, pk, pv, batch, topk, heads, dim,
+        zero_fill_cols=stride, out_k_sf=pk_sf, out_v_sf=pv_sf,
+    )
+    qwen_sparse_kv_gather_dequant_fp4_triton(
+        *args, bk, bv, batch, topk, heads, dim, zero_fill_cols=stride
+    )
+    torch.manual_seed(7)
+    q = torch.randn(batch, 1, 12, dim, device="cuda", dtype=BF16)
+    bt = torch.arange(pages, dtype=torch.int32, device="cuda").reshape(
+        batch, stride // PAGE
+    ).contiguous()
+    sl = w["seq_lens"].clone()
+    ws = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    ref = trtllm_batch_decode_with_kv_cache(
+        q,
+        (bk.view(pages, PAGE, heads, dim).permute(0, 2, 1, 3),
+         bv.view(pages, PAGE, heads, dim).permute(0, 2, 1, 3)),
+        ws, bt, sl, max_seq_len=stride, bmm1_scale=0.18, bmm2_scale=1.0,
+        out_dtype=BF16,
+    )
+    got = trtllm_batch_decode_with_kv_cache(
+        q,
+        (pk[: batch * stride].view(pages, PAGE, heads, dim // 2).permute(0, 2, 1, 3),
+         pv[: batch * stride].view(pages, PAGE, heads, dim // 2).permute(0, 2, 1, 3)),
+        ws, bt, sl, max_seq_len=stride,
+        kv_cache_sf=(
+            pk_sf[: batch * stride].view(pages, PAGE, heads, dim // 16)
+            .permute(0, 2, 1, 3).view(FP8),
+            pv_sf[: batch * stride].view(pages, PAGE, heads, dim // 16)
+            .permute(0, 2, 1, 3).view(FP8),
+        ),
+        bmm1_scale=0.18 * w["k_gs"][1:2], bmm2_scale=w["v_gs"][1:2],
+        out_dtype=BF16,
+    )
+    rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
+    if gs == 0.25:
+        assert torch.equal(got, ref)
+    else:
+        assert rel < 0.01, f"native fp4 drift {rel}"
+
