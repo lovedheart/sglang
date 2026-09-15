@@ -378,3 +378,89 @@ def test_native_fp4_decode_matches_bf16_scratch(gs):
     else:
         assert rel < 0.01, f"native fp4 drift {rel}"
 
+
+def test_fp4_packed_gather_verify_rows_are_bitwise():
+    # Target-verify shape: query rows outnumber requests -- `requests * draft`
+    # rows share req_to_token through a repeated row_req_pool_indices, and each
+    # row carries its own top-k selection and its own length (position + 1).
+    # The packed gather must address the pool through the ROW's request while
+    # packing each row at its strided offset: every scratch byte must equal a
+    # torch row-gather of the raw pool, and every non-selected column inside
+    # the stride (draft-window overflow and -1 padding alike) must land as
+    # zero, never as stale poison.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    device = torch.device("cuda")
+    requests, draft, topk, heads, dim, pool_rows = 2, 4, 20, 2, 128, 4096
+    rows = requests * draft
+    stride = ((topk + PAGE - 1) // PAGE) * PAGE
+    g = torch.Generator(device="cpu").manual_seed(3)
+
+    def u8(*shape):
+        return (
+            torch.randint(0, 256, shape, generator=g, dtype=torch.int64)
+            .to(torch.uint8)
+            .to(device)
+        )
+
+    k_fp4, v_fp4 = u8(pool_rows, heads, dim // 2), u8(pool_rows, heads, dim // 2)
+    k_sf, v_sf = u8(pool_rows, heads * (dim // 16)), u8(pool_rows, heads * (dim // 16))
+    # Verify-window lengths: a full group plus the growing draft offset, with
+    # one request crossing the topk boundary so rows mix fully-valid rows and
+    # rows whose index tail is -1-padded.
+    lengths = [12, 13, 14, 15, 20, 21, 22, 23]
+    assert len(lengths) == rows
+    table_len = max(lengths)
+    req_to_token = (
+        torch.stack(
+            [torch.randperm(pool_rows, generator=g)[:table_len] for _ in range(requests)]
+        )
+        .to(torch.int32)
+        .to(device)
+    )
+    req_indices = (
+        torch.arange(requests).repeat_interleave(draft).to(torch.int32).to(device)
+    )
+    seq_lens = torch.tensor(lengths, dtype=torch.int32, device=device)
+    indices = torch.full((rows, topk), -1, dtype=torch.int32)
+    for b in range(rows):
+        n = min(lengths[b], topk)
+        # Upstream sorts the block selections for run determinism; keep them
+        # sorted so the gather sees the same order as the real verify path.
+        picks = torch.randperm(lengths[b], generator=g)[:n].sort().values
+        indices[b, :n] = picks.to(torch.int32)
+    indices = indices.to(device)
+
+    cu = torch.arange(rows + 1, dtype=torch.int32, device=device) * stride
+    pk = torch.full((rows * stride, heads, dim // 2), 0x7F, dtype=torch.uint8, device=device)
+    pv = torch.full_like(pk, 0x7F)
+    pk_sf = torch.full((rows * stride, heads, dim // 16), 0x7F, dtype=torch.uint8, device=device)
+    pv_sf = torch.full_like(pk_sf, 0x7F)
+    qwen_sparse_kv_gather_dequant_fp4_triton(
+        k_fp4, v_fp4, k_sf, v_sf,
+        torch.ones(1, dtype=torch.float32, device=device),
+        torch.ones(1, dtype=torch.float32, device=device),
+        req_to_token, req_indices, indices, seq_lens, cu,
+        pk, pv, rows, topk, heads, dim,
+        zero_fill_cols=stride, out_k_sf=pk_sf, out_v_sf=pv_sf,
+    )
+
+    idx = indices.long()
+    valid = (idx >= 0) & (idx < seq_lens.long()[:, None])
+    slots = req_to_token.long()[req_indices.long()[:, None], idx.clamp(min=0)]
+    for name, pool, sf, out, out_sf in (
+        ("K", k_fp4, k_sf, pk, pk_sf),
+        ("V", v_fp4, v_sf, pv, pv_sf),
+    ):
+        ref = pool[slots.reshape(-1)].reshape(rows, topk, heads, -1)
+        ref = torch.where(valid[:, :, None, None], ref, torch.zeros_like(ref))
+        expected = torch.zeros(rows, stride, *ref.shape[2:], dtype=torch.uint8, device=device)
+        expected[:, :topk] = ref
+        assert torch.equal(out.view(rows, stride, heads, -1), expected), name
+        ref_s = sf[slots.reshape(-1)].reshape(rows, topk, heads, dim // 16)
+        ref_s = torch.where(valid[:, :, None, None], ref_s, torch.zeros_like(ref_s))
+        expected_s = torch.zeros(rows, stride, heads, dim // 16, dtype=torch.uint8, device=device)
+        expected_s[:, :topk] = ref_s
+        assert torch.equal(out_sf.view(rows, stride, heads, dim // 16), expected_s), name
+    # Nothing survived from the poison: the whole stride is written per row.
+    assert not (pk == 0x7F).any() and not (pv_sf == 0x7F).any()
