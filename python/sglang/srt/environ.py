@@ -325,6 +325,15 @@ class Envs:
     # top-k kernels emit slots in atomic order; sparse attention merges in
     # list order, making logits run-dependent).  0 keeps the raw order.
     SGLANG_QSA_SORT_TOPK = EnvBool(True)
+    # Feed the QSA sparse-attention paged decode kernel fp8 scratch instead of
+    # widening KV to the query dtype first.  On an fp8_e4m3 pool the cast to
+    # bf16 is exact (scale 1.0), so this only switches the kernel to its
+    # bf16-q/fp8-KV path (trtllm-gen transform / xqa fp8) and halves the
+    # scratch traffic.  On an NVFP4 pool (fused gather only) the gather kernel
+    # requantizes the dequantized rows to e4m3 and folds the per-layer global
+    # scales into the bmm scales -- an extra rounding on top of the FP4
+    # storage, so it is opt-in.  Unset keeps the bf16 KV path everywhere.
+    SGLANG_QSA_ATTN_FP8 = EnvBool(False)
     # Route decode-size HC mix through the persistent Triton kernel; 0 falls
     # back to the plain-torch mix without full deterministic inference.
     SGLANG_HC_MIX_TRITON = EnvBool(True)
