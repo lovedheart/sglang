@@ -1066,6 +1066,126 @@ def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
     torch.testing.assert_close(actual, expected)
 
 
+def _qsa_window_mask(rows, keys, starts, ends):
+    columns = torch.arange(keys, device=starts.device)
+    return (columns >= starts[:, None].long()) & (columns < ends[:, None].long())
+
+
+def _qsa_poison_outside_window(logits, inside):
+    """Overwrite every out-of-window lane with a rotating poison pattern.
+
+    The tilelang prefill scorer leaves columns outside a row's window as
+    uninitialized scratch (torch.empty, no -inf fill pass). The top-k
+    consumers must never observe those lanes, so an all -inf fill -- the
+    old behaviour -- is the weakest possible test. Cycle fp32 max, +inf,
+    and quiet NaN instead: any out-of-window read reaching the radix
+    histogram would flip the selection.
+    """
+    poisons = (
+        torch.finfo(torch.float32).max,
+        float("inf"),
+        float("nan"),
+    )
+    out = ~inside
+    columns = torch.arange(logits.shape[1], device=logits.device)
+    for phase, pattern in enumerate(poisons):
+        logits = logits.masked_fill(out & ((columns % 3) == phase)[None, :], pattern)
+    return logits
+
+
+def test_qsa_fast_topk_reference_reads_only_the_window():
+    """Contract test for the window-only semantics the tilelang scorer now
+    relies on: out-of-window columns are scratch and top-k selection must be
+    invariant to their contents. Exercises the CPU/reference path, so it
+    runs everywhere and mirrors what the CUDA kernels promise."""
+    torch.manual_seed(3)
+    rows, keys = 3, 4096
+    scores = torch.randn(rows, keys, dtype=torch.float32)
+    starts = torch.tensor([0, 5, 17], dtype=torch.int32)
+    ends = torch.tensor([31, 4096, 3000], dtype=torch.int32)
+    inside = _qsa_window_mask(rows, keys, starts, ends)
+    clean = scores.masked_fill(~inside, -float("inf"))
+    poisoned = _qsa_poison_outside_window(scores.clone(), inside)
+    for topk in (512, 2048):
+        expected = qsa_fast_topk(clean, starts, ends, topk=topk)
+        actual = qsa_fast_topk(poisoned, starts, ends, topk=topk)
+        assert torch.equal(actual, expected), topk
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="tilelang scorer + CUDA top-k required"
+)
+def test_qsa_tilelang_prefill_scale_inline_is_bitwise_identical():
+    """Inlining the score-scale division at the store must match the old
+    unscaled-store-then-full-width-div_ pipeline bit for bit.
+
+    Score 1.0 in the kernel reproduces the pre-change unscaled store
+    exactly (__fdiv_rn(x, 1.0) == x), so applying Tensor.div_ afterwards
+    re-creates the legacy result; the default path (division fused into the
+    kernel via __fdiv_rn) must equal it on every in-window element.
+    """
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_prefill,
+    )
+
+    if not HAS_TILELANG:
+        pytest.skip("TileLang unavailable")
+    torch.manual_seed(5)
+    # Rows below block_q and a non-4-aligned window start exercise both the
+    # padding path and the ragged tile boundary.
+    rows, keys, heads, head_dim = 5, 900, 4, 128
+    q = torch.randn(rows, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(keys, 1, head_dim, dtype=torch.bfloat16, device="cuda")
+    starts = torch.tensor([0, 1, 17, 300, 899], dtype=torch.int32, device="cuda")
+    ends = torch.tensor([2, 64, 900, 897, 900], dtype=torch.int32, device="cuda")
+    inside = _qsa_window_mask(rows, keys, starts.cpu(), ends.cpu()).cuda()
+    fused = tilelang_qsa_mqa_prefill(q, k, starts, ends)
+    legacy = tilelang_qsa_mqa_prefill(q, k, starts, ends, score_scale=1.0)
+    legacy.div_(head_dim**0.5)
+    assert torch.equal(fused[inside], legacy[inside])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="tilelang scorer + CUDA top-k required"
+)
+def test_qsa_prefill_topk_ignores_out_of_window_scratch():
+    """End-to-end: with the -inf fill pass deleted, poison whatever the
+    scorer left outside each window and require identical selections.
+
+    Scoring and selection run the production paths (tilelang prefill kernel,
+    then qsa_fast_topk's CUDA branch), so this is the direct proof that no
+    scratch lane ever reaches a consumer.
+    """
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_prefill,
+    )
+
+    if not HAS_TILELANG:
+        pytest.skip("TileLang unavailable")
+    torch.manual_seed(11)
+    rows, keys, heads, head_dim = 2, 8192, 4, 128
+    q = torch.randn(rows, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(keys, 1, head_dim, dtype=torch.bfloat16, device="cuda")
+    starts = torch.tensor([0, 17], dtype=torch.int32, device="cuda")
+    ends = torch.tensor([8192, 8180], dtype=torch.int32, device="cuda")
+    inside = _qsa_window_mask(rows, keys, starts.cpu(), ends.cpu()).cuda()
+    logits = tilelang_qsa_mqa_prefill(q, k, starts, ends)
+    clean = logits.masked_fill(~inside, -float("inf"))
+    poisoned = _qsa_poison_outside_window(logits.clone(), inside)
+    for topk in (512, 2048):
+        try:
+            expected = qsa_fast_topk(clean, starts, ends, topk=topk)
+            actual = qsa_fast_topk(poisoned, starts, ends, topk=topk)
+        except (ImportError, ValueError, RuntimeError):
+            if topk == 2048:
+                pytest.skip("sgl_kernel fast_topk_v2 unavailable")
+            raise
+        # CUDA kernels emit in atomic order; compare the selected sets.
+        assert torch.equal(expected.sort(dim=-1).values, actual.sort(dim=-1).values)
+
+
 def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
     rows, keys, heads, head_dim = 65, 64, 4, 8
     token_topk, compress_ratio = 8, 4

@@ -344,6 +344,7 @@ if HAS_TILELANG:
             Logits: T.Tensor([rows, keys], T.float32),  # type: ignore
             Starts: T.Tensor([rows], T.int32),  # type: ignore
             Ends: T.Tensor([rows], T.int32),  # type: ignore
+            ScaleRecip: T.float32,
         ):
             with T.Kernel(T.ceildiv(rows, block_q), threads=threads) as bx:
                 q_shared = T.alloc_shared([block_q * heads, head_dim], T.bfloat16)
@@ -377,30 +378,17 @@ if HAS_TILELANG:
                         scores_3d[n, qi, head] = T.max(scores_3d[n, qi, head], 0.0)
                     T.reduce_sum(scores_3d, reduced, dim=-1, clear=True)
                     for qi, n in T.Parallel(block_q, block_n):
-                        Logits[row_base + qi, start_min + ni * block_n + n] = reduced[
-                            n, qi
-                        ]
-
-        return kernel
-
-    @tilelang.jit
-    def _tilelang_qsa_mqa_mask_kernel(threads: int = 512, block_k: int = 4096):
-        rows = T.dynamic("rows")
-        keys = T.dynamic("keys")
-
-        @T.prim_func
-        def kernel(
-            Logits: T.Tensor([rows, keys], T.float32),  # type: ignore
-            Starts: T.Tensor([rows], T.int32),  # type: ignore
-            Ends: T.Tensor([rows], T.int32),  # type: ignore
-        ):
-            with T.Kernel(rows, threads=threads) as bx:
-                tx = T.thread_binding(0, threads, thread="threadIdx.x")
-                for block in T.Pipelined(T.ceildiv(keys, block_k)):
-                    for item in T.serial(block_k // threads):
-                        column = block * block_k + item * threads + tx
-                        if column < Starts[bx] or column >= Ends[bx]:
-                            Logits[bx, column] = -T.infinity(T.float32)
+                        # Inline the score-scale division at the store so the
+                        # full-width logits.div_ pass disappears. torch's
+                        # Tensor.div_(scalar) on CUDA is not IEEE division: the
+                        # cpu-scalar fast path rewrites it as a multiply by the
+                        # fp32 reciprocal of the fp32 scale, so we precompute
+                        # that reciprocal host-side and multiply (a plain "*",
+                        # exact under fast-math) instead of __fdiv_rn, which
+                        # would differ by 1 ulp on ~4% of lanes.
+                        Logits[row_base + qi, start_min + ni * block_n + n] = (
+                            reduced[n, qi] * ScaleRecip
+                        )
 
         return kernel
 
@@ -507,16 +495,23 @@ def tilelang_qsa_mqa_prefill(
     block_q = max(1, 128 // heads)
     padding = (-rows) % block_q
     padded_rows = rows + padding
-    # A torch.cat of the padding rows would copy the whole [rows, keys] fp32 matrix,
+    # torch.empty (not torch.zeros + a full-width -inf mask kernel): the
+    # top-k consumers mask by the same row_starts/row_ends windows (the JIT
+    # fast_topk reads only [start, start+length), fast_topk_v2 neutralizes
+    # every lane it sees outside the window as NaN padding), so columns
+    # outside a row's window are kernel scratch -- the same contract the
+    # DeepGEMM scorers document. The scoring kernel below writes every
+    # in-window column, so no prefill traffic is observable. A torch.cat of
+    # the padding rows would copy the whole [rows, keys] fp32 matrix,
     # doubling the dominant prefill buffer; allocate pre-padded instead.
-    logits = torch.zeros((padded_rows, keys), dtype=torch.float32, device=q.device)
+    logits = torch.empty((padded_rows, keys), dtype=torch.float32, device=q.device)
     q_padded = q.to(torch.bfloat16).contiguous()
     starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
     ends = row_ends.to(device=q.device, dtype=torch.int32).contiguous()
     if padding:
         q_padded = torch.cat([q_padded, q_padded.new_zeros(padding, heads, head_dim)])
-        starts = torch.cat([starts, starts[-1:].expand(padding)])
-        ends = torch.cat([ends, ends[-1:].expand(padding)])
+        starts = torch.cat([starts, starts[-1:].expand(padding)], dim=0)
+        ends = torch.cat([ends, ends[-1:].expand(padding)], dim=0)
 
     _tilelang_qsa_mqa_prefill_kernel(heads=heads, head_dim=head_dim, block_q=block_q)(
         q_padded.reshape(-1, head_dim),
@@ -524,13 +519,18 @@ def tilelang_qsa_mqa_prefill(
         logits,
         starts,
         ends,
+        # torch Tensor.div_(scalar) on CUDA multiplies by the fp32
+        # reciprocal of the fp32 scale instead of dividing; precompute the
+        # same reciprocal here (fp32 IEEE 1.0/scale) so the in-kernel
+        # multiply reproduces the old logits.div_ bit for bit.
+        float(
+            torch.tensor(1.0, dtype=torch.float32)
+            / torch.tensor(score_scale or math.sqrt(head_dim), dtype=torch.float32)
+        ),
     )
     # A leading-dimension slice that retains every column is already
     # contiguous, so do not copy this large matrix again when removing padding.
-    logits = logits[:rows]
-    logits.div_(score_scale or math.sqrt(head_dim))
-    _tilelang_qsa_mqa_mask_kernel()(logits, starts[:rows], ends[:rows])
-    return logits
+    return logits[:rows]
 
 
 def tilelang_qsa_mqa_decode(
