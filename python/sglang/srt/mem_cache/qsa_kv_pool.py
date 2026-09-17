@@ -59,7 +59,6 @@ class QSATokenToKVPool(HybridLinearKVPool):
         )
         return index_k_bytes // compress_ratio * num_layers
 
-
     def __init__(
         self,
         *,
@@ -230,6 +229,37 @@ class QSATokenToKVPool(HybridLinearKVPool):
         buffer = self.get_qsa_compressed_k_buffer(layer_id)
         buffer[loc.long()] = compressed_k.to(buffer.dtype)
 
+    def qsa_hicache_regions(self, page_size: int):
+        """KV-page-indexed uint8 views of the compressed-K cache for HiCache.
+
+        Row ``i`` of each returned buffer is the byte block of compressed
+        slots ``[i * page_size // ratio, (i + 1) * page_size // ratio)``, i.e.
+        exactly the compressed keys belonging to full-KV page ``i``
+        (``compressed_slot = full_slot // ratio`` keeps every page's groups
+        contiguous). ``DeepSeekV4PagedHostPool`` maps a KV token index to a
+        buffer row via ``index // page_size``, so these views ride the generic
+        KV-derived sidecar transfer path with no extra index derivation.
+        """
+        ratio = self.qsa_compress_ratio
+        if page_size % ratio != 0:
+            raise ValueError(
+                "QSA HiCache regions require page_size to be a multiple of "
+                f"the compress ratio: page_size={page_size}, ratio={ratio}"
+            )
+        groups_per_page = page_size // ratio
+        row_bytes = (
+            groups_per_page
+            * self.qsa_index_kv_heads
+            * self.qsa_index_head_dim
+            * self.index_state_dtype.itemsize
+        )
+        rows = self.qsa_compressed_capacity // groups_per_page
+        buffers = [
+            layer.view(torch.uint8)[: rows * row_bytes].view(rows, row_bytes)
+            for layer in self.qsa_compressed_flat
+        ]
+        return buffers, row_bytes
+
     def get_kv_size_bytes(self):
         k_size, v_size = super().get_kv_size_bytes()
         qsa_k_size = (
@@ -244,4 +274,3 @@ class QSATokenToKVPool(HybridLinearKVPool):
             + self.qsa_rope_position_buffer.numel() * 8
         )
         return k_size + qsa_k_size, v_size
-
