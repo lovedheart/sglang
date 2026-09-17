@@ -1145,6 +1145,7 @@ def build_hybrid_mamba_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    qsa_kvcache: Any = None,
 ) -> tuple[HostPoolGroup, HybridCacheController, HostPoolGroupConfig]:
     """KV plus every pool the hybrid pool declares (e.g. a sparse indexer),
     then the Mamba state pool, which keeps its own host path."""
@@ -1228,6 +1229,43 @@ def build_hybrid_mamba_stack(
                 packed_draft_device_pools=qsa_draft_pools,
             )
         )
+    # NOTE: with both sides wired, the compressed-K pages are backed up twice
+    # (INDEXER via QSAIndexerPoolHost, QSA_COMPRESSED_K via the KV-derived
+    # sidecar). Content-identical, but costs host memory and transfer
+    # bandwidth; consolidate once one path is chosen.
+    if qsa_kvcache is not None:
+        # QSA compressed-K pages ride the KV-derived sidecar path: rows are
+        # indexed in the FULL logical page space (index // page_size inside
+        # the host pool), so no extra index derivation is needed.
+        qsa_buffers, qsa_item_bytes = qsa_kvcache.qsa_hicache_regions(
+            page_size=params.page_size
+        )
+        qsa_host_pool = DeepSeekV4PagedHostPool(
+            pool_name=str(PoolName.QSA_COMPRESSED_K),
+            device_buffers=qsa_buffers,
+            item_bytes=qsa_item_bytes,
+            num_host_pages=kv_host_pool.size // params.page_size,
+            slot_page_size=params.page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+        )
+        entries.append(
+            build_pool_entry(
+                name=PoolName.QSA_COMPRESSED_K,
+                host_pool=qsa_host_pool,
+                device_pool=kv_pool,
+                # Drop the MTP draft keys added by _with_mtp_layer_mapping:
+                # the compressed-K cache has one row per full-attention layer
+                # only, and draft tokens carry no QSA pages.
+                layer_mapping={
+                    k: v
+                    for k, v in full_layer_mapping.items()
+                    if k < transfer_layer_id_max
+                },
+                transfer_layer_id_max=transfer_layer_id_max,
+            )
+        )
+
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -1829,6 +1867,21 @@ class _MambaStrategy(StackStrategy):
         mamba_layer_mapping = _stage_local_layer_mapping(
             params.req_to_token_pool.mamba_map, kvcache.start_layer
         )
+        qsa_kvcache = qsa_pool
+        if qsa_kvcache is not None:
+            if get_memory().hicache_host_memory_mode == "buffer_only":
+                raise NotImplementedError(
+                    "QSA compressed-K HiCache requires the cache host memory "
+                    "mode; buffer_only handoff is not wired for the "
+                    "QSA_COMPRESSED_K sidecar."
+                )
+            if params.page_size % qsa_kvcache.qsa_compress_ratio != 0:
+                raise ValueError(
+                    "QSA compressed-K HiCache requires page_size to be a "
+                    f"multiple of the compress ratio: page_size="
+                    f"{params.page_size}, ratio="
+                    f"{qsa_kvcache.qsa_compress_ratio}."
+                )
         host_pool_group, cache_controller, config = build_hybrid_mamba_stack(
             params=params,
             decls=kvcache.host_pool_decls(),
@@ -1845,6 +1898,7 @@ class _MambaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            qsa_kvcache=qsa_kvcache,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -1860,6 +1914,16 @@ class _MambaStrategy(StackStrategy):
                 [SidecarPoolSpec(PoolName.INDEXER, PoolName.KV)]
                 if qsa_pool is not None
                 else []
+            )
+            + (
+                [
+                    SidecarPoolSpec(
+                        pool_name=PoolName.QSA_COMPRESSED_K,
+                        indices_from_pool=PoolName.KV,
+                    )
+                ]
+                if qsa_kvcache is not None
+                else []
             ),
             pool_declarations=tuple(c.decl for c in config.pools),
             register_req_to_token_counter=True,
@@ -1867,6 +1931,7 @@ class _MambaStrategy(StackStrategy):
                 [c.decl.pool_name.value.upper() for c in config.pools]
                 + ["MAMBA"]
                 + (["INDEXER"] if qsa_pool is not None else [])
+                + (["QSA_COMPRESSED_K"] if qsa_kvcache is not None else [])
             ),
         )
 
