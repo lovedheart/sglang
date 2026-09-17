@@ -64,6 +64,10 @@ class PoolName(str, Enum):
     MAMBA = "mamba"
     SWA = "swa"
     INDEXER = "indexer"
+    # QSA compressed-K pages (Qwen4-Exp). KV-derived sidecar: rows are indexed
+    # in the FULL logical page space, one row holding the page's
+    # ``page_size // compress_ratio`` compressed slots.
+    QSA_COMPRESSED_K = "qsa_compressed_k"
     # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
     # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
     DEEPSEEK_V4_C1 = "deepseek_v4_c1"
