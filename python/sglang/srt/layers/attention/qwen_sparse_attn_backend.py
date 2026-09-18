@@ -261,6 +261,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_dummy_out_cache_loc = None
         self._graph_row_req_pool_indices = None
         self._trtllm_sparse_tables = {}
+        # Fused Triton sparse-decode attention (see qsa/sparse_decode.py):
+        # gated per call by row count; scratch keyed by row count.
+        self._fused_sparse_decode = bool(envs.SGLANG_QSA_FUSED_SPARSE_DECODE.get())
+        self._qsa_fused_scratch: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._mtp_shared_sparse_indices = None
         self._trtllm_workspace = None
         self._graph_extend_lens = None
@@ -1664,6 +1668,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         driven by a static arange block table and the per-row valid counts."""
         batch, topk = topk_indices.shape
         fused_fp4 = gathered_rows and self._fused_fp4_gather
+        # Fused fast path: one Triton pass over the top-k list instead of
+        # valid-counts + strided gather + paged decode; measured faster at
+        # every batch size for NVFP4 (up to 2.8x at bs<=4), so it is enabled
+        # for all realistic fp4 batches (scratch capped at ~1MB/row).
+        if self._fused_sparse_decode and batch <= (256 if fused_fp4 else 8):
+            fused = self._forward_fused_sparse_decode(
+                q, layer, forward_batch, metadata, topk_indices, fused_fp4
+            )
+            if fused is not None:
+                return fused
         page = _TRTLLM_SPARSE_PAGE_SIZE
         pages_per_row = (topk + page - 1) // page
         stride = pages_per_row * page
@@ -1847,6 +1861,77 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         return output.reshape(q.shape[0], -1)
 
+    def _forward_fused_sparse_decode(
+        self,
+        q: torch.Tensor,
+        layer,
+        forward_batch,
+        metadata,
+        topk_indices: torch.Tensor,
+        fp4: bool,
+    ) -> Optional[torch.Tensor]:
+        """Gather + dequant + attention in one Triton pass over the top-k list.
+
+        Returns None (fall through to the paged path) when the configuration
+        is outside the kernel's support envelope.
+        """
+        from sglang.srt.layers.attention.qsa.sparse_decode import (
+            sparse_decode_attention,
+        )
+
+        pool = self.token_to_kv_pool
+        if q.ndim != 3 or not q.is_cuda or q.dtype != torch.bfloat16:
+            return None
+        rows, q_heads, head_dim = q.shape
+        if head_dim & (head_dim - 1) or head_dim < 32:
+            return None
+        method = self.kv_cache_quant_method
+        if fp4:
+            if method is None:
+                return None
+            k, v, k_sf, v_sf = pool.get_raw_kv_buffer(layer.layer_id)
+            if k.dtype != torch.uint8:
+                return None
+            k_gs = method.k_scales_gpu[layer.layer_id : layer.layer_id + 1]
+            v_gs = method.v_scales_gpu[layer.layer_id : layer.layer_id + 1]
+            kv_heads = k.shape[1]
+        else:
+            k = pool.get_key_buffer(layer.layer_id)
+            v = pool.get_value_buffer(layer.layer_id)
+            if k.dtype != torch.bfloat16:
+                return None
+            k_sf = v_sf = k_gs = v_gs = None
+            kv_heads = k.shape[1]
+        if kv_heads <= 0 or q_heads % kv_heads:
+            return None
+        h_per_kv = q_heads // kv_heads
+        if h_per_kv > 16 or kv_heads > 8 or k.shape[2] * (2 if fp4 else 1) != head_dim:
+            return None
+        if metadata.sequence_lengths.dtype != torch.int32:
+            return None
+        req_indices = (
+            metadata.row_req_pool_indices
+            if metadata.row_req_pool_indices is not None
+            else forward_batch.req_pool_indices
+        )
+        out = sparse_decode_attention(
+            q.contiguous(),
+            k,
+            v,
+            k_sf,
+            v_sf,
+            k_gs,
+            v_gs,
+            topk_indices,
+            self.req_to_token_pool.req_to_token,
+            req_indices,
+            metadata.sequence_lengths,
+            layer.scaling,
+            fp4,
+            self._qsa_fused_scratch,
+        )
+        return out.reshape(q.shape[0], -1)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1901,9 +1986,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 k_buffer, v_buffer = self._gather_kv_fp4(
                     layer.layer_id, slots.reshape(-1)
                 )
-                address = (
-                    torch.arange(slots.numel(), device=slots.device)
-                    .reshape(slots.shape)
+                address = torch.arange(slots.numel(), device=slots.device).reshape(
+                    slots.shape
                 )
                 slots = torch.where(slots >= 0, address, slots)
             else:
