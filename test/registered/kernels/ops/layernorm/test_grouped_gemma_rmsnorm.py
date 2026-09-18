@@ -5,6 +5,7 @@ from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import grouped_gemma_rms
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def _reference_grouped_gemma_rmsnorm(
@@ -79,6 +80,28 @@ def test_grouped_gemma_rmsnorm_bad_group_size():
     weight = torch.zeros(10240, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(RuntimeError, match="group_size"):
         grouped_gemma_rmsnorm(x, weight, 1000, 1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_grouped_gemma_rmsnorm_3d_input(dtype):
+    torch.manual_seed(0)
+    x = torch.randn(4, 8, 10240, dtype=dtype, device="cuda")
+    weight = torch.randn(10240, dtype=dtype, device="cuda") * 0.2
+
+    out = grouped_gemma_rmsnorm(x, weight, 2560, 1e-6)
+    expected = _reference_grouped_gemma_rmsnorm(
+        x, weight, 2560, 1e-6, compute_dtype=torch.float64
+    ).to(dtype)
+
+    assert out.shape == x.shape
+    torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
+
+
+def test_grouped_gemma_rmsnorm_unsupported_dtype():
+    x = torch.randn(4, 10240, dtype=torch.float32, device="cuda")
+    weight = torch.zeros(10240, dtype=torch.float32, device="cuda")
+    with pytest.raises(RuntimeError, match="dtype"):
+        grouped_gemma_rmsnorm(x, weight, 2560, 1e-6)
 
 
 if __name__ == "__main__":
