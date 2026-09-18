@@ -341,6 +341,13 @@ class Envs:
     # (xqa); elsewhere FP4 alone stays on the bf16 path, while FP8 alone still
     # selects the e4m3-requant scratch.  SGLANG_QSA_ATTN_FP8 also implies it.
     SGLANG_QSA_ATTN_FP4 = EnvBool(False)
+    # Run QSA sparse-decode attention in the fused Triton kernel (gather +
+    # dequant + attention in one pass over the top-k list) instead of the
+    # valid-counts + strided-gather + paged-decode triple.  The paged decode
+    # kernels cost a fixed ~10us per call at bs<=4 on Blackwell; the fused
+    # kernel halves that at small batch.  Used only while the row count is
+    # small (<=16 on a packed-FP4 pool, <=8 otherwise); 0 disables it.
+    SGLANG_QSA_FUSED_SPARSE_DECODE = EnvBool(True)
     # Route decode-size HC mix through the persistent Triton kernel; 0 falls
     # back to the plain-torch mix without full deterministic inference.
     SGLANG_HC_MIX_TRITON = EnvBool(True)
