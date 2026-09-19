@@ -159,7 +159,13 @@ def _sparse_decode_split(
         toks = tok0 + c + offs_t
         tmask = toks < TOPK
         idx = tl.load(idx_ptr + row * TOPK + toks, mask=tmask, other=-1)
-        valid = (idx >= 0) & (idx < seqlen)
+        # Same valid mask as the paged path's qwen_sparse_valid_counts_triton.
+        # It matters beyond -1 padding: the decode scorer writes only
+        # [0, compressed_len) of its empty logits buffer, so fast_topk can
+        # select an uninitialized token past the scored context; without the
+        # seqlen term that stale token gathers a random KV row instead of
+        # being dropped.
+        valid = tmask & (idx >= 0) & (idx < seqlen)
         idx_c = tl.where(valid, idx, 0).to(tl.int64)
         slot = tl.load(r2t_ptr + r2t_base + idx_c, mask=valid, other=0).to(tl.int64)
         if NVFP4:
