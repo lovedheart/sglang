@@ -41,12 +41,22 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_packed_decode_triton,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_sm120
 
 logger = logging.getLogger(__name__)
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
+
+
+@lru_cache(maxsize=1)
+def _resolve_fa4_sm120_paged_decode():
+    """Arch-owned Blackwell-SM120 FlashAttention-4 paged decode (SGLANG_QSA_ATTN_FA4)."""
+    from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
+        flash_attn_with_kvcache,
+    )
+
+    return flash_attn_with_kvcache
 
 
 @lru_cache(maxsize=1)
@@ -69,7 +79,7 @@ def _resolve_trtllm_sparse_decode():
 
 @lru_cache(maxsize=1)
 def _resolve_flash_attn_varlen_func():
-    from sglang.srt.utils import is_sm121
+    from sglang.srt.utils import is_sm120, is_sm121
 
     if is_sm121():
         from sglang.kernels.ops.attention import (
@@ -77,6 +87,17 @@ def _resolve_flash_attn_varlen_func():
         )
 
         return qwen38_qsa_sm121_varlen
+    if is_sm120() and envs.SGLANG_QSA_ATTN_FA4.get():
+        from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
+            flash_attn_varlen_func as fa4_varlen,
+        )
+
+        def flash_attn_varlen_func(*args, **kwargs):
+            kwargs.setdefault("num_splits", 1)
+            output = fa4_varlen(*args, **kwargs)
+            return output[0] if isinstance(output, tuple) else output
+
+        return flash_attn_varlen_func
     try:
         from flash_attn import flash_attn_varlen_func
 
@@ -268,6 +289,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         # Fused Triton sparse-decode attention (see qsa/sparse_decode.py):
         # gated per call by row count; scratch keyed by row count.
         self._fused_sparse_decode = bool(envs.SGLANG_QSA_FUSED_SPARSE_DECODE.get())
+        # FA4 sm120 paged decode replaces the trtllm dispatch (and bypasses
+        # the fused Triton path); SM120 only, bf16/fp16 scratch only.
+        self._fa4_decode = bool(envs.SGLANG_QSA_ATTN_FA4.get()) and is_sm120()
+        self._fa4_out_scratch: Dict[tuple, Tuple[torch.Tensor]] = {}
         self._qsa_fused_scratch: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._mtp_shared_sparse_indices = None
         self._trtllm_workspace = None
@@ -1720,7 +1745,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         # valid-counts + strided gather + paged decode; measured faster at
         # every batch size for NVFP4 (up to 2.8x at bs<=4), so it is enabled
         # for all realistic fp4 batches (scratch capped at ~1MB/row).
-        if self._fused_sparse_decode and batch <= (256 if fused_fp4 else 8):
+        if self._fused_sparse_decode and not self._fa4_decode and batch <= (
+            256 if fused_fp4 else 8
+        ):
             fused = self._forward_fused_sparse_decode(
                 q, layer, forward_batch, metadata, topk_indices, fused_fp4
             )
@@ -1766,7 +1793,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             fused_fp4
             and self._native_fp4_decode
             and q.dtype == torch.bfloat16
+            and not self._fa4_decode
         )
+        if self._fa4_decode:
+            # FA4 reads bf16/fp16 scratch only.
+            scratch_dtype = q.dtype
         if native_fp4:
             scratch_dtype = torch.uint8
         packed_k, packed_v = self._get_fa2_scratch(
@@ -1896,6 +1927,17 @@ class QwenSparseAttnBackend(AttentionBackend):
             self._trtllm_workspace = torch.zeros(
                 128 * 1024 * 1024, dtype=torch.uint8, device=device
             )
+        if self._fa4_decode:
+            # FA4 wants the canonical (pages, page, kv_heads, dim) layout.
+            output = self._fa4_paged_decode(
+                q,
+                kv_rows.view(-1, page, num_kv_heads, head_dim),
+                kv_rows_v.view(-1, page, num_kv_heads, head_dim),
+                block_tables,
+                valid_counts,
+                layer.scaling,
+            )
+            return output.reshape(q.shape[0], -1)
         output = trtllm_decode(
             query=q.contiguous(),
             kv_cache=(kc, vc),
@@ -1908,6 +1950,51 @@ class QwenSparseAttnBackend(AttentionBackend):
             **({"kv_cache_sf": kv_cache_sf} if native_fp4 else {}),
         )
         return output.reshape(q.shape[0], -1)
+
+    def _fa4_paged_decode(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        valid_counts: torch.Tensor,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        """FA4 sm120 paged decode over the page-aligned sparse scratch.
+
+        Same scratch, block table, and per-row valid counts as the trtllm
+        dispatch; k/v_cache are (pages_total, page, kv_heads, head_dim).
+        """
+        rows = q.shape[0]
+        # Dedicated buffer: a (q-heads, dim) key could alias the packed-KV
+        # scratch key on MHA models, and the kernel reads KV while writing.
+        out_key = (q.shape[1], q.shape[2], q.dtype, q.device)
+        buffers = self._fa4_out_scratch.get(out_key)
+        if buffers is None or buffers[0].shape[0] < rows:
+            buffers = (
+                torch.empty(
+                    (rows, 1, q.shape[1], q.shape[2]),
+                    dtype=q.dtype,
+                    device=q.device,
+                ),
+            )
+            self._fa4_out_scratch[out_key] = buffers
+        out = buffers[0][:rows]
+        # 4-D (rows, 1, heads, dim): the cached C++ fast path wants 3-D but
+        # bails under stream capture, while the cute fallback (which capture
+        # records) wants 4-D; passing 4-D keeps eager and replay on the same
+        # kernel, so replays stay bit-identical to eager.
+        _resolve_fa4_sm120_paged_decode()(
+            q.contiguous().unsqueeze(1),
+            k_cache,
+            v_cache,
+            page_table=block_tables,
+            cache_seqlens=valid_counts,
+            causal=False,
+            softmax_scale=softmax_scale,
+            out=out,
+        )
+        return out.squeeze(1)
 
     def _forward_fused_sparse_decode(
         self,

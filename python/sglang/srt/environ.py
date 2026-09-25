@@ -341,6 +341,14 @@ class Envs:
     # (xqa); elsewhere FP4 alone stays on the bf16 path, while FP8 alone still
     # selects the e4m3-requant scratch.  SGLANG_QSA_ATTN_FP8 also implies it.
     SGLANG_QSA_ATTN_FP4 = EnvBool(False)
+    # Run the QSA sparse-decode attention (the page-aligned packed scratch in
+    # _forward_trtllm_sparse, and the packed varlen fallback) on the arch-
+    # owned Blackwell-SM120 FlashAttention-4 kernel instead of the fused
+    # Triton sparse decode / trtllm-gen paged decode.  SM120 only (other
+    # architectures ignore the flag); bf16/fp16 scratch only (the native
+    # FP4-KV decode stays on xqa).  Gather, page tables, and masking are
+    # unchanged, so results match the trtllm path within kernel reordering.
+    SGLANG_QSA_ATTN_FA4 = EnvBool(False)
     # Run QSA sparse-decode attention in the fused Triton kernel (gather +
     # dequant + attention in one pass over the top-k list) instead of the
     # valid-counts + strided-gather + paged-decode triple.  The paged decode
