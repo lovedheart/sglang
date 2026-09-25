@@ -248,10 +248,8 @@ def test_chunk_prefill_fp8_passthrough_is_bitwise():
 
 
 def _packed_gather_world(seed=0):
-    import test.registered.kernel.qsa.test_qsa_attn_fp8 as self_mod
-
     batch, topk, heads, dim, pool_rows = 4, 512, 2, 256, 65536
-    w = self_mod._make_fp4_world(
+    w = _make_fp4_world(
         batch, topk, heads, dim, pool_rows, torch.device("cuda"), seed=seed
     )
     # calibrated (in-range) scales: block scale 1.0, pow2 global scale so the
@@ -462,5 +460,9 @@ def test_fp4_packed_gather_verify_rows_are_bitwise():
         expected_s = torch.zeros(rows, stride, heads, dim // 16, dtype=torch.uint8, device=device)
         expected_s[:, :topk] = ref_s
         assert torch.equal(out_sf.view(rows, stride, heads, dim // 16), expected_s), name
-    # Nothing survived from the poison: the whole stride is written per row.
-    assert not (pk == 0x7F).any() and not (pv_sf == 0x7F).any()
+    # Nothing survived from the poison. Only the zero-fill tail (cols >= topk)
+    # can still hold it: gathered bytes are random pool bytes and may equal
+    # 0x7F by chance, which torch.equal above already accounts for.
+    for name, t in (("pk", pk), ("pv", pv), ("pk_sf", pk_sf), ("pv_sf", pv_sf)):
+        tail = t.view(rows, stride, *t.shape[1:])[:, topk:]
+        assert not (tail == 0x7F).any(), f"stale poison survived in {name} zero-fill"
