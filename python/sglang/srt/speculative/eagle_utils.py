@@ -26,6 +26,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_pin_memory_available,
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
@@ -1068,8 +1069,13 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     for r in batch.reqs:
         r.decode_batch_idx += 1
 
-    cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
-    nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
+    _pin = is_pin_memory_available(batch.device)
+    cur_kv_lens_cpu = torch.tensor(
+        cur_kv_lens, dtype=torch.int32, device="cpu", pin_memory=_pin
+    )
+    nxt_kv_lens_cpu = torch.tensor(
+        nxt_kv_lens, dtype=torch.int32, device="cpu", pin_memory=_pin
+    )
 
     # Fail fast if the page>1 + topk>1 draft over-allocation
     # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
