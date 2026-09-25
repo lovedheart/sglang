@@ -99,6 +99,10 @@ def _resolve_flash_attn_varlen_func():
         ) from exc
 
 
+# Cache for constant uniform row->request mappings (device, batch, rows-per-req).
+_ROW_TO_REQUEST_CACHE: dict = {}
+
+
 class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     """Per-forward metadata consumed by core sparse attention."""
 
@@ -457,11 +461,26 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "QSA speculative query rows cannot be mapped to requests: "
                 f"rows={num_rows}, batch={batch_size}"
             )
-        return torch.arange(
+        # Uniform (rows-per-request) mappings are constant per (device, bs, k);
+        # steady decode/verify loops hit the same key every forward, so cache
+        # the device tensor instead of relaunching arange + repeat_interleave.
+        # Consumers treat the mapping as read-only.
+        key = (
+            forward_batch.req_pool_indices.device,
             batch_size,
-            dtype=torch.long,
-            device=forward_batch.req_pool_indices.device,
-        ).repeat_interleave(num_rows // batch_size)
+            num_rows // batch_size,
+        )
+        cached = _ROW_TO_REQUEST_CACHE.get(key)
+        if cached is None:
+            cached = torch.arange(
+                batch_size,
+                dtype=torch.long,
+                device=forward_batch.req_pool_indices.device,
+            ).repeat_interleave(num_rows // batch_size)
+            if len(_ROW_TO_REQUEST_CACHE) > 256:
+                _ROW_TO_REQUEST_CACHE.clear()
+            _ROW_TO_REQUEST_CACHE[key] = cached
+        return cached
 
     @staticmethod
     def _as_cpu_int_tensor(values, size: int) -> torch.Tensor:
@@ -1313,17 +1332,46 @@ class QwenSparseAttnBackend(AttentionBackend):
         if metadata.req_pool_indices is None or metadata.req_pool_indices.numel() == 0:
             return
         state = self._mtp_shared_sparse_indices
-        row_to_req = metadata.get_token_to_batch_idx().long()
-        row_req_pool_indices = metadata.req_pool_indices[
-            row_to_req[: topk_indices.shape[0]]
-        ]
-        is_last = torch.ones_like(row_req_pool_indices, dtype=torch.bool)
-        if row_req_pool_indices.numel() > 1:
-            is_last[:-1] = row_req_pool_indices[:-1] != row_req_pool_indices[1:]
-        anchor_rows = is_last.nonzero().flatten()
-        req_rows = row_req_pool_indices[anchor_rows]
+        req_pool_indices = metadata.req_pool_indices
+        row_to_req = metadata.get_token_to_batch_idx().long()[: topk_indices.shape[0]]
+        # Last physical row of each request, without nonzero()'s host sync.
+        # scatter_reduce(amax) writes each row index into its request slot, so
+        # anchor_rows[k] ends up as the max (last) row of request k; requests
+        # with no rows in this forward (truncation/padding) keep the zero init
+        # and are routed to the trash row below, matching the draft-extend
+        # capture path. (bincount/cumsum would work too but both host-sync.)
+        num_req = req_pool_indices.numel()
+        anchor_rows = torch.zeros(
+            num_req, dtype=torch.int64, device=topk_indices.device
+        )
+        anchor_rows.scatter_reduce_(
+            0,
+            row_to_req,
+            torch.arange(
+                topk_indices.shape[0],
+                dtype=torch.int64,
+                device=topk_indices.device,
+            ),
+            reduce="amax",
+        )
+        counts = torch.zeros(num_req, dtype=torch.int64, device=topk_indices.device)
+        counts.scatter_add_(
+            0, row_to_req, torch.ones_like(row_to_req, dtype=torch.int64)
+        )
+        req_rows = torch.where(
+            counts > 0,
+            req_pool_indices,
+            req_pool_indices.new_full(
+                (), state.trash_row, dtype=req_pool_indices.dtype
+            ),
+        )
         captured_lens = metadata.get_seqlens_expanded()[anchor_rows]
-        state.capture(topk_indices[anchor_rows], req_rows, captured_lens, layer_id)
+        state.capture(
+            topk_indices.index_select(0, anchor_rows),
+            req_rows.long(),
+            captured_lens,
+            layer_id,
+        )
 
     @staticmethod
     def _capture_extend_seq_lens(forward_batch) -> torch.Tensor:
