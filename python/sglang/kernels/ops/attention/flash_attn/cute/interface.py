@@ -1733,6 +1733,9 @@ def _flash_attn_fwd(
             if arch_forward_host is not None:
                 assert arch_forward_plan is not None
                 call_args.extend(arch_forward_host.runtime_arguments(arch_forward_plan))
+                # mSFk/mSFv/mDump: None-typed params remain in the compiled
+                # ABI even when unused (dense path).
+                call_args.extend([None, None, None])
             compiled_fwd = _flash_attn_fwd.compile_cache[compile_key]
             if (
                 arch_forward_host is not None
