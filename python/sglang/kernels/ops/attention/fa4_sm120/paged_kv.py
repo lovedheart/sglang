@@ -320,34 +320,63 @@ class Sm120PagedKVManager(ParamsBase):
                 # the fragment into the swizzled SMEM tile through the
                 # tiled-copy layout algebra, exactly like the bf16 path.
                 frag = cute.make_fragment_like(tXsX[None, m, k])
-                row = tXcX[((0, 0), m, k)][0]
+                sc0 = tXcX[((0, 0), m, k)]
+                row = sc0[0]
                 row_valid = n_block * self.n_block_size + row < self.seqlen_k
+                # Each fragment owns 16 *contiguous* columns starting at
+                # ``col0`` (a multiple of 16) -- verified exhaustively by the
+                # gmem-dump check -- so the whole fragment shares one packed
+                # u64 word and one e4m3 scale byte.  This hoists the div/mod
+                # (and their gmem loads) out of the 16-element loop.
+                col0 = sc0[1]
+                word_idx = col0 // 16
+                packed64 = mX_row[word_idx]
+                sf_word = mX_sf[word_idx // 4].to(cutlass.Int32)
+                sf_byte = (sf_word >> ((word_idx % 4) * 8)) & 0xFF
+                sf_frag = cute.make_rmem_tensor((1,), cutlass.Uint8)
+                sf_frag[0] = sf_byte.to(cutlass.Uint8)
+                sf_f16 = cute.make_tensor(
+                    cute.recast_ptr(
+                        sf_frag.iterator, dtype=cutlass.Float8E4M3FN
+                    ),
+                    cute.make_layout((1,)),
+                )[0].to(cutlass.Float16)
+                # Hardware fp4->fp16 converts (four cvt.rn.f16x2.e2m1x2 per
+                # word); nibble i of the packed word is element i.  The fp16
+                # multiply by the (broadcast, exact) e4m3 scale keeps at most
+                # 6 significand bits, so the fp16 result is exact and the
+                # fp16 -> bf16 convert is lossless: bit-identical to the
+                # fp32 scalar reference.
+                ssv_frag = cute.make_rmem_tensor((8,), cutlass.Float16)
+                for j in cutlass.range_constexpr(8):
+                    ssv_frag[j] = sf_f16
+                ssv = ssv_frag.load()
+                r_lo = cute.TensorSSA(
+                    cute.arch.cvt_f4e2m1x8_to_f16x8(
+                        packed64.to(cutlass.Uint32).ir_value()
+                    ),
+                    (8,),
+                    cutlass.Float16,
+                )
+                r_hi = cute.TensorSSA(
+                    cute.arch.cvt_f4e2m1x8_to_f16x8(
+                        (packed64 >> 32).to(cutlass.Uint32).ir_value()
+                    ),
+                    (8,),
+                    cutlass.Float16,
+                )
+                p_lo = r_lo * ssv
+                p_hi = r_hi * ssv
                 for e in cutlass.range_constexpr(
                     cute.size(frag, mode=[0, 0])
                 ):
-                    sc = tXcX[((e, 0), m, k)]
-                    col = sc[1]
-                    packed64 = mX_row[col // 16]
-                    nib = ((col % 16) // 2) * 8 + (col % 2) * 4
-                    code = ((packed64 >> nib) & 0xF).to(cutlass.Uint32)
-                    sf_g = col // 16
-                    sf_word = mX_sf[sf_g // 4].to(cutlass.Int32)
-                    sf_byte = (sf_word >> ((sf_g % 4) * 8)) & 0xFF
-                    sf_frag = cute.make_rmem_tensor((1,), cutlass.Uint8)
-                    sf_frag[0] = sf_byte.to(cutlass.Uint8)
-                    sf_f32 = cute.make_tensor(
-                        cute.recast_ptr(
-                            sf_frag.iterator, dtype=cutlass.Float8E4M3FN
-                        ),
-                        cute.make_layout((1,)),
-                    )[0].to(cutlass.Float32)
                     value = (
-                        _nvfp4_to_bf16(code).to(cutlass.Float32) * sf_f32
+                        p_lo[e] if e < 8 else p_hi[e - 8]
                     ).to(self.compute_dtype)
                     frag[e] = value
                     if const_expr(self.dump_gmem is not None):
                         if const_expr(K_or_V == "K"):
                             seq_pos = n_block * self.n_block_size + row
-                            self.dump_gmem[seq_pos, col] = value
+                            self.dump_gmem[seq_pos, col0 + e] = value
                 if row_valid:
                     cute.autovec_copy(frag, tXsX[None, m, k])
