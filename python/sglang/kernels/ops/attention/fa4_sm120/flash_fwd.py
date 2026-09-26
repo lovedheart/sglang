@@ -85,6 +85,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         has_bias: bool = False,
         bias_block_size: int = 64,
         rel_extent_padded: int = 128,
+        kv_fp4: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -92,6 +93,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         self.paged_kv = paged_kv
         self.split_qk_n = split_qk_n
         self.split_kv_blocks_per_cta = split_kv_blocks_per_cta
+        self.kv_fp4 = kv_fp4
         self.has_bias = has_bias
         self.bias_block_size = bias_block_size
         self.rel_extent_padded = rel_extent_padded
@@ -863,6 +865,43 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             return True
         return (tile_m * 2) % num_threads == 0
 
+    def _check_type(
+        self,
+        mQ_type,
+        mK_type,
+        mV_type,
+        mO_type,
+        mLSE_type,
+        mCuSeqlensQ_type,
+        mCuSeqlensK_type,
+        mSeqUsedQ_type,
+        mSeqUsedK_type,
+    ):
+        if const_expr(self.kv_fp4):
+            # Native NVFP4 KV: Q/O stay bf16/fp16; K/V are packed uint8.
+            if const_expr(mQ_type not in [cutlass.Float16, cutlass.BFloat16]):
+                raise TypeError("Only Float16 or BFloat16 is supported")
+            if const_expr(mK_type is not cutlass.Uint8 or mV_type is not cutlass.Uint8):
+                raise TypeError("Native FP4 KV requires packed uint8 K/V tensors")
+            if const_expr(mO_type != mQ_type):
+                raise TypeError("Output dtype must match Q dtype")
+            if const_expr(mLSE_type not in [None, cutlass.Float32]):
+                raise TypeError("LSE tensor must be Float32")
+            if const_expr(mSeqUsedK_type not in [None, cutlass.Int32]):
+                raise TypeError("seqused_k tensor must be Int32")
+            return
+        super()._check_type(
+            mQ_type,
+            mK_type,
+            mV_type,
+            mO_type,
+            mLSE_type,
+            mCuSeqlensQ_type,
+            mCuSeqlensK_type,
+            mSeqUsedQ_type,
+            mSeqUsedK_type,
+        )
+
     def _get_smem_layout_atom(self):
         sQ_layout_atom = self._make_smem_layout_atom(
             self.dtype, self.tile_hdim, is_k_major=True
@@ -1086,6 +1125,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         aux_data: AuxData = AuxData(),
         mBias: Optional[cute.Tensor] = None,
         launch_split_combine_early: Int32 = Int32(0),
+        mSFk: Optional[cute.Tensor] = None,
+        mSFv: Optional[cute.Tensor] = None,
+        mDump: Optional[cute.Tensor] = None,
         stream: cuda.CUstream = None,
     ):
         assert blocksparse_tensors is None, "Block sparsity is not supported on SM120"
@@ -1093,6 +1135,14 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         assert mPageTable is None or self.paged_kv, (
             "SM120 paged KV requires the dedicated DMA-warp specialization"
         )
+        if const_expr(self.kv_fp4):
+            assert mPageTable is not None and not self.paged_tma, (
+                "Native FP4 KV requires the paged cp.async loader path"
+            )
+            assert mSFk is not None and mSFv is not None
+            assert mK.element_type is cutlass.Uint8, (
+                "Native FP4 KV requires packed uint8 KV tensors"
+            )
         self._check_type(
             *(
                 t.element_type if t is not None else None
@@ -1147,6 +1197,13 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             )
             for t in (mK, mV)
         ]
+        if const_expr(self.kv_fp4):
+            mSFk = cute.make_tensor(
+                mSFk.iterator, cute.select(mSFk.layout, mode=KV_layout_transpose)
+            )
+            mSFv = cute.make_tensor(
+                mSFv.iterator, cute.select(mSFv.layout, mode=KV_layout_transpose)
+            )
         if const_expr(mPageTable is None):
             V_layout_transpose = (
                 [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
@@ -1343,6 +1400,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             launch_split_combine_early,
             aux_data,
             fastdiv_mods,
+            mSFk,
+            mSFv,
+            mDump,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads + self._num_dma_threads(), 1, 1],
@@ -1395,6 +1455,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         launch_split_combine_early: Int32,
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
+        mSFk: Optional[cute.Tensor] = None,
+        mSFv: Optional[cute.Tensor] = None,
+        mDump: Optional[cute.Tensor] = None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1631,6 +1694,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                             window_size_left,
                             window_size_right,
                             tidx,
+                            mSFk=mSFk,
+                            mDump=mDump,
+                            mSFv=mSFv,
                         )
                     elif const_expr(self._uses_n_distributed_qk()):
                         if warp_idx <= self.num_mma_threads // cute.arch.WARP_SIZE:
@@ -1849,6 +1915,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                             sBias=sBias,
                             tma_atom_Bias=tma_atom_Bias,
                             pipeline_bias=pipeline_bias,
+                            mSFk=mSFk,
+                            mDump=mDump,
+                            mSFv=mSFv,
                         )
                 elif warp_idx <= self.num_threads // cute.arch.WARP_SIZE:
                     self.mma_persistent(
@@ -2100,6 +2169,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         sBias: Optional[cute.Tensor] = None,
         tma_atom_Bias: Optional[cute.CopyAtom] = None,
         pipeline_bias: Optional[PipelineAsync] = None,
+        mSFk: Optional[cute.Tensor] = None,
+        mSFv: Optional[cute.Tensor] = None,
+        mDump: Optional[cute.Tensor] = None,
     ):
         producer_state_k = PipelineState(
             self._num_k_stages(), Int32(0), Int32(0), Int32(1)
@@ -2253,6 +2325,11 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             self.tile_hdimv,
             self.num_dma_threads,
             mK.element_type,
+            packed_fp4=self.kv_fp4,
+            mKsf_paged=mSFk,
+            mVsf_paged=mSFv,
+            compute_dtype=self.dtype,
+            dump_gmem=mDump,
         )
         num_n_blocks = cutlass.max(n_block_max - n_block_min, 1)
         for n_tile in cutlass.range(num_n_blocks, unroll=1):
@@ -2277,6 +2354,10 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                 sK[None, None, producer_state_k.index],
                 "K",
             )
+            if const_expr(self.kv_fp4):
+                # SIMT stores must be visible to the async proxy before the
+                # pipeline release (mirrors the sP producer convention).
+                cute.arch.fence_view_async_shared()
             cute.arch.cp_async_commit_group()
             pipeline_k.producer_commit(producer_state_k)
             producer_state_k.advance()
@@ -2286,6 +2367,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                 sV[None, None, producer_state_v.index]
             )
             paged_kv_manager.load_KV(n_block, sV_stage, "V")
+            if const_expr(self.kv_fp4):
+                cute.arch.fence_view_async_shared()
             cute.arch.cp_async_commit_group()
             pipeline_v.producer_commit(producer_state_v)
             producer_state_v.advance()

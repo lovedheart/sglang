@@ -1793,7 +1793,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             fused_fp4
             and self._native_fp4_decode
             and q.dtype == torch.bfloat16
-            and not self._fa4_decode
         )
         if self._fa4_decode:
             # FA4 reads bf16/fp16 scratch only.
@@ -1928,6 +1927,23 @@ class QwenSparseAttnBackend(AttentionBackend):
                 128 * 1024 * 1024, dtype=torch.uint8, device=device
             )
         if self._fa4_decode:
+            if native_fp4:
+                output = self._fa4_fp4_paged_decode(
+                    q,
+                    kv_rows.view(-1, page, num_kv_heads, head_dim // 2),
+                    kv_rows_v.view(-1, page, num_kv_heads, head_dim // 2),
+                    packed_ksf[: batch * stride].view(
+                        -1, page, num_kv_heads, head_dim // 16
+                    ),
+                    packed_vsf[: batch * stride].view(
+                        -1, page, num_kv_heads, head_dim // 16
+                    ),
+                    block_tables,
+                    valid_counts,
+                    layer,
+                    method,
+                )
+                return output.reshape(q.shape[0], -1)
             # FA4 wants the canonical (pages, page, kv_heads, dim) layout.
             output = self._fa4_paged_decode(
                 q,
@@ -1993,6 +2009,70 @@ class QwenSparseAttnBackend(AttentionBackend):
             causal=False,
             softmax_scale=softmax_scale,
             out=out,
+        )
+        return out.squeeze(1)
+
+    def _fa4_fp4_paged_decode(
+        self,
+        q: torch.Tensor,
+        k_packed: torch.Tensor,
+        v_packed: torch.Tensor,
+        sf_k: torch.Tensor,
+        sf_v: torch.Tensor,
+        block_tables: torch.Tensor,
+        valid_counts: torch.Tensor,
+        layer,
+        method,
+    ) -> torch.Tensor:
+        """FA4 sm120 native packed-NVFP4 paged decode.
+
+        Dequantization (e2m1 x e4m3 SF) happens inside the kernel's producer;
+        the pool's global scales fold into the softmax scale (K) and a
+        post-output multiply (V). They are constant after calibration, so
+        caching them as floats keeps the call graph-safe.
+        """
+        from sglang.kernels.ops.attention.fa4_sm120.fp4_host import (
+            fp4_paged_decode,
+        )
+
+        lid = layer.layer_id
+        scales = self._fp4_gs_host.get(lid)
+        if scales is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "FA4 FP4 global scales must be warmed before graph "
+                    "capture (layer %d)." % lid
+                )
+            scales = (
+                float(method.k_scales_gpu[lid].item()),
+                float(method.v_scales_gpu[lid].item()),
+            )
+            self._fp4_gs_host[lid] = scales
+        k_gs, v_gs = scales
+        rows = q.shape[0]
+        out_key = (q.shape[1], q.shape[2], q.dtype, q.device, "fp4")
+        buffers = self._fa4_out_scratch.get(out_key)
+        if buffers is None or buffers[0].shape[0] < rows:
+            buffers = (
+                torch.empty(
+                    (rows, 1, q.shape[1], q.shape[2]),
+                    dtype=q.dtype,
+                    device=q.device,
+                ),
+            )
+            self._fa4_out_scratch[out_key] = buffers
+        out = buffers[0][:rows]
+        fp4_paged_decode(
+            q.contiguous().unsqueeze(1),
+            k_packed,
+            v_packed,
+            sf_k,
+            sf_v,
+            block_tables,
+            valid_counts,
+            layer.scaling * k_gs,
+            out=out,
+            v_global_scale=v_gs,
         )
         return out.squeeze(1)
 

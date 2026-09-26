@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Type
+from typing import Optional, Type
 
 import cutlass
 import cutlass.cute as cute
@@ -11,6 +11,32 @@ from quack.cute_dsl_utils import ParamsBase
 
 from sglang.kernels.ops.attention.flash_attn.cute import utils
 
+
+
+@cute.jit
+def _nvfp4_to_bf16(code: cutlass.Uint32) -> cutlass.BFloat16:
+    # NVFP4 (e2m1) -> BFloat16: magnitudes {0,.5,1,1.5,2,3,4,6} and the sign
+    # bit are exactly representable, so a select chain is exact and cheap.
+    mag = code & 0x7
+    v = cutlass.BFloat16(0.0)
+    if mag == 1:
+        v = cutlass.BFloat16(0.5)
+    elif mag == 2:
+        v = cutlass.BFloat16(1.0)
+    elif mag == 3:
+        v = cutlass.BFloat16(1.5)
+    elif mag == 4:
+        v = cutlass.BFloat16(2.0)
+    elif mag == 5:
+        v = cutlass.BFloat16(3.0)
+    elif mag == 6:
+        v = cutlass.BFloat16(4.0)
+    else:
+        if mag == 7:
+            v = cutlass.BFloat16(6.0)
+    if ((code >> 3) & 0x1) == 1:
+        v = cutlass.BFloat16(0.0) - v
+    return v
 
 @dataclass
 class Sm120PagedKVManager(ParamsBase):
@@ -37,6 +63,12 @@ class Sm120PagedKVManager(ParamsBase):
     gmem_thr_copy_KV: cute.TiledCopy
     tPrPage: cute.Tensor
     tPrPageOffset: cute.Tensor
+    # Native packed-NVFP4 KV support (SM120 SIMT loader path only).
+    packed_fp4: cutlass.Constexpr[bool] = False
+    mKsf_paged: Optional[cute.Tensor] = None
+    mVsf_paged: Optional[cute.Tensor] = None
+    compute_dtype: Type[cutlass.Numeric] = cutlass.BFloat16
+    dump_gmem: Optional[cute.Tensor] = None
 
     @staticmethod
     def create(
@@ -54,6 +86,11 @@ class Sm120PagedKVManager(ParamsBase):
         head_dim_v_padded: cutlass.Constexpr[Int32],
         num_threads: cutlass.Constexpr[Int32],
         dtype: Type[cutlass.Numeric],
+        packed_fp4: cutlass.Constexpr[bool] = False,
+        mKsf_paged: Optional[cute.Tensor] = None,
+        mVsf_paged: Optional[cute.Tensor] = None,
+        compute_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
+        dump_gmem: Optional[cute.Tensor] = None,
     ):
         universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // dtype.width
@@ -108,6 +145,11 @@ class Sm120PagedKVManager(ParamsBase):
             gmem_thr_copy_KV,
             tPrPage,
             tPrPageOffset,
+            packed_fp4,
+            mKsf_paged[None, None, bidh, None] if packed_fp4 else None,
+            mVsf_paged[None, None, bidh, None] if packed_fp4 else None,
+            compute_dtype,
+            dump_gmem,
         )
 
     @cute.jit
@@ -147,6 +189,16 @@ class Sm120PagedKVManager(ParamsBase):
         return tPrXPtr
 
     @cute.jit
+    def compute_SF_ptr(self, K_or_V: str):
+        tPrSfPtr = cute.make_rmem_tensor((self.page_entry_per_thread,), cutlass.Int64)
+        mX = self.mKsf_paged if const_expr(K_or_V == "K") else self.mVsf_paged
+        for i in cutlass.range_constexpr(self.page_entry_per_thread):
+            page = self.tPrPage[i]
+            page_offset = self.tPrPageOffset[i]
+            tPrSfPtr[i] = utils.elem_pointer(mX, (page_offset, 0, page)).toint()
+        return tPrSfPtr
+
+    @cute.jit
     def _copy_row_async(
         self,
         tXsX: cute.Tensor,
@@ -172,6 +224,9 @@ class Sm120PagedKVManager(ParamsBase):
     @cute.jit
     def load_KV(self, n_block: Int32, sX: cute.Tensor, K_or_V: str):
         assert K_or_V in ("K", "V")
+        if const_expr(self.packed_fp4):
+            self._load_KV_fp4(n_block, sX, K_or_V)
+            return
 
         tPrXPtr = self.compute_X_ptr(K_or_V)
 
@@ -186,15 +241,12 @@ class Sm120PagedKVManager(ParamsBase):
         cX = cute.make_identity_tensor((self.n_block_size, head_dim))
         tXsX = self.gmem_thr_copy_KV.partition_D(sX_pi)
         tXcX = self.gmem_thr_copy_KV.partition_S(cX)
-        tXc0X = self.gmem_thr_copy_KV.get_slice(0).partition_S(cX)
+        # D-side identity partition: exact (row, col) of every destination
+        # slot (the V view is transposed, so S-side coords do not match).
+        tXdX = self.gmem_thr_copy_KV.partition_D(cX)
 
-        seqlenk_row_limit = (
-            self.seqlen_k - n_block * self.n_block_size - tXcX[0][0]
-            if n_block >= 0
-            else 0
-        )
         for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
-            row_valid = tXc0X[0, m, 0][0] < seqlenk_row_limit
+            row_valid = True
             should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], cute.Boolean)
             should_load.fill(row_valid)
 
@@ -214,3 +266,88 @@ class Sm120PagedKVManager(ParamsBase):
                 mX_paged_cur, (self.async_copy_elems,)
             )
             self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load)
+
+    @cute.jit
+    def _load_KV_fp4(self, n_block: Int32, sX: cute.Tensor, K_or_V: str):
+        # Native packed-NVFP4 loader: same (m, k) -> (row, col) ownership as
+        # the proven bf16 cp.async ``load_KV`` (identical tiled-copy geometry,
+        # entry-pointer warp shuffles), but each 16-byte source word covers
+        # 32 elements; every element is dequantized (e2m1 x e4m3 SF, both
+        # exact in fp32) before the SIMT store into the swizzled tile.
+        tPrXPtr = self.compute_X_ptr(K_or_V)
+        tPrSfPtr = self.compute_SF_ptr(K_or_V)
+
+        sX_pi = cute.group_modes(sX, 0, 1)
+        head_dim = (
+            self.head_dim_v_padded
+            if const_expr(K_or_V == "V")
+            else self.head_dim_padded
+        )
+        cX = cute.make_identity_tensor((self.n_block_size, head_dim))
+        tXsX = self.gmem_thr_copy_KV.partition_D(sX_pi)
+        tXcX = self.gmem_thr_copy_KV.partition_S(cX)
+        # D-side identity partition: exact (row, col) of every destination
+        # slot (the V view is transposed, so S-side coords do not match).
+        tXdX = self.gmem_thr_copy_KV.partition_D(cX)
+
+        gptr = self.gmem_threads_per_row
+        for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
+            row_valid = True
+            x_ptr_i64 = utils.shuffle_sync(
+                tPrXPtr[m // gptr], m % gptr, width=gptr
+            )
+            sf_ptr_i64 = utils.shuffle_sync(
+                tPrSfPtr[m // gptr], m % gptr, width=gptr
+            )
+            x_gmem_ptr = cute.make_ptr(
+                cutlass.Uint8, x_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
+            )
+            sf_gmem_ptr = cute.make_ptr(
+                cutlass.Uint8, sf_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
+            )
+            mX_row = cute.make_tensor(
+                cute.recast_ptr(x_gmem_ptr, dtype=cutlass.Uint64),
+                cute.make_layout((head_dim // 16,)),
+            )
+            mX_sf = cute.make_tensor(
+                cute.recast_ptr(sf_gmem_ptr, dtype=cutlass.Uint32),
+                cute.make_layout((head_dim // 64,)),
+            )
+            for k in cutlass.range_constexpr(cute.size(tXsX, mode=[2])):
+                # Values land in a register fragment indexed identically to
+                # the S-side identity partition (whose coordinates are the
+                # logical (row, col) of the tile); autovec_copy then writes
+                # the fragment into the swizzled SMEM tile through the
+                # tiled-copy layout algebra, exactly like the bf16 path.
+                frag = cute.make_fragment_like(tXsX[None, m, k])
+                row = tXcX[((0, 0), m, k)][0]
+                row_valid = n_block * self.n_block_size + row < self.seqlen_k
+                for e in cutlass.range_constexpr(
+                    cute.size(frag, mode=[0, 0])
+                ):
+                    sc = tXcX[((e, 0), m, k)]
+                    col = sc[1]
+                    packed64 = mX_row[col // 16]
+                    nib = ((col % 16) // 2) * 8 + (col % 2) * 4
+                    code = ((packed64 >> nib) & 0xF).to(cutlass.Uint32)
+                    sf_g = col // 16
+                    sf_word = mX_sf[sf_g // 4].to(cutlass.Int32)
+                    sf_byte = (sf_word >> ((sf_g % 4) * 8)) & 0xFF
+                    sf_frag = cute.make_rmem_tensor((1,), cutlass.Uint8)
+                    sf_frag[0] = sf_byte.to(cutlass.Uint8)
+                    sf_f32 = cute.make_tensor(
+                        cute.recast_ptr(
+                            sf_frag.iterator, dtype=cutlass.Float8E4M3FN
+                        ),
+                        cute.make_layout((1,)),
+                    )[0].to(cutlass.Float32)
+                    value = (
+                        _nvfp4_to_bf16(code).to(cutlass.Float32) * sf_f32
+                    ).to(self.compute_dtype)
+                    frag[e] = value
+                    if const_expr(self.dump_gmem is not None):
+                        if const_expr(K_or_V == "K"):
+                            seq_pos = n_block * self.n_block_size + row
+                            self.dump_gmem[seq_pos, col] = value
+                if row_valid:
+                    cute.autovec_copy(frag, tXsX[None, m, k])
