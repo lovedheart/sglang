@@ -1624,6 +1624,9 @@ def _flash_attn_fwd(
                 compile_args.extend(
                     arch_forward_host.compile_arguments(arch_forward_plan)
                 )
+                # mSFk/mSFv/mDump: native fp4 KV is driven through the
+                # fp4_host launcher; the dense path keeps them None.
+                compile_args.extend([None, None, None])
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 *compile_args, options="--enable-tvm-ffi"
