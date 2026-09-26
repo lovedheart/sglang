@@ -1745,8 +1745,15 @@ class QwenSparseAttnBackend(AttentionBackend):
         # valid-counts + strided gather + paged decode; measured faster at
         # every batch size for NVFP4 (up to 2.8x at bs<=4), so it is enabled
         # for all realistic fp4 batches (scratch capped at ~1MB/row).
-        if self._fused_sparse_decode and not self._fa4_decode and batch <= (
-            256 if fused_fp4 else 8
+        # Measured against the FA4 gather+fwd+combine chain too: the one-shot
+        # wins at every rows in [2, 256] and both topk sizes for this arch's
+        # 2-kv-head/256-dim decode shapes, so an FP4 pool keeps precedence
+        # over FA4 decode; FA4 remains the paged path for bf16 pools, for
+        # shapes the one-shot rejects, and for the >256-row fallback.
+        if (
+            self._fused_sparse_decode
+            and (fused_fp4 or not self._fa4_decode)
+            and batch <= (256 if fused_fp4 else 8)
         ):
             fused = self._forward_fused_sparse_decode(
                 q, layer, forward_batch, metadata, topk_indices, fused_fp4

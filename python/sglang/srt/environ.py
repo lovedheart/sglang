@@ -343,11 +343,14 @@ class Envs:
     SGLANG_QSA_ATTN_FP4 = EnvBool(False)
     # Run the QSA sparse-decode attention (the page-aligned packed scratch in
     # _forward_trtllm_sparse, and the packed varlen fallback) on the arch-
-    # owned Blackwell-SM120 FlashAttention-4 kernel instead of the fused
-    # Triton sparse decode / trtllm-gen paged decode.  SM120 only (other
-    # architectures ignore the flag); bf16/fp16 scratch only (the native
-    # FP4-KV decode stays on xqa).  Gather, page tables, and masking are
-    # unchanged, so results match the trtllm path within kernel reordering.
+    # owned Blackwell-SM120 FlashAttention-4 kernel instead of the trtllm-gen
+    # paged decode.  SM120 only (other architectures ignore the flag);
+    # bf16/fp16 scratch only (the native FP4-KV decode stays on xqa).  Gather,
+    # page tables, and masking are unchanged, so results match the trtllm path
+    # within kernel reordering.  Note: with an NVFP4 pool the fused one-shot
+    # Triton kernel still takes precedence up to 256 rows (measured faster
+    # than FA4's gather+fwd+combine chain at every batch size), so on an FP4
+    # pool this flag only affects the >256-row / one-shot-rejected fallbacks.
     SGLANG_QSA_ATTN_FA4 = EnvBool(False)
     # Run QSA sparse-decode attention in the fused Triton kernel (gather +
     # dequant + attention in one pass over the top-k list) instead of the
