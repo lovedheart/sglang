@@ -19,11 +19,30 @@ _L20_CONFIGS = [
     (512, (32, 4, 2)),
     (float("inf"), (16, 1, 2)),
 ]
+# RTX PRO 6000-class Blackwell (sm120/121: 188 SM, 128 MB L2, ~1.85 TB/s).
+# Swept at 2 kv-heads / group 12 / head_dim 256 / topk 512 on batched
+# decode-style and chunked-prefill shapes: wide-N tiles pay off while the
+# gather fits in L2 (small total_q); above ~1k rows the kernel is
+# DRAM-gather bound and a single warp per tile streams best.
+_SM120_CONFIGS = [
+    (64, (64, 4, 2)),
+    (128, (32, 2, 3)),
+    (1024, (16, 2, 4)),
+    (float("inf"), (16, 1, 2)),
+]
+
+
+def _get_config_table():
+    if "H20" in torch.cuda.get_device_name(0):
+        return _H20_CONFIGS
+    # Capability-driven (not device-name) so every SM12x SKU picks it.
+    if torch.cuda.get_device_capability(0)[0] == 12:
+        return _SM120_CONFIGS
+    return _L20_CONFIGS
 
 
 def _get_best_config(total_q: int):
-    table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
-    return next(cfg for limit, cfg in table if total_q <= limit)
+    return next(cfg for limit, cfg in _get_config_table() if total_q <= limit)
 
 
 @triton.jit
@@ -769,7 +788,9 @@ def _gather_dequant_fp4_kv(
             sf = sf.to(tl.float32)
             for _ in tl.static_range(4):
                 sf = tl.interleave(sf, sf)
-            tl.store(out + dst, ((vals * sf) * gs).to(out_dtype), mask=store_cols[:, None])
+            tl.store(
+                out + dst, ((vals * sf) * gs).to(out_dtype), mask=store_cols[:, None]
+            )
 
 
 def qwen_sparse_kv_gather_dequant_fp4_triton(
