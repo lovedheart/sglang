@@ -153,16 +153,18 @@ def _qsa_graph_row_metadata_kernel(
     row_width_pages = req_to_token_row_stride // FULL_PAGE
     # Only the first ceil(compressed / COMPRESSED_PAGE) columns are ever read
     # (every consumer masks by compressed_lens; see the stale-but-unread note
-    # in metadata.compressed_decode_view), so the gather bound is the row's
-    # own page count instead of max_pages. Columns past it keep their prior
-    # contents (buffer-init zeros, or a previous replay's ids) and are never
-    # observed. The bound is read from memory at replay, so the data-dependent
-    # masking stays CUDA-graph safe.
+    # in metadata.compressed_decode_view), so the gather LOAD bound is the
+    # row's own page count instead of max_pages. Columns past it are stored
+    # as zeros: the whole table row stays a deterministic function of the
+    # row state (CUDA-graph replays with a captured buffer never see stale
+    # ids from a longer previous sequence). The bound is read from memory at
+    # replay, so the data-dependent masking stays CUDA-graph safe.
     used_pages = (seq_len // RATIO + COMPRESSED_PAGE - 1) // COMPRESSED_PAGE
     idx = tl.program_id(1) * PAGE_BLOCK + offs
-    valid = idx < tl.minimum(tl.minimum(max_pages, row_width_pages), used_pages)
-    loc = tl.load(req_to_token_ptr + token_row + idx * FULL_PAGE, mask=valid, other=0)
-    tl.store(table_row + idx, tl.maximum(loc // FULL_PAGE, 0), mask=valid)
+    in_table = idx < tl.minimum(max_pages, row_width_pages)
+    gather = in_table & (idx < used_pages)
+    loc = tl.load(req_to_token_ptr + token_row + idx * FULL_PAGE, mask=gather, other=0)
+    tl.store(table_row + idx, tl.maximum(loc // FULL_PAGE, 0), mask=in_table)
 
 
 def supports_graph_metadata_kernels(pool, device) -> bool:
