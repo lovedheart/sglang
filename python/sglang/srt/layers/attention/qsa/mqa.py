@@ -400,23 +400,17 @@ if HAS_TILELANG:
                         scores_3d[n, qi, head] = T.max(scores_3d[n, qi, head], 0.0)
                     T.reduce_sum(scores_3d, reduced, dim=-1, clear=True)
                     for qi, n in T.Parallel(block_q, block_n):
-                        # Tile covers [start_min, end_max) across the whole
-                        # tile of rows; only this row's own window may be
-                        # written -- outside it the -inf pre-fill must
-                        # survive (the torch reference is -inf there and
-                        # consumers top-k mask by the same window). This
-                        # predicated store replaces the old full-width -inf
-                        # mask kernel.
-                        col = start_min + ni * block_n + n
-                        if (
-                            col >= Starts[row_base + qi]
-                            and col < Ends[row_base + qi]
-                        ):
-                            # ScaleRecip reproduces torch's div_(scalar)
-                            # bit-for-bit: CUDA div_ by a cpu scalar is a
-                            # multiply by the fp32 reciprocal, so multiply
-                            # host-side-computed 1/scale instead of dividing.
-                            Logits[row_base + qi, col] = reduced[n, qi] * ScaleRecip
+                        # Inline the score-scale division at the store so the
+                        # full-width logits.div_ pass disappears. torch's
+                        # Tensor.div_(scalar) on CUDA is not IEEE division: the
+                        # cpu-scalar fast path rewrites it as a multiply by the
+                        # fp32 reciprocal of the fp32 scale, so we precompute
+                        # that reciprocal host-side and multiply (a plain "*",
+                        # exact under fast-math) instead of __fdiv_rn, which
+                        # would differ by 1 ulp on ~4% of lanes.
+                        Logits[row_base + qi, start_min + ni * block_n + n] = (
+                            reduced[n, qi] * ScaleRecip
+                        )
 
         return kernel
 
@@ -524,14 +518,16 @@ def tilelang_qsa_mqa_prefill(
     block_q = max(1, 128 // heads)
     padding = (-rows) % block_q
     padded_rows = rows + padding
-    # Upstream contract: columns outside a row's [start, end) window read as
-    # -inf (the torch reference and the tilelang finite-mask parity test
-    # depend on it), so pre-fill the whole slab with -inf; the kernel
-    # overwrites every in-window column. The old separate full-width mask
-    # kernel is replaced by this single fill.
-    logits = torch.full(
-        (padded_rows, keys), -float("inf"), dtype=torch.float32, device=q.device
-    )
+    # torch.empty (not torch.zeros + a full-width -inf mask kernel): the
+    # top-k consumers mask by the same row_starts/row_ends windows (the JIT
+    # fast_topk reads only [start, start+length), fast_topk_v2 neutralizes
+    # every lane it sees outside the window as NaN padding), so columns
+    # outside a row's window are kernel scratch -- the same contract the
+    # DeepGEMM scorers document. The scoring kernel below writes every
+    # in-window column, so no prefill traffic is observable. A torch.cat of
+    # the padding rows would copy the whole [rows, keys] fp32 matrix,
+    # doubling the dominant prefill buffer; allocate pre-padded instead.
+    logits = torch.empty((padded_rows, keys), dtype=torch.float32, device=q.device)
     scoring_dtype = _scoring_dtype(q, k)
     q_padded = q.to(scoring_dtype).contiguous()
     starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
@@ -585,12 +581,12 @@ def tilelang_qsa_mqa_decode(
             "TileLang QSA decode requires a compressed page size of "
             f"8/16/32/64 (64-row GEMM sub-page packing), got {page_size}"
         )
-    # -inf beyond each row's context length matches the torch reference's
-    # finite-mask contract (see tilelang_qsa_mqa_prefill); the kernel writes
-    # the [0, context_len) prefix in full.
-    logits = torch.full(
+    # torch.empty (not torch.full(-inf)): fast_topk scans exactly
+    # [0, context_len) and the kernel writes that prefix in full, so columns
+    # past a row's context length are never read; the wide -inf fill was
+    # pure traffic.
+    logits = torch.empty(
         (q.shape[0], max_model_len),
-        -float("inf"),
         dtype=torch.float32,
         device=q.device,
     )

@@ -272,9 +272,16 @@ def test_tilelang_mqa_matches_torch_reference(dtype):
     max_model_len = max_pages * page_size
     ref = torch_qsa_mqa_decode(q, cache, page_table, context_lens, max_model_len)
     out = tilelang_qsa_mqa_decode(q, cache, page_table, context_lens, max_model_len)
-    finite = torch.isfinite(ref)
-    assert torch.equal(finite, torch.isfinite(out))
-    torch.testing.assert_close(out[finite], ref[finite], rtol=2e-3, atol=2e-3)
+    # Columns at/after a row's context length are kernel scratch on the fast
+    # production path (top-k reads only [0, context_len)), so parity is
+    # checked inside the window only.
+    in_win = torch.arange(max_model_len, device=device)[None, :] < context_lens[
+        :, None
+    ]
+    assert torch.equal(
+        torch.isfinite(ref[in_win]), torch.isfinite(out[in_win])
+    )
+    torch.testing.assert_close(out[in_win], ref[in_win], rtol=2e-3, atol=2e-3)
     row_starts = torch.zeros_like(context_lens)
     sel_ref = _selected_score_multisets(
         ref, qsa_fast_topk(ref, row_starts, context_lens, topk=block_topk)
@@ -292,9 +299,13 @@ def test_tilelang_mqa_matches_torch_reference(dtype):
     row_ends = torch.randint(1, keys + 1, (rows,), device=device).to(torch.int32)
     ref_p = torch_qsa_mqa_prefill(qp, kp, row_starts, row_ends)
     out_p = tilelang_qsa_mqa_prefill(qp, kp, row_starts, row_ends)
-    finite = torch.isfinite(ref_p)
-    assert torch.equal(finite, torch.isfinite(out_p))
-    torch.testing.assert_close(out_p[finite], ref_p[finite], rtol=2e-3, atol=2e-3)
+    # Same scratch contract as the decode leg above: compare [start, end).
+    cols = torch.arange(keys, device=device)[None, :]
+    in_win = (cols >= row_starts[:, None]) & (cols < row_ends[:, None])
+    assert torch.equal(
+        torch.isfinite(ref_p[in_win]), torch.isfinite(out_p[in_win])
+    )
+    torch.testing.assert_close(out_p[in_win], ref_p[in_win], rtol=2e-3, atol=2e-3)
 
 
 def test_tilelang_mqa_rejects_mixed_operand_dtypes():
