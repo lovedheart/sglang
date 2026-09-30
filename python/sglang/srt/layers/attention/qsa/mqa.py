@@ -652,13 +652,28 @@ def qsa_mqa_decode(
     max_model_len: int,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    if k_cache.dtype == torch.float8_e4m3fn:
+    page_size = int(k_cache.shape[1])
+    can_tilelang = (
+        q.is_cuda and HAS_TILELANG and page_size >= 8 and 64 % page_size == 0
+    )
+    if k_cache.dtype == torch.float8_e4m3fn and not can_tilelang:
+        # Only reached where TileLang cannot run (absent, or a page size its
+        # 64-row sub-page packing rejects): the DeepGEMM paged fp8 kernel
+        # cannot address ratio-shrunken compressed pages on every arch
+        # (SM120 pins block_kv==64), so this scorer gathers each row's full
+        # history into a fresh slab per step -- several times the paged
+        # traffic, growing with context length.
         return deepgemm_qsa_mqa_decode(
             q, k_cache, page_table, context_lens, score_scale
         )
-    if q.is_cuda and HAS_TILELANG:
+    if can_tilelang:
         return tilelang_qsa_mqa_decode(
-            q, k_cache, page_table, context_lens, max_model_len, score_scale
+            q.to(k_cache.dtype) if q.dtype != k_cache.dtype else q,
+            k_cache,
+            page_table,
+            context_lens,
+            max_model_len,
+            score_scale,
         )
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale
