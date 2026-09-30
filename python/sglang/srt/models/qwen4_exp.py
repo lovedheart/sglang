@@ -784,6 +784,60 @@ def _gather_ple_embedding_from_pinned_kernel(
     )
 
 
+# Row counts above which a full one-CTA-per-row launch measurably slows the
+# decoder layer it overlaps with on sm120 (SM/issue-slot contention, not PCIe).
+_PLE_STRIDED_GATHER_ROWS = 8192
+_PLE_STRIDED_GATHER_GRID = 128
+
+
+@triton.jit
+def _gather_ple_embedding_from_pinned_strided_kernel(
+    weight_ptr,
+    ids_ptr,
+    output_ptr,
+    nrows,
+    tp_vocab_start,
+    tp_vocab_end,
+    embedding_dim: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    ILP: tl.constexpr,
+    is_fp8: tl.constexpr,
+):
+    """Grid-strided variant for prefill-sized gathers.
+
+    A full rows-long grid issues one UVA read cluster per CTA and steals
+    issue slots from the decoder layer it overlaps with (~15% of the layer
+    window measured on sm120 at 131k rows). A small persistent grid with
+    ILP rows in flight keeps the same PCIe throughput at a fraction of the
+    SM footprint.
+    """
+    pid = tl.program_id(0)
+    num_pids = tl.num_programs(0)
+    if is_fp8:
+        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+    else:
+        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
+    offsets = tl.arange(0, BLOCK_D)
+    dim_mask = offsets < embedding_dim
+    for row_base in tl.range(pid * ILP, nrows, num_pids * ILP):
+        rows = row_base + tl.arange(0, ILP)
+        row_ok = rows < nrows
+        global_idx = tl.load(ids_ptr + rows, mask=row_ok, other=0)
+        in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
+        local_idx = tl.where(in_range, global_idx - tp_vocab_start, 0)
+        values = tl.load(
+            weight_ptr + local_idx[:, None] * embedding_dim + offsets[None, :],
+            mask=in_range[:, None] & dim_mask[None, :],
+            other=0.0,
+        ).to(tl.bfloat16)
+        values = tl.where(in_range[:, None], values, 0.0)
+        tl.store(
+            output_ptr + rows[:, None].to(tl.int64) * embedding_dim + offsets[None, :],
+            values,
+            mask=row_ok[:, None] & dim_mask[None, :],
+        )
+
+
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """PLE table read directly from host memory (pinned, or a file-backed mmap).
 
@@ -905,16 +959,37 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                     vocab_start=self.shard_indices.org_vocab_start_index,
                     vocab_end=self.shard_indices.org_vocab_end_index,
                 )
-            _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self.weight.data_ptr(),
-                flat_ids,
-                output,
-                embedding_dim=self.embedding_dim,
-                tp_vocab_start=self.shard_indices.org_vocab_start_index,
-                tp_vocab_end=self.shard_indices.org_vocab_end_index,
-                is_fp8=self.weight.dtype == torch.float8_e4m3fn,
-                BLOCK_D=self._block_d,
-            )
+            if flat_ids.numel() > _PLE_STRIDED_GATHER_ROWS:
+                _gather_ple_embedding_from_pinned_strided_kernel[
+                    (_PLE_STRIDED_GATHER_GRID,)
+                ](
+                    self.weight.data_ptr(),
+                    flat_ids,
+                    output,
+                    flat_ids.numel(),
+                    self.shard_indices.org_vocab_start_index,
+                    self.shard_indices.org_vocab_end_index,
+                    embedding_dim=self.embedding_dim,
+                    BLOCK_D=self._block_d,
+                    ILP=8,
+                    is_fp8=self.weight.dtype == torch.float8_e4m3fn,
+                    num_warps=1,
+                )
+            else:
+                _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
+                    self.weight.data_ptr(),
+                    flat_ids,
+                    output,
+                    embedding_dim=self.embedding_dim,
+                    tp_vocab_start=self.shard_indices.org_vocab_start_index,
+                    tp_vocab_end=self.shard_indices.org_vocab_end_index,
+                    is_fp8=self.weight.dtype == torch.float8_e4m3fn,
+                    BLOCK_D=self._block_d,
+                    # 1 warp/row: each row is embedding_dim (<=BLOCK_D) contiguous
+                    # fp8 bytes, so one warp saturates the UVA read; extra warps
+                    # only add idle masked lanes (~13% faster on sm120).
+                    num_warps=1,
+                )
         return output
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
