@@ -612,8 +612,11 @@ class QSAIndexer(MultiPlatformOp):
             # Fold the determinism sort into the expand kernel below (one
             # launch instead of the five-launch torch.sort chain); when the
             # env kill-switch is off the fold is off and behavior matches
-            # SORT_TOPK=0 exactly.
-            fold_sort = envs.SGLANG_QSA_SORT_TOPK.get()
+            # SORT_TOPK=0 exactly.  With deferred expansion the fused KV
+            # prep expands in place and never runs that kernel, so the fold
+            # would leave the topk in atomic (run-varying) order — sort
+            # standalone there instead.
+            fold_sort = envs.SGLANG_QSA_SORT_TOPK.get() and not defer_expansion
             topk_indices = fast_topk(
                 logits,
                 compressed_lengths.to(torch.int32),
