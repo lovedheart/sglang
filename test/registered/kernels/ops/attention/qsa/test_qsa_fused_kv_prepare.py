@@ -245,6 +245,7 @@ def test_block_indices_expand_on_attention_fallback(monkeypatch):
     backend = module.QwenSparseAttnBackend.__new__(module.QwenSparseAttnBackend)
     backend.qsa_profile = SimpleNamespace(block_topk=512, budget=2048)
     backend.compress_ratio = 4
+    backend.kv_cache_quant_method = None
     cache = torch.zeros(16, 1, 256, device="cuda", dtype=torch.bfloat16)
     backend.token_to_kv_pool = SimpleNamespace(
         get_key_buffer=lambda _: cache, get_value_buffer=lambda _: cache
@@ -262,7 +263,7 @@ def test_block_indices_expand_on_attention_fallback(monkeypatch):
     expected = expand_qsa_block_indices(blocks, positions, lengths, 4, 2048)
     marker = object()
 
-    def attention(q, k, v, layer, batch, metadata, indices, trtllm):
+    def attention(q, k, v, layer, batch, metadata, indices, trtllm, gathered_rows=False):
         torch.testing.assert_close(indices, expected, rtol=0, atol=0)
         return marker
 
