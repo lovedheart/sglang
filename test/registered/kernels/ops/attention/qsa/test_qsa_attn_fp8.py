@@ -17,12 +17,12 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
-    QwenSparseAttnBackend,
-)
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_kv_gather_dequant_fp4_triton,
+)
+from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+    QwenSparseAttnBackend,
 )
 
 FP8 = torch.float8_e4m3fn
@@ -82,22 +82,30 @@ def test_widen_kv_for_kernel_passes_fp8_through(dtype):
 def _make_fp4_world(batch, topk, heads, dim, pool_rows, device, seed=0):
     g = torch.Generator(device="cpu").manual_seed(seed)
     k_fp4 = (
-        torch.randint(0, 256, (pool_rows, heads, dim // 2), generator=g, dtype=torch.int64)
+        torch.randint(
+            0, 256, (pool_rows, heads, dim // 2), generator=g, dtype=torch.int64
+        )
         .to(torch.uint8)
         .to(device)
     )
     v_fp4 = (
-        torch.randint(0, 256, (pool_rows, heads, dim // 2), generator=g, dtype=torch.int64)
+        torch.randint(
+            0, 256, (pool_rows, heads, dim // 2), generator=g, dtype=torch.int64
+        )
         .to(torch.uint8)
         .to(device)
     )
     k_sf = (
-        torch.randint(0, 127, (pool_rows, heads * (dim // 16)), generator=g, dtype=torch.int64)
+        torch.randint(
+            0, 127, (pool_rows, heads * (dim // 16)), generator=g, dtype=torch.int64
+        )
         .to(torch.uint8)
         .to(device)
     )
     v_sf = (
-        torch.randint(0, 127, (pool_rows, heads * (dim // 16)), generator=g, dtype=torch.int64)
+        torch.randint(
+            0, 127, (pool_rows, heads * (dim // 16)), generator=g, dtype=torch.int64
+        )
         .to(torch.uint8)
         .to(device)
     )
@@ -113,9 +121,16 @@ def _make_fp4_world(batch, topk, heads, dim, pool_rows, device, seed=0):
         n = int(seq_lens[b])
         indices[b, :n] = torch.arange(n, dtype=torch.int32, device=device)
     return dict(
-        k_fp4=k_fp4, v_fp4=v_fp4, k_sf=k_sf, v_sf=v_sf, k_gs=k_gs, v_gs=v_gs,
-        req_to_token=req_to_token, req_indices=req_indices,
-        indices=indices, seq_lens=seq_lens,
+        k_fp4=k_fp4,
+        v_fp4=v_fp4,
+        k_sf=k_sf,
+        v_sf=v_sf,
+        k_gs=k_gs,
+        v_gs=v_gs,
+        req_to_token=req_to_token,
+        req_indices=req_indices,
+        indices=indices,
+        seq_lens=seq_lens,
     )
 
 
@@ -149,8 +164,18 @@ def test_strided_gather_into_fp8_scratch_matches_bf16():
             (batch * stride, heads, dim), float("nan"), device=device
         ).to(out_dtype)
         qwen_sparse_kv_extraction_compact_triton(
-            k_pool, v_pool, req_to_token, req_indices, indices, seq_lens, cu,
-            poison, poison.clone(), batch, topk, zero_fill_cols=stride,
+            k_pool,
+            v_pool,
+            req_to_token,
+            req_indices,
+            indices,
+            seq_lens,
+            cu,
+            poison,
+            poison.clone(),
+            batch,
+            topk,
+            zero_fill_cols=stride,
         )
         outs[out_dtype] = poison
 
@@ -164,8 +189,14 @@ def test_strided_gather_into_fp8_scratch_matches_bf16():
     assert torch.equal(widened.view(BF16)[rows_valid], ref.view(BF16)[rows_valid])
     # tail: fp8 zeros are legal masked rows, never stale NaN bytes
     tail = ~rows_valid
-    assert torch.equal(outs[FP8].view(torch.uint8)[tail], torch.zeros_like(outs[FP8].view(torch.uint8)[tail]))
-    assert torch.equal(outs[BF16].view(torch.int16)[tail], torch.zeros_like(outs[BF16].view(torch.int16)[tail]))
+    assert torch.equal(
+        outs[FP8].view(torch.uint8)[tail],
+        torch.zeros_like(outs[FP8].view(torch.uint8)[tail]),
+    )
+    assert torch.equal(
+        outs[BF16].view(torch.int16)[tail],
+        torch.zeros_like(outs[BF16].view(torch.int16)[tail]),
+    )
 
 
 def test_fp4_fused_gather_into_fp8_scratch_within_rounding():
@@ -186,10 +217,24 @@ def test_fp4_fused_gather_into_fp8_scratch_within_rounding():
             (batch * stride, heads, dim), float("nan"), device=device
         ).to(out_dtype)
         qwen_sparse_kv_gather_dequant_fp4_triton(
-            w["k_fp4"], w["v_fp4"], w["k_sf"], w["v_sf"],
-            w["k_gs"][5:6], w["v_gs"][5:6],
-            w["req_to_token"], w["req_indices"], w["indices"], w["seq_lens"], cu,
-            k_out, v_out, batch, topk, heads, dim, zero_fill_cols=stride,
+            w["k_fp4"],
+            w["v_fp4"],
+            w["k_sf"],
+            w["v_sf"],
+            w["k_gs"][5:6],
+            w["v_gs"][5:6],
+            w["req_to_token"],
+            w["req_indices"],
+            w["indices"],
+            w["seq_lens"],
+            cu,
+            k_out,
+            v_out,
+            batch,
+            topk,
+            heads,
+            dim,
+            zero_fill_cols=stride,
         )
         outs[out_dtype] = (k_out, v_out)
 
@@ -273,20 +318,35 @@ def test_fp4_fused_gather_into_packed_scratch_is_bitwise():
     cu = torch.arange(batch + 1, dtype=torch.int32, device="cuda") * stride
     pk = torch.zeros(batch * stride, heads, dim // 2, dtype=torch.uint8, device="cuda")
     pv = torch.zeros_like(pk)
-    pk_sf = torch.zeros(batch * stride, heads, dim // 16, dtype=torch.uint8, device="cuda")
+    pk_sf = torch.zeros(
+        batch * stride, heads, dim // 16, dtype=torch.uint8, device="cuda"
+    )
     pv_sf = torch.zeros_like(pk_sf)
     qwen_sparse_kv_gather_dequant_fp4_triton(
-        w["k_fp4"], w["v_fp4"], w["k_sf"], w["v_sf"],
-        w["k_gs"][1:2], w["v_gs"][1:2],
-        w["req_to_token"], w["req_indices"], w["indices"], w["seq_lens"], cu,
-        pk, pv, batch, topk, heads, dim,
-        zero_fill_cols=stride, out_k_sf=pk_sf, out_v_sf=pv_sf,
+        w["k_fp4"],
+        w["v_fp4"],
+        w["k_sf"],
+        w["v_sf"],
+        w["k_gs"][1:2],
+        w["v_gs"][1:2],
+        w["req_to_token"],
+        w["req_indices"],
+        w["indices"],
+        w["seq_lens"],
+        cu,
+        pk,
+        pv,
+        batch,
+        topk,
+        heads,
+        dim,
+        zero_fill_cols=stride,
+        out_k_sf=pk_sf,
+        out_v_sf=pv_sf,
     )
     idx = w["indices"].long()
     valid = (idx >= 0) & (idx < w["seq_lens"].long()[:, None])
-    slots = w["req_to_token"][
-        w["req_indices"].long()[:, None], idx.clamp(min=0)
-    ]
+    slots = w["req_to_token"][w["req_indices"].long()[:, None], idx.clamp(min=0)]
     for name, pool, sf, out, out_sf in (
         ("K", w["k_fp4"], w["k_sf"], pk, pk_sf),
         ("V", w["v_fp4"], w["v_sf"], pv, pv_sf),
@@ -326,48 +386,85 @@ def test_native_fp4_decode_matches_bf16_scratch(gs):
     cu = torch.arange(batch + 1, dtype=torch.int32, device="cuda") * stride
     pk = torch.zeros(batch * stride, heads, dim // 2, dtype=torch.uint8, device="cuda")
     pv = torch.zeros_like(pk)
-    pk_sf = torch.zeros(batch * stride, heads, dim // 16, dtype=torch.uint8, device="cuda")
+    pk_sf = torch.zeros(
+        batch * stride, heads, dim // 16, dtype=torch.uint8, device="cuda"
+    )
     pv_sf = torch.zeros_like(pk_sf)
     bk = torch.zeros(batch * stride, heads, dim, dtype=BF16, device="cuda")
     bv = torch.zeros_like(bk)
     args = (
-        w["k_fp4"], w["v_fp4"], w["k_sf"], w["v_sf"],
-        w["k_gs"][1:2], w["v_gs"][1:2],
-        w["req_to_token"], w["req_indices"], w["indices"], w["seq_lens"], cu,
+        w["k_fp4"],
+        w["v_fp4"],
+        w["k_sf"],
+        w["v_sf"],
+        w["k_gs"][1:2],
+        w["v_gs"][1:2],
+        w["req_to_token"],
+        w["req_indices"],
+        w["indices"],
+        w["seq_lens"],
+        cu,
     )
     qwen_sparse_kv_gather_dequant_fp4_triton(
-        *args, pk, pv, batch, topk, heads, dim,
-        zero_fill_cols=stride, out_k_sf=pk_sf, out_v_sf=pv_sf,
+        *args,
+        pk,
+        pv,
+        batch,
+        topk,
+        heads,
+        dim,
+        zero_fill_cols=stride,
+        out_k_sf=pk_sf,
+        out_v_sf=pv_sf,
     )
     qwen_sparse_kv_gather_dequant_fp4_triton(
         *args, bk, bv, batch, topk, heads, dim, zero_fill_cols=stride
     )
     torch.manual_seed(7)
     q = torch.randn(batch, 1, 12, dim, device="cuda", dtype=BF16)
-    bt = torch.arange(pages, dtype=torch.int32, device="cuda").reshape(
-        batch, stride // PAGE
-    ).contiguous()
+    bt = (
+        torch.arange(pages, dtype=torch.int32, device="cuda")
+        .reshape(batch, stride // PAGE)
+        .contiguous()
+    )
     sl = w["seq_lens"].clone()
     ws = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
     ref = trtllm_batch_decode_with_kv_cache(
         q,
-        (bk.view(pages, PAGE, heads, dim).permute(0, 2, 1, 3),
-         bv.view(pages, PAGE, heads, dim).permute(0, 2, 1, 3)),
-        ws, bt, sl, max_seq_len=stride, bmm1_scale=0.18, bmm2_scale=1.0,
+        (
+            bk.view(pages, PAGE, heads, dim).permute(0, 2, 1, 3),
+            bv.view(pages, PAGE, heads, dim).permute(0, 2, 1, 3),
+        ),
+        ws,
+        bt,
+        sl,
+        max_seq_len=stride,
+        bmm1_scale=0.18,
+        bmm2_scale=1.0,
         out_dtype=BF16,
     )
     got = trtllm_batch_decode_with_kv_cache(
         q,
-        (pk[: batch * stride].view(pages, PAGE, heads, dim // 2).permute(0, 2, 1, 3),
-         pv[: batch * stride].view(pages, PAGE, heads, dim // 2).permute(0, 2, 1, 3)),
-        ws, bt, sl, max_seq_len=stride,
-        kv_cache_sf=(
-            pk_sf[: batch * stride].view(pages, PAGE, heads, dim // 16)
-            .permute(0, 2, 1, 3).view(FP8),
-            pv_sf[: batch * stride].view(pages, PAGE, heads, dim // 16)
-            .permute(0, 2, 1, 3).view(FP8),
+        (
+            pk[: batch * stride].view(pages, PAGE, heads, dim // 2).permute(0, 2, 1, 3),
+            pv[: batch * stride].view(pages, PAGE, heads, dim // 2).permute(0, 2, 1, 3),
         ),
-        bmm1_scale=0.18 * w["k_gs"][1:2], bmm2_scale=w["v_gs"][1:2],
+        ws,
+        bt,
+        sl,
+        max_seq_len=stride,
+        kv_cache_sf=(
+            pk_sf[: batch * stride]
+            .view(pages, PAGE, heads, dim // 16)
+            .permute(0, 2, 1, 3)
+            .view(FP8),
+            pv_sf[: batch * stride]
+            .view(pages, PAGE, heads, dim // 16)
+            .permute(0, 2, 1, 3)
+            .view(FP8),
+        ),
+        bmm1_scale=0.18 * w["k_gs"][1:2],
+        bmm2_scale=w["v_gs"][1:2],
         out_dtype=BF16,
     )
     rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
@@ -411,7 +508,10 @@ def test_fp4_packed_gather_verify_rows_are_bitwise():
     table_len = max(lengths)
     req_to_token = (
         torch.stack(
-            [torch.randperm(pool_rows, generator=g)[:table_len] for _ in range(requests)]
+            [
+                torch.randperm(pool_rows, generator=g)[:table_len]
+                for _ in range(requests)
+            ]
         )
         .to(torch.int32)
         .to(device)
@@ -430,17 +530,35 @@ def test_fp4_packed_gather_verify_rows_are_bitwise():
     indices = indices.to(device)
 
     cu = torch.arange(rows + 1, dtype=torch.int32, device=device) * stride
-    pk = torch.full((rows * stride, heads, dim // 2), 0x7F, dtype=torch.uint8, device=device)
+    pk = torch.full(
+        (rows * stride, heads, dim // 2), 0x7F, dtype=torch.uint8, device=device
+    )
     pv = torch.full_like(pk, 0x7F)
-    pk_sf = torch.full((rows * stride, heads, dim // 16), 0x7F, dtype=torch.uint8, device=device)
+    pk_sf = torch.full(
+        (rows * stride, heads, dim // 16), 0x7F, dtype=torch.uint8, device=device
+    )
     pv_sf = torch.full_like(pk_sf, 0x7F)
     qwen_sparse_kv_gather_dequant_fp4_triton(
-        k_fp4, v_fp4, k_sf, v_sf,
+        k_fp4,
+        v_fp4,
+        k_sf,
+        v_sf,
         torch.ones(1, dtype=torch.float32, device=device),
         torch.ones(1, dtype=torch.float32, device=device),
-        req_to_token, req_indices, indices, seq_lens, cu,
-        pk, pv, rows, topk, heads, dim,
-        zero_fill_cols=stride, out_k_sf=pk_sf, out_v_sf=pv_sf,
+        req_to_token,
+        req_indices,
+        indices,
+        seq_lens,
+        cu,
+        pk,
+        pv,
+        rows,
+        topk,
+        heads,
+        dim,
+        zero_fill_cols=stride,
+        out_k_sf=pk_sf,
+        out_v_sf=pv_sf,
     )
 
     idx = indices.long()
@@ -452,14 +570,20 @@ def test_fp4_packed_gather_verify_rows_are_bitwise():
     ):
         ref = pool[slots.reshape(-1)].reshape(rows, topk, heads, -1)
         ref = torch.where(valid[:, :, None, None], ref, torch.zeros_like(ref))
-        expected = torch.zeros(rows, stride, *ref.shape[2:], dtype=torch.uint8, device=device)
+        expected = torch.zeros(
+            rows, stride, *ref.shape[2:], dtype=torch.uint8, device=device
+        )
         expected[:, :topk] = ref
         assert torch.equal(out.view(rows, stride, heads, -1), expected), name
         ref_s = sf[slots.reshape(-1)].reshape(rows, topk, heads, dim // 16)
         ref_s = torch.where(valid[:, :, None, None], ref_s, torch.zeros_like(ref_s))
-        expected_s = torch.zeros(rows, stride, heads, dim // 16, dtype=torch.uint8, device=device)
+        expected_s = torch.zeros(
+            rows, stride, heads, dim // 16, dtype=torch.uint8, device=device
+        )
         expected_s[:, :topk] = ref_s
-        assert torch.equal(out_sf.view(rows, stride, heads, dim // 16), expected_s), name
+        assert torch.equal(out_sf.view(rows, stride, heads, dim // 16), expected_s), (
+            name
+        )
     # Nothing survived from the poison. Only the zero-fill tail (cols >= topk)
     # can still hold it: gathered bytes are random pool bytes and may equal
     # 0x7F by chance, which torch.equal above already accounts for.

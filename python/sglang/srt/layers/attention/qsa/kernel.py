@@ -68,9 +68,7 @@ def qsa_fast_topk(
         supported_topk = getattr(top_k_module, "_FAST_TOPK_SUPPORTED_K", (2048,))
         if topk in supported_topk:
             return _sort_qsa_topk_indices(
-                top_k_module.fast_topk_v2(
-                    logits, lengths, topk=topk, row_starts=starts
-                )
+                top_k_module.fast_topk_v2(logits, lengths, topk=topk, row_starts=starts)
             )
         raise ValueError(
             f"QSA top-k {topk} is unsupported by sgl_kernel; "

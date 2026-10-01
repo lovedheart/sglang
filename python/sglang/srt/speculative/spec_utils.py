@@ -894,11 +894,7 @@ def _pptrace_verify(batch, accept_lens, steps_to_track):
         if bufs is not None:
             for r in bufs:
                 b = getattr(r.kv, "mamba_ping_pong_track_buffer", None)
-                pp.append(
-                    b.tolist()
-                    if b is not None
-                    else None
-                )
+                pp.append(b.tolist() if b is not None else None)
         iv = mamba_track_grid(batch.tree_cache.page_size)
 
         def _hh(slot):
@@ -918,12 +914,9 @@ def _pptrace_verify(batch, accept_lens, steps_to_track):
 
         def _hhact(req):
             try:
-                pidx = (
-                    batch.tree_cache.req_to_token_pool.translate_mamba_indices(
-                        req.kv.mamba_pool_idx.view(-1).to(torch.int64)
-                    )
-                    .item()
-                )
+                pidx = batch.tree_cache.req_to_token_pool.translate_mamba_indices(
+                    req.kv.mamba_pool_idx.view(-1).to(torch.int64)
+                ).item()
                 t = (
                     batch.tree_cache.req_to_token_pool.mamba_pool.mamba_cache.temporal[
                         :, pidx

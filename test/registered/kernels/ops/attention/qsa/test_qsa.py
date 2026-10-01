@@ -6,6 +6,7 @@ import torch
 
 from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
 from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
 from sglang.srt.layers.attention.qsa.kernel import (
@@ -29,7 +30,6 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_kv_extraction_compact_triton,
     sparse_gqa_fwd_interface_triton_ck,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseMultiStepDraftBackend,
@@ -1730,9 +1730,7 @@ def test_qsa_draft_metadata_multi_step_graph(bs, padding):
             graph_compressed_page_table=torch.zeros(
                 (bs, pages), dtype=torch.int32, device="cuda"
             ),
-            decode_logical_positions=torch.zeros(
-                bs, dtype=torch.int32, device="cuda"
-            ),
+            decode_logical_positions=torch.zeros(bs, dtype=torch.int32, device="cuda"),
             pending_ring_slots=torch.zeros(bs, dtype=torch.int64, device="cuda"),
             graph_ring_group_locs=torch.zeros(
                 (bs, ratio), dtype=torch.int32, device="cuda"
@@ -1826,9 +1824,7 @@ def test_qsa_fold_sort_matches_sort_then_expand():
 def test_qsa_fold_sort_reorders_input_in_place():
     bi, qp, sl = _fold_sort_case(2, seed=7)
     before = bi.clone()
-    expand_qsa_block_indices(
-        bi, qp, sl, COMPRESS_RATIO, TOKEN_TOPK, sort_input=True
-    )
+    expand_qsa_block_indices(bi, qp, sl, COMPRESS_RATIO, TOKEN_TOPK, sort_input=True)
     torch.cuda.synchronize()
     assert not torch.equal(bi, before)
     assert torch.equal(bi, before.sort(dim=-1, descending=True).values)
@@ -1860,7 +1856,6 @@ def test_qsa_fold_sort_cuda_graph_capture_replay():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(captured, eager)
-
 
 
 def _make_chunk_prefill_backend(prefix_lens, extend_lens, req_pool_indices, seed):
@@ -1966,6 +1961,7 @@ def test_qsa_chunk_prefill_vector_gather_matches_legacy(
     assert torch.equal(vectorized, legacy)
     assert torch.isfinite(vectorized).all()
 
+
 def test_qsa_chunk_prefill_removes_device_round_trips():
     """The vectorized gather must drop the legacy loop's device reads: it never
     sends req_pool_indices back to the host and takes the query-row maximum
@@ -2009,8 +2005,12 @@ def test_qsa_chunk_prefill_removes_device_round_trips():
     backend, queries, layer, forward_batch, indices = _make_chunk_prefill_backend(
         [1500, 400], [128, 64], [1, 0], seed=11
     )
-    legacy_syncs, legacy = count_syncs(backend, queries, layer, forward_batch, indices, False)
-    vector_syncs, vectorized = count_syncs(backend, queries, layer, forward_batch, indices, True)
+    legacy_syncs, legacy = count_syncs(
+        backend, queries, layer, forward_batch, indices, False
+    )
+    vector_syncs, vectorized = count_syncs(
+        backend, queries, layer, forward_batch, indices, True
+    )
     assert torch.equal(vectorized, legacy)
     # Both paths still stage the host length lists onto the device; the legacy
     # loop adds one more read (req_pool_indices). The query-row maximum is
