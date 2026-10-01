@@ -240,6 +240,10 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
                 "commit_gdn_replayssm_circular"
             ),
             patch(
+                "sglang.srt.layers.attention.hybrid_linear_attn_backend."
+                "update_ple_state_after_mtp_verify"
+            ),
+            patch(
                 "sglang.kernels.ops.mamba.mamba_state_scatter_triton."
                 "fused_conv_window_scatter_with_mask"
             ) as scatter,
