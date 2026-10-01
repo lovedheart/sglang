@@ -4,6 +4,9 @@ import pytest
 
 from sglang.srt.layers.attention.qsa import sparse_attn
 from sglang.srt.layers.attention.qsa.sparse_attn import _get_best_config
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
 
 @pytest.mark.parametrize(
@@ -18,10 +21,12 @@ from sglang.srt.layers.attention.qsa.sparse_attn import _get_best_config
     ],
 )
 def test_config_table_selection_is_substring_based(monkeypatch, name, expected_table):
-    monkeypatch.setattr(
-        sparse_attn.torch.cuda, "get_device_name", lambda idx=0: name
+    monkeypatch.setattr(sparse_attn.torch.cuda, "get_device_name", lambda idx=0: name)
+    table = (
+        sparse_attn._H20_CONFIGS
+        if expected_table == "h20"
+        else sparse_attn._L20_CONFIGS
     )
-    table = sparse_attn._H20_CONFIGS if expected_table == "h20" else sparse_attn._L20_CONFIGS
     for total_q in (1, 32, 64, 128, 512, 4096, 100000):
         assert _get_best_config(total_q) == next(
             cfg for limit, cfg in table if total_q <= limit
