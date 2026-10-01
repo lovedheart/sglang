@@ -1721,18 +1721,23 @@ def test_qsa_draft_metadata_multi_step_graph(bs, padding):
     reqs = torch.arange(1, bs + 1, dtype=torch.int32, device="cuda")
 
     def metadata():
+        # Zero-init like the production graph buffers: the bounded page-table
+        # gather (and the ring stores) never write columns past a row's used
+        # pages, so those stay at their buffer-init contents by design.
         indexer = SimpleNamespace(
-            graph_compressed_lengths=torch.empty(bs, dtype=torch.int32, device="cuda"),
-            graph_write_locs=torch.empty(bs, dtype=torch.int32, device="cuda"),
-            graph_compressed_page_table=torch.empty(
+            graph_compressed_lengths=torch.zeros(bs, dtype=torch.int32, device="cuda"),
+            graph_write_locs=torch.zeros(bs, dtype=torch.int32, device="cuda"),
+            graph_compressed_page_table=torch.zeros(
                 (bs, pages), dtype=torch.int32, device="cuda"
             ),
-            decode_logical_positions=torch.empty(bs, dtype=torch.int32, device="cuda"),
-            pending_ring_slots=torch.empty(bs, dtype=torch.int64, device="cuda"),
-            graph_ring_group_locs=torch.empty(
+            decode_logical_positions=torch.zeros(
+                bs, dtype=torch.int32, device="cuda"
+            ),
+            pending_ring_slots=torch.zeros(bs, dtype=torch.int64, device="cuda"),
+            graph_ring_group_locs=torch.zeros(
                 (bs, ratio), dtype=torch.int32, device="cuda"
             ),
-            graph_prefix_lengths=torch.empty(bs, dtype=torch.int32, device="cuda"),
+            graph_prefix_lengths=torch.zeros(bs, dtype=torch.int32, device="cuda"),
             compress_ratio=ratio,
         )
         return SimpleNamespace(
