@@ -1805,6 +1805,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             _os.environ.get("SGLANG_PPTRACE") == "1"
             and not torch.cuda.is_current_stream_capturing()
         ):
+
             def _h(slots):
                 t = self.mamba_pool.mamba_cache.temporal[:, slots].float()
                 head = t[:, :, :4].contiguous().cpu().numpy().tobytes()

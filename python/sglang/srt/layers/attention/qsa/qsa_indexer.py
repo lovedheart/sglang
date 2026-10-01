@@ -38,14 +38,14 @@ logger = logging.getLogger(__name__)
 # Top-k is row-independent, so large scheduler chunks can be scored in smaller
 # row tiles without changing the selected blocks.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
+
+
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
     if rows <= 0 or keys <= 0:
         return max(rows, 1)
     block_q = max(1, 128 // heads)
     bytes_per_row = keys * torch.float32.itemsize
-    max_padded_rows = max(
-        block_q, _QSA_PREFILL_LOGITS_BUDGET_BYTES // bytes_per_row
-    )
+    max_padded_rows = max(block_q, _QSA_PREFILL_LOGITS_BUDGET_BYTES // bytes_per_row)
     max_padded_rows = max(block_q, max_padded_rows // block_q * block_q)
     return min(rows, max_padded_rows)
 
@@ -261,9 +261,10 @@ class QSAIndexer(MultiPlatformOp):
         return self.apply_rope(block_positions, normalized)
 
     def _use_fused_compress(self, pool) -> bool:
-        return (
-            getattr(pool, "qsa_rope_position_buffer", None) is not None
-            and self._use_fused_prep(pool.get_qsa_key_state_buffer(self.layer_id))
+        return getattr(
+            pool, "qsa_rope_position_buffer", None
+        ) is not None and self._use_fused_prep(
+            pool.get_qsa_key_state_buffer(self.layer_id)
         )
 
     def _fused_compress_store(
@@ -326,7 +327,6 @@ class QSAIndexer(MultiPlatformOp):
             sequence_ids=sequence_ids,
             compress_ratio=self.compress_ratio,
         )
-
 
     def update_key_state_and_compress(
         self,
@@ -482,7 +482,9 @@ class QSAIndexer(MultiPlatformOp):
         if tensor.numel() == 0:
             return tensor
         positions = positions.long()
-        num_positions = positions.shape[-1] if positions.ndim == 2 else positions.numel()
+        num_positions = (
+            positions.shape[-1] if positions.ndim == 2 else positions.numel()
+        )
         if num_positions != tensor.shape[0]:
             raise ValueError("QSA RoPE positions must match the token dimension")
         self._ensure_rope_cache_for(positions)
@@ -529,11 +531,7 @@ class QSAIndexer(MultiPlatformOp):
             rows, compressed_keys.shape[0], q.shape[1]
         )
         num_keys = compressed_keys.shape[0]
-        if (
-            getattr(self, "use_fp4_indexer", False)
-            and num_keys
-            and q.is_cuda
-        ):
+        if getattr(self, "use_fp4_indexer", False) and num_keys and q.is_cuda:
             # The pool keeps BF16 compressed keys; quantize the whole slab
             # once per forward (shared across row chunks) into the packed
             # (codes, ue8m0-scales) pair so qsa_mqa_prefill routes to the
@@ -545,11 +543,7 @@ class QSAIndexer(MultiPlatformOp):
             compressed_keys = quantize_fp4_indexer_tensor(
                 compressed_keys.reshape(-1, compressed_keys.shape[-1])
             )
-        elif (
-            getattr(self, "use_fp8_indexer", False)
-            and num_keys
-            and q.is_cuda
-        ):
+        elif getattr(self, "use_fp8_indexer", False) and num_keys and q.is_cuda:
             # The pool keeps BF16 compressed keys; cast the whole (once per
             # forward, shared across row chunks) slab so the dtype dispatch in
             # qsa_mqa_prefill routes to the DeepGEMM packed fp8 kernel.
@@ -628,9 +622,7 @@ class QSAIndexer(MultiPlatformOp):
                 row_starts=None,
             )
             block_indices = (
-                topk_indices
-                if fold_sort
-                else _sort_qsa_topk_indices(topk_indices)
+                topk_indices if fold_sort else _sort_qsa_topk_indices(topk_indices)
             )
         else:
             fold_sort = False
@@ -643,7 +635,10 @@ class QSAIndexer(MultiPlatformOp):
         import hashlib
         import os
 
-        if os.environ.get("SGLANG_PPTRACE") == "1" and not torch.cuda.is_current_stream_capturing():
+        if (
+            os.environ.get("SGLANG_PPTRACE") == "1"
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             with open("/tmp/pptrace.log", "a") as f:
                 f.write(
                     f"T layer={self.layer_id} L={compressed_lengths.tolist()} "
@@ -776,9 +771,7 @@ class QSAIndexer(MultiPlatformOp):
         else:
             logical_positions = getattr(forward_batch, "positions", None)
             if logical_positions is None:
-                logical_positions = (
-                    positions[0] if positions.ndim == 2 else positions
-                )
+                logical_positions = positions[0] if positions.ndim == 2 else positions
             logical_positions = logical_positions.flatten()
         # DP MAX_LEN padding adds token rows without assigning them to a
         # request. token_to_batch_idx is the source of truth for semantic rows.
@@ -854,9 +847,7 @@ class QSAIndexer(MultiPlatformOp):
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
-            indexer_metadata.get_prefill_mqa_inputs(
-                self.layer_id, logical_positions
-            )
+            indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
         )
         query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
         row_sequence_lengths = sequence_lengths.index_select(
