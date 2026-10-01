@@ -141,7 +141,6 @@ def _scoring_dtype(q: torch.Tensor, k: torch.Tensor) -> torch.dtype:
 _DEEPGEMM_ALLOWED_HEADS = (8, 16, 32, 64)
 
 
-
 def _require_deepgemm(fp4: bool = False) -> None:
     if not HAS_DEEPGEMM:
         raise RuntimeError(
@@ -251,8 +250,10 @@ def deepgemm_qsa_mqa_prefill_fp4(
     padded_heads = next((h for h in _DEEPGEMM_ALLOWED_HEADS if h >= heads), None)
     if padded_heads is None:
         raise ValueError(f"QSA FP4 MQA cannot pad {heads} query heads")
-    q_pad = q if padded_heads == heads else torch.nn.functional.pad(
-        q, (0, 0, 0, padded_heads - heads)
+    q_pad = (
+        q
+        if padded_heads == heads
+        else torch.nn.functional.pad(q, (0, 0, 0, padded_heads - heads))
     )
     weights = q.new_zeros((rows, padded_heads), dtype=torch.float32)
     if head_weights is None:
@@ -260,9 +261,7 @@ def deepgemm_qsa_mqa_prefill_fp4(
     else:
         if head_weights.shape != (rows, heads):
             raise ValueError("QSA FP4 head_weights must be [rows, heads]")
-        weights[:, :heads] = (
-            head_weights.float() / (score_scale or math.sqrt(head_dim))
-        )
+        weights[:, :heads] = head_weights.float() / (score_scale or math.sqrt(head_dim))
     q_codes, q_sf = quantize_fp4_indexer_tensor(
         q_pad.contiguous().reshape(rows * padded_heads, head_dim)
     )
@@ -303,7 +302,9 @@ def deepgemm_qsa_mqa_decode(
     pages, page_size, _, _ = k_cache.shape
     total = page_table.shape[1] * page_size
     if total == 0:
-        return torch.full((rows, 0), -float("inf"), dtype=torch.float32, device=q.device)
+        return torch.full(
+            (rows, 0), -float("inf"), dtype=torch.float32, device=q.device
+        )
     q_fp8, weights = _qsa_fp8_query(q, score_scale)
     cache_flat = k_cache.reshape(-1, head_dim)
     context = context_lens.to(torch.int32).reshape(-1)
@@ -315,9 +316,7 @@ def deepgemm_qsa_mqa_decode(
     for row_begin in range(0, rows, block):
         row_end = min(row_begin + block, rows)
         slots = (
-            page_table[row_begin:row_end]
-            .to(torch.int64)
-            .clamp_min(0)[:, :, None]
+            page_table[row_begin:row_end].to(torch.int64).clamp_min(0)[:, :, None]
             * page_size
             + offsets
         ).reshape(row_end - row_begin, total)

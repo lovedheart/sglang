@@ -22,7 +22,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
-from sglang.srt.layers.attention.qsa.sparse_decode import sparse_decode_attention
 
 # The valid mask as it must appear in the kernel source (C1 form).
 _NEW_MASK = "valid = tmask & (idx >= 0) & (idx < seqlen)"
@@ -52,9 +51,21 @@ def _world(rows, junk, seed):
     device = torch.device("cuda")
     g = torch.Generator(device="cuda")
     g.manual_seed(seed)
-    q = torch.randn(rows, Q_HEADS, DIM, device=device, dtype=torch.bfloat16, generator=g)
-    k = torch.randn(SLOTS, KV_HEADS, DIM, device=device, dtype=torch.bfloat16, generator=g) * 3.0
-    v = torch.randn(SLOTS, KV_HEADS, DIM, device=device, dtype=torch.bfloat16, generator=g) * 3.0
+    q = torch.randn(
+        rows, Q_HEADS, DIM, device=device, dtype=torch.bfloat16, generator=g
+    )
+    k = (
+        torch.randn(
+            SLOTS, KV_HEADS, DIM, device=device, dtype=torch.bfloat16, generator=g
+        )
+        * 3.0
+    )
+    v = (
+        torch.randn(
+            SLOTS, KV_HEADS, DIM, device=device, dtype=torch.bfloat16, generator=g
+        )
+        * 3.0
+    )
     req = torch.zeros(rows, dtype=torch.int64, device=device)
     r2t = (
         torch.arange(SLOTS, device=device, dtype=torch.int32)[None, :]
@@ -89,7 +100,9 @@ def test_clean_indices_are_bitwise_unchanged(rows, seed):
     """The C1 mask is a tautology for clean top-k: no output bit may move."""
     pre = _load_pre_fix()
     w = _world(rows, junk=False, seed=seed)
-    assert torch.equal(_run(_sd.sparse_decode_attention, w), _run(pre.sparse_decode_attention, w))
+    assert torch.equal(
+        _run(_sd.sparse_decode_attention, w), _run(pre.sparse_decode_attention, w)
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -98,5 +111,13 @@ def test_garbage_tokens_change_the_result(pre_diff_threshold=1e-3):
     present, the pre-fix kernel gathers their KV and the outputs diverge."""
     pre = _load_pre_fix()
     w = _world(2, junk=True, seed=7)
-    diff = (_run(_sd.sparse_decode_attention, w).float() - _run(pre.sparse_decode_attention, w).float()).abs().max().item()
+    diff = (
+        (
+            _run(_sd.sparse_decode_attention, w).float()
+            - _run(pre.sparse_decode_attention, w).float()
+        )
+        .abs()
+        .max()
+        .item()
+    )
     assert diff > pre_diff_threshold, f"guard did not affect garbage output: {diff}"

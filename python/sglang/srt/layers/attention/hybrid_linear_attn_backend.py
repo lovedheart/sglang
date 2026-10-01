@@ -1565,6 +1565,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             :, src_indices[valid_indices], steps[valid_indices]
         ]
 
+
 def update_ple_state_after_mtp_verify(
     req_to_token_pool,
     state_indices_tensor: torch.Tensor,
@@ -1599,10 +1600,7 @@ def update_ple_state_after_mtp_verify(
         )
 
     ngram_pool = req_to_token_pool.ngram_pool
-    if (
-        ngram_pool.context is not None
-        and ngram_pool.intermediate_context is not None
-    ):
+    if ngram_pool.context is not None and ngram_pool.intermediate_context is not None:
         state_pairs.append(
             (
                 ngram_pool.context.unsqueeze(0),

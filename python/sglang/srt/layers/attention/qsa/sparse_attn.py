@@ -769,7 +769,9 @@ def _gather_dequant_fp4_kv(
             sf = sf.to(tl.float32)
             for _ in tl.static_range(4):
                 sf = tl.interleave(sf, sf)
-            tl.store(out + dst, ((vals * sf) * gs).to(out_dtype), mask=store_cols[:, None])
+            tl.store(
+                out + dst, ((vals * sf) * gs).to(out_dtype), mask=store_cols[:, None]
+            )
 
 
 def qwen_sparse_kv_gather_dequant_fp4_triton(
