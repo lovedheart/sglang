@@ -36,6 +36,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.fp8_lm_head import quantize_lm_head_to_fp8_block128
 from sglang.srt.layers.hyperconnection import (
     GatedResidual,
     HyperConnectionConfig,
@@ -82,7 +83,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -2443,7 +2444,20 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
 
+        self._maybe_quantize_lm_head_fp8_blockwise()
+
         return loaded_params
+
+    def _maybe_quantize_lm_head_fp8_blockwise(self) -> None:
+        # One-shot swap at load time, never lazy: the decode CUDA graphs must
+        # capture the final head form. The NEXTN draft shares this module via
+        # set_lm_head_from_target, so quantizing here covers both runners.
+        if not get_exec().features.enable_fp8_lm_head:
+            return
+        if not self.pp_group.is_last_rank or self.config.tie_word_embeddings:
+            return
+        if quantize_lm_head_to_fp8_block128(self.lm_head):
+            logger.info("Quantized lm_head to FP8 e4m3 with 128x128 block scales")
 
     def precompile_kernels_after_loading(self) -> None:
         from sglang.srt.layers.quantization.unquant import precompile_splitk_tactics
