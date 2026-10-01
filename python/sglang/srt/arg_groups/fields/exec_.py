@@ -41,6 +41,10 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "If set, the LM head outputs (logits) are in FP32.",
     ] = False
+    enable_fp8_lm_head: A[
+        bool,
+        "Store the LM head weight in FP8 e4m3 with 128x128 block scales (SM120 only, ignored elsewhere), halving decode-time head memory traffic.",
+    ] = False
     enable_tf32_matmul: A[
         bool,
         Arg(

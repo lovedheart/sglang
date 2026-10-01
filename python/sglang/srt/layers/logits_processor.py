@@ -44,6 +44,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.fp8_lm_head import fp8_blockwise_lm_head_apply
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
     LogprobStage,
@@ -973,7 +974,12 @@ class LogitsProcessor(nn.Module):
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
-            if self.use_fp32_lm_head:
+            if lm_head.weight.dtype == torch.float8_e4m3fn:
+                # Load-time block-quantized head (--enable-fp8-lm-head, SM120)
+                logits = fp8_blockwise_lm_head_apply(
+                    lm_head, hidden_states, bias=embedding_bias
+                )
+            elif self.use_fp32_lm_head:
                 # Avoid materializing FP32 copies for same-dtype CUDA FP16/BF16
                 # inputs. Retain explicit FP32 casts for unsupported devices or
                 # dtype combinations.
