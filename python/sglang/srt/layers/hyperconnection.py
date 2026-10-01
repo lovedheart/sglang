@@ -5,7 +5,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.kernels.ops.gemm.hc_mix import (
+    fused_hc_mix,
+    fused_hc_mix_fold,
+    fused_hc_mix_fold_supported,
+    fused_hc_mix_supported,
+    hc_norm_fold_enabled,
+)
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -178,6 +184,21 @@ class GatedResidual(HyperConnectionBase):
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
 
+        # Norm-weight folding (TileKernels-style): the RMSNorm weight and the
+        # per-branch rsqrt factors are folded into the down/inject projections
+        # and the gate-apply, so the normed residual is never materialized.
+        self._use_mix = use_mix
+        self._use_combine = use_combine
+        self._norm_fold_ok = (
+            use_mix
+            and config.hc_per_branch_norm
+            and hc_norm_fold_enabled()
+            and torch.cuda.is_available()
+        )
+        self._wn = None
+        self._w_down_fold = None
+        self._w_inject_fold = None
+
         def _mix_compute(
             hyper_input_normed: torch.Tensor,
             input_mix_weight_down: torch.Tensor,
@@ -213,8 +234,69 @@ class GatedResidual(HyperConnectionBase):
             )
             return (R + injection).flatten(-2)
 
+        def _mix_folded(
+            hyper_input: torch.Tensor,
+            w_down_fold: torch.Tensor,
+            input_mix_weight_up: torch.Tensor,
+            wn: torch.Tensor,
+            hc: int,
+            hs: int,
+            eps: float,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            # Same math as _mix_compute with norm(x) = x * wn * g expanded:
+            # per-branch partial down-projections, g applied after the GEMM.
+            x3 = hyper_input.unflatten(-1, (hc, hs))
+            xf = x3.float()
+            g = torch.rsqrt(xf.square().mean(-1) + eps)
+            partials = torch.matmul(
+                x3.transpose(0, 1),
+                w_down_fold.view(w_down_fold.shape[0], hc, hs).permute(1, 2, 0),
+            )
+            down = torch.einsum("bnl,nb->nl", partials.float(), g) / hc
+            h = F.silu(down).to(hyper_input.dtype)
+            input_mix_weight = F.linear(h, input_mix_weight_up).unflatten(-1, (hc, hs))
+            gate = torch.sigmoid(input_mix_weight)
+            output = (gate * (xf * wn.unflatten(-1, (hc, hs)) * g.unsqueeze(-1))).sum(
+                dim=-2
+            ) / hc
+            return output.to(hyper_input.dtype), g
+
+        def _combine_folded(
+            block_output: torch.Tensor,
+            residual: torch.Tensor,
+            g: torch.Tensor,
+            w_inject_fold: torch.Tensor,
+            hc: int,
+            hs: int,
+        ) -> torch.Tensor:
+            R = residual.unflatten(-1, (hc, hs))
+            partials = torch.matmul(
+                R.transpose(0, 1), w_inject_fold.view(hc, hc, hs).permute(1, 2, 0)
+            )
+            gate_in = torch.einsum("bnc,nb->nc", partials.float(), g)
+            a = 2 * torch.sigmoid(gate_in / hc)
+            return (R + block_output.unsqueeze(-2) * a.unsqueeze(-1)).flatten(-2)
+
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
+        self._mix_folded = torch.compile(_mix_folded)
+        self._combine_folded = torch.compile(_combine_folded)
+
+    def _ensure_fold_weights(self) -> None:
+        # First eager call (weights are loaded before any forward), so folding
+        # once here is CUDA-graph safe.
+        if self._wn is not None:
+            return
+        wn = (1.0 + self.hc_norm.weight.float()).contiguous()
+        self._wn = wn
+        if self._use_mix:
+            w_down = self.input_mix_weight_down.weight
+            self._w_down_fold = (w_down.float() * wn).to(w_down.dtype).contiguous()
+        if self._use_combine:
+            w_inject = self.block_inject_weight.weight
+            self._w_inject_fold = (
+                (w_inject.float() * wn).to(w_inject.dtype).contiguous()
+            )
 
     def mix(self, hyper_input: torch.Tensor):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
@@ -222,7 +304,41 @@ class GatedResidual(HyperConnectionBase):
             mixed_input = hyper_input.new_empty(
                 (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
             )
-            return mixed_input, (hyper_input, hyper_input)
+            return mixed_input, (hyper_input, hyper_input, None)
+
+        # The CuTe split-K pair wants the normed residual and only exists on
+        # sm_100 at decode sizes; there, keep the unfused norm.
+        fold = (
+            self._norm_fold_ok
+            and hyper_input.is_cuda
+            and hyper_input.dtype in (torch.bfloat16, torch.float16)
+            and not (self._jit_mix_ok and hyper_input.shape[0] <= 24)
+        )
+        if fold:
+            self._ensure_fold_weights()
+            if fused_hc_mix_fold_supported(
+                hyper_input, self._w_down_fold, self.input_mix_weight_up.weight
+            ):
+                mixed_input, norm_g = fused_hc_mix_fold(
+                    hyper_input,
+                    self._w_down_fold,
+                    self.input_mix_weight_up.weight,
+                    self._wn,
+                    self.hc_count,
+                    self.hidden_size,
+                    self.config.rms_norm_eps,
+                )
+            else:
+                mixed_input, norm_g = self._mix_folded(
+                    hyper_input,
+                    self._w_down_fold,
+                    self.input_mix_weight_up.weight,
+                    self._wn,
+                    self.hc_count,
+                    self.hidden_size,
+                    self.config.rms_norm_eps,
+                )
+            return mixed_input.to(self.params_dtype), (hyper_input, None, norm_g)
 
         if self.config.hc_per_branch_norm:
             hyper_input_normed = self.hc_norm(hyper_input)
@@ -272,14 +388,54 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
-        return mixed_input, (hyper_input, hyper_input_normed)
+        return mixed_input, (hyper_input, hyper_input_normed, None)
 
     def combine(self, block_output: torch.Tensor, residuals) -> torch.Tensor:
-        hyper_input, hyper_input_normed = residuals
+        hyper_input, hyper_input_normed, norm_g = residuals
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         assert block_output.shape[-1] == self.hidden_size
         if block_output.shape[0] == 0:
             return hyper_input.to(self.params_dtype)
+
+        if norm_g is not None:
+            self._ensure_fold_weights()
+            if (
+                self._jit_combine_ok
+                and block_output.is_cuda
+                and block_output.dtype in (torch.bfloat16, torch.float16)
+                and hyper_input.dtype == block_output.dtype
+                and self._w_inject_fold.dtype == block_output.dtype
+            ):
+                from sglang.kernels.ops.elementwise.hc_combine import (
+                    hc_combine_fold,
+                    hc_combine_split_fold,
+                )
+
+                if self._split_combine_ok and block_output.shape[0] <= 32:
+                    return hc_combine_split_fold(
+                        block_output,
+                        hyper_input,
+                        norm_g,
+                        self._w_inject_fold,
+                        self.hc_count,
+                        self.hidden_size,
+                    )
+                return hc_combine_fold(
+                    block_output,
+                    hyper_input,
+                    norm_g,
+                    self._w_inject_fold,
+                    self.hc_count,
+                    self.hidden_size,
+                )
+            return self._combine_folded(
+                block_output,
+                hyper_input,
+                norm_g,
+                self._w_inject_fold,
+                self.hc_count,
+                self.hidden_size,
+            ).to(self.params_dtype)
 
         if (
             self._jit_combine_ok

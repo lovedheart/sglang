@@ -17,6 +17,7 @@ struct HcCombineParams {
   const void* residual;         // [M, HC * H]
   const void* normed_residual;  // [M, HC * H]
   const void* inject_weight;    // [HC, HC * H]
+  const float* g;               // [M, HC] per-branch rsqrt factors (norm-fold only)
   void* output;                 // [M, HC * H]
 };
 
@@ -37,7 +38,7 @@ struct HcCombineParams {
  * \tparam kUsePDL     Whether to emit the PDL wait/trigger pair.
  * \tparam Float       Element type: bf16_t | fp16_t.
  */
-template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename Float>
+template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, bool kFoldNorm, typename Float>
 __global__ __launch_bounds__(256) void hc_combine_kernel(const HcCombineParams __grid_constant__ params) {
   using namespace device;
   using Float2 = packed_t<Float>;
@@ -55,13 +56,16 @@ __global__ __launch_bounds__(256) void hc_combine_kernel(const HcCombineParams _
 
   const auto y_ptr = pointer::offset<Float>(params.block_output, static_cast<int64_t>(m) * kHiddenSize);
   const auto r_ptr = pointer::offset<Float>(params.residual, static_cast<int64_t>(m) * kRowSize);
-  const auto n_ptr = pointer::offset<Float>(params.normed_residual, static_cast<int64_t>(m) * kRowSize);
   const auto w_ptr = static_cast<const Float*>(params.inject_weight);
   const auto out_ptr = pointer::offset<Float>(params.output, static_cast<int64_t>(m) * kRowSize);
 
   PDLWaitPrimary<kUsePDL>();
 
   // Phase 1: gate values a_c, accumulated in fp32 and reduced across the CTA.
+  // Under norm-folding the dot reads the raw residual (scaled per branch by
+  // g) against the (1 + norm_weight)-folded inject weight.
+  const void* const dot_src = kFoldNorm ? params.residual : params.normed_residual;
+  const auto n_ptr = pointer::offset<Float>(dot_src, static_cast<int64_t>(m) * kRowSize);
   Storage n_vec[kVecsPerThread];
 #pragma unroll
   for (uint32_t j = 0; j < kVecsPerThread; ++j) {
@@ -76,11 +80,16 @@ __global__ __launch_bounds__(256) void hc_combine_kernel(const HcCombineParams _
 #pragma unroll
     for (uint32_t j = 0; j < kVecsPerThread; ++j) {
       const Storage w_vec = gmem.load(wc_ptr, j);
+      float g_scale = 1.0f;
+      if constexpr (kFoldNorm) {
+        const uint32_t vec_idx = threadIdx.x + j * kNumThreads;
+        g_scale = params.g[static_cast<int64_t>(m) * kHcCount + vec_idx / kVecsPerBranch];
+      }
 #pragma unroll
       for (uint32_t i = 0; i < kVecLen / 2; ++i) {
         const auto [nx, ny] = cast<fp32x2_t>(n_vec[j][i]);
         const auto [wx, wy] = cast<fp32x2_t>(w_vec[i]);
-        sum += nx * wx + ny * wy;
+        sum += g_scale * (nx * wx + ny * wy);
       }
     }
     acc[c] = warp::reduce_sum(sum);
@@ -138,7 +147,8 @@ struct HcCombineKernel {
   static_assert(kHcCount > 0, "kHcCount must be positive");
   static_assert(kHiddenSize > 0 && kHiddenSize % 8 == 0, "kHiddenSize must be a multiple of 8");
   static_assert((kHcCount * kHiddenSize) % (256 * 8) == 0, "kHcCount * kHiddenSize must be a multiple of 2048");
-  static constexpr auto kernel = hc_combine_kernel<kHcCount, kHiddenSize, kUsePDL, DType>;
+  static constexpr auto kernel = hc_combine_kernel<kHcCount, kHiddenSize, kUsePDL, false, DType>;
+  static constexpr auto kernel_fold = hc_combine_kernel<kHcCount, kHiddenSize, kUsePDL, true, DType>;
   static constexpr uint32_t kBlockSize = 256;
 
   /**
@@ -180,12 +190,59 @@ struct HcCombineKernel {
         .residual = residual.data_ptr(),
         .normed_residual = normed_residual.data_ptr(),
         .inject_weight = inject_weight.data_ptr(),
+        .g = nullptr,
         .output = output.data_ptr(),
     };
 
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
     LaunchKernel(num_tokens, kBlockSize, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
+  }
+
+  /**
+   * \brief Norm-folded variant: the inject dot reads the raw residual scaled
+   * by per-branch rsqrt factors g instead of a materialized normed residual.
+   * \param block_output   [M, H] contiguous
+   * \param residual       [M, HC * H] contiguous
+   * \param g              [M, HC] contiguous fp32 per-branch rsqrt factors
+   * \param inject_weight  [HC, HC * H] contiguous, (1 + norm_weight)-folded
+   * \param output         [M, HC * H] contiguous
+   */
+  static void run_fold(
+      const tvm::ffi::TensorView block_output,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView g,
+      const tvm::ffi::TensorView inject_weight,
+      const tvm::ffi::TensorView output) {
+    using namespace host;
+    auto M = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({M, kHiddenSize}).with_dtype<DType>().with_device(device).verify(block_output);
+    TensorMatcher({M, kHcCount * kHiddenSize})  // residual, output
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(residual)
+        .verify(output);
+    TensorMatcher({M, kHcCount}).with_dtype<fp32_t>().with_device(device).verify(g);
+    TensorMatcher({kHcCount, kHcCount * kHiddenSize})  // inject_weight
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(inject_weight);
+
+    const auto params = HcCombineParams{
+        .block_output = block_output.data_ptr(),
+        .residual = residual.data_ptr(),
+        .normed_residual = nullptr,
+        .inject_weight = inject_weight.data_ptr(),
+        .g = static_cast<const float*>(g.data_ptr()),
+        .output = output.data_ptr(),
+    };
+
+    const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    LaunchKernel(num_tokens, kBlockSize, device.unwrap())  //
+        .enable_pdl(kUsePDL)(kernel_fold, params);
   }
 };
 
@@ -194,6 +251,7 @@ struct HcCombineSplitParams {
   const void* residual;
   const void* normed_residual;
   const void* inject_weight;
+  const float* g;
   void* output;
   float* partials;
 };
@@ -219,7 +277,7 @@ constexpr uint32_t kVecLen = 8;
  * kSplit CTAs. Each CTA writes its own partials slot, so no atomics and no
  * buffer clearing are needed.
  */
-template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename Float>
+template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, bool kFoldNorm, typename Float>
 __global__ __launch_bounds__(hc_combine_split_detail::kGateThreads) void hc_combine_gate_kernel(
     const HcCombineSplitParams __grid_constant__ params) {
   using namespace device;
@@ -238,7 +296,10 @@ __global__ __launch_bounds__(hc_combine_split_detail::kGateThreads) void hc_comb
   const uint32_t c = blockIdx.y % kHcCount;
   const uint32_t ref_tid = split * kGateThreads + threadIdx.x;
 
-  const auto n_ptr = pointer::offset<Float>(params.normed_residual, static_cast<int64_t>(m) * kRowSize);
+  constexpr uint32_t kVecsPerBranch = kHiddenSize / kVecLen;
+
+  const void* const dot_src = kFoldNorm ? params.residual : params.normed_residual;
+  const auto n_ptr = pointer::offset<Float>(dot_src, static_cast<int64_t>(m) * kRowSize);
   const auto w_ptr = static_cast<const Float*>(params.inject_weight);
 
   PDLWaitPrimary<kUsePDL>();
@@ -256,11 +317,16 @@ __global__ __launch_bounds__(hc_combine_split_detail::kGateThreads) void hc_comb
     for (uint32_t j = 0; j < kVecsPerThread; ++j) {
       Storage w_vec;
       w_vec.load(wc_ptr, ref_tid + j * kRefThreads);
+      float g_scale = 1.0f;
+      if constexpr (kFoldNorm) {
+        const uint32_t vec_idx = ref_tid + j * kRefThreads;
+        g_scale = params.g[static_cast<int64_t>(m) * kHcCount + vec_idx / kVecsPerBranch];
+      }
 #pragma unroll
       for (uint32_t i = 0; i < kVecLen / 2; ++i) {
         const auto [nx, ny] = cast<fp32x2_t>(n_vec[j][i]);
         const auto [wx, wy] = cast<fp32x2_t>(w_vec[i]);
-        sum += nx * wx + ny * wy;
+        sum += g_scale * (nx * wx + ny * wy);
       }
     }
     sum = warp::reduce_sum(sum);
@@ -335,7 +401,8 @@ __global__ __launch_bounds__(hc_combine_split_detail::kApplyThreads) void hc_com
 template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename DType>
 struct HcCombineSplitKernel {
   static_assert(sizeof(DType) == 2, "HcCombine only supports 2-byte dtypes");
-  static constexpr auto gate_kernel = hc_combine_gate_kernel<kHcCount, kHiddenSize, kUsePDL, DType>;
+  static constexpr auto gate_kernel = hc_combine_gate_kernel<kHcCount, kHiddenSize, kUsePDL, false, DType>;
+  static constexpr auto gate_kernel_fold = hc_combine_gate_kernel<kHcCount, kHiddenSize, kUsePDL, true, DType>;
   static constexpr auto apply_kernel = hc_combine_apply_kernel<kHcCount, kHiddenSize, kUsePDL, DType>;
 
   static void
@@ -367,6 +434,7 @@ struct HcCombineSplitKernel {
         .residual = residual.data_ptr(),
         .normed_residual = normed_residual.data_ptr(),
         .inject_weight = inject_weight.data_ptr(),
+        .g = nullptr,
         .output = output.data_ptr(),
         .partials = static_cast<float*>(partials.data_ptr()),
     };
@@ -374,6 +442,46 @@ struct HcCombineSplitKernel {
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
     LaunchKernel(dim3(num_tokens, kSplit * kHcCount, 1), kGateThreads, device.unwrap())
         .enable_pdl(kUsePDL)(gate_kernel, params);
+    LaunchKernel(dim3(num_tokens, kSplit, 1), kApplyThreads, device.unwrap()).enable_pdl(kUsePDL)(apply_kernel, params);
+  }
+
+  /**
+   * \brief Norm-folded variant of run(): the gate dot reads the raw residual
+   * scaled by per-branch rsqrt factors g instead of a normed residual.
+   */
+  static void run_fold(
+      const tvm::ffi::TensorView block_output,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView g,
+      const tvm::ffi::TensorView inject_weight,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView partials) {
+    using namespace host;
+    using namespace hc_combine_split_detail;
+    auto M = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({M, kHiddenSize}).with_dtype<DType>().with_device(device).verify(block_output);
+    TensorMatcher({M, kHcCount * kHiddenSize}).with_dtype<DType>().with_device(device).verify(residual).verify(output);
+    TensorMatcher({M, kHcCount}).with_dtype<fp32_t>().with_device(device).verify(g);
+    TensorMatcher({kHcCount, kHcCount * kHiddenSize}).with_dtype<DType>().with_device(device).verify(inject_weight);
+    auto part_rows = SymbolicSize{"partial_rows"};
+    TensorMatcher({part_rows, kSplit, kHcCount}).with_dtype<fp32_t>().with_device(device).verify(partials);
+
+    const auto params = HcCombineSplitParams{
+        .block_output = block_output.data_ptr(),
+        .residual = residual.data_ptr(),
+        .normed_residual = nullptr,
+        .inject_weight = inject_weight.data_ptr(),
+        .g = static_cast<const float*>(g.data_ptr()),
+        .output = output.data_ptr(),
+        .partials = static_cast<float*>(partials.data_ptr()),
+    };
+
+    const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    LaunchKernel(dim3(num_tokens, kSplit * kHcCount, 1), kGateThreads, device.unwrap())
+        .enable_pdl(kUsePDL)(gate_kernel_fold, params);
     LaunchKernel(dim3(num_tokens, kSplit, 1), kApplyThreads, device.unwrap()).enable_pdl(kUsePDL)(apply_kernel, params);
   }
 };
