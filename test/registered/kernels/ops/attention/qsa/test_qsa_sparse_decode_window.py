@@ -98,8 +98,20 @@ def _world(rows, junk_cols, device, seed):
 
 def _fused(fn, q, k, v, req, r2t, seq, idx):
     return fn(
-        q, k, v, None, None, None, None, idx, r2t, req, seq,
-        1.0 / math.sqrt(DIM), False, {},
+        q,
+        k,
+        v,
+        None,
+        None,
+        None,
+        None,
+        idx,
+        r2t,
+        req,
+        seq,
+        1.0 / math.sqrt(DIM),
+        False,
+        {},
     )
 
 

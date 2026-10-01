@@ -29,7 +29,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 # Tokens per split-program iteration; one 64-token page is the GEMM sub-tile.
 _CHUNK = 64
 _MAX_SPLITS = 33  # 33 * 64 = 2112 >= final_topk = token_topk + ratio - 1 (2051)

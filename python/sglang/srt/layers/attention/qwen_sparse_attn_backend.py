@@ -2029,11 +2029,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             fused_fp4=fused_fp4,
             gathered_rows=gathered_rows,
         )
-        native_fp4 = (
-            fused_fp4
-            and self._native_fp4_decode
-            and q.dtype == torch.bfloat16
-        )
+        native_fp4 = fused_fp4 and self._native_fp4_decode and q.dtype == torch.bfloat16
         if native_fp4:
             scratch_dtype = torch.uint8
         packed_k, packed_v = self._get_fa2_scratch(
@@ -2182,9 +2178,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             # The kernel applies only the per-block SFs; fold the pool's global
             # scales into the bmm scales (graph-safe fp32 tensor views).
             method = self.kv_cache_quant_method
-            bmm1 = layer.scaling * method.k_scales_gpu[
-                layer.layer_id : layer.layer_id + 1
-            ]
+            bmm1 = (
+                layer.scaling * method.k_scales_gpu[layer.layer_id : layer.layer_id + 1]
+            )
             bmm2 = method.v_scales_gpu[layer.layer_id : layer.layer_id + 1]
         else:
             kc = kv_rows.view(-1, page, num_kv_heads, head_dim).permute(0, 2, 1, 3)
@@ -2214,7 +2210,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             block_tables=block_tables,
             seq_lens=valid_counts,
             max_seq_len=stride,
-           bmm1_scale=bmm1,
+            bmm1_scale=bmm1,
             bmm2_scale=bmm2,
             **({"kv_cache_sf": kv_cache_sf} if native_fp4 else {}),
         )

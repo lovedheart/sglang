@@ -402,13 +402,16 @@ class TestReplaySSMFoldPleCommit(CustomTestCase):
         return target_worker
 
     def _run(self, target_worker, batch, accept_lens, accept_index):
-        with patch(
-            "sglang.srt.speculative.spec_utils.mambaish_config",
-            return_value={"some": "config"},
-        ), patch(
-            "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold."
-            "commit_gdn_replayssm_fold_after_verify"
-        ) as fold:
+        with (
+            patch(
+                "sglang.srt.speculative.spec_utils.mambaish_config",
+                return_value={"some": "config"},
+            ),
+            patch(
+                "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold."
+                "commit_gdn_replayssm_fold_after_verify"
+            ) as fold,
+        ):
             from sglang.srt.speculative.spec_utils import (
                 commit_mamba_states_after_verify,
             )

@@ -149,9 +149,8 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         return (
             self.token_slot_table[
                 sequence_id,
-                : complete_blocks * self.compress_ratio : self.compress_ratio
-            ]
-            .long()
+                : complete_blocks * self.compress_ratio : self.compress_ratio,
+            ].long()
             // self.compress_ratio
         )
 
@@ -216,14 +215,15 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
                     block_ends, entries, right=True
                 ).clamp(max=sequence_lengths.numel() - 1)
                 block_offsets = (
-                    entries - (block_ends - complete_blocks).index_select(0, sequence_ids)
+                    entries
+                    - (block_ends - complete_blocks).index_select(0, sequence_ids)
                 ) * ratio
                 # DSV4-style addressing: a group's compressed slot is its
                 # first raw slot // ratio (the page-aligned allocator keeps
                 # the group contiguous in one page).
-                compressed_locs = self.token_slot_table[
-                    sequence_ids, block_offsets
-                ].long() // ratio
+                compressed_locs = (
+                    self.token_slot_table[sequence_ids, block_offsets].long() // ratio
+                )
                 compressed_keys = compressed_buffer.index_select(0, compressed_locs)
             else:
                 compressed_keys = compressed_buffer.new_empty(
@@ -362,7 +362,9 @@ def build_group_ring_slots(
     stride = qsa_ring_stride(compress_ratio)
     requests = req_pool_indices.long()[sequence_ids]
     offsets = torch.arange(
-        compress_ratio - 1, -1, -1,
+        compress_ratio - 1,
+        -1,
+        -1,
         device=group_end_positions.device,
         dtype=torch.long,
     )
