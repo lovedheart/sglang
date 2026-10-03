@@ -1,10 +1,10 @@
-"""CPU contracts for the QSA compressed-K HiCache sidecar.
+"""CPU contracts for QSA compressed-K HiCache backing (INDEXER sidecar).
 
-Covers the three seams the feature touches:
-  1. ``QSATokenToKVPool.qsa_hicache_regions`` page-group view math.
-  2. ``DeepSeekV4PagedHostPool._to_page_indices`` composition with that view:
-     a KV token index must land on the compressed-slot block of its page.
-  3. ``_MambaStrategy`` wiring: sidecar spec registration + fail-loud guards.
+The compressed-K mirror rides the upstream INDEXER sidecar
+(``QSAIndexerPoolHost``, #39893); the branch-local QSA_COMPRESSED_K
+KV-derived sidecar was retired in favour of it.  What remains covered
+here: the page-group row algebra the host pool relies on, the
+``_MambaStrategy`` wiring, and its fail-loud guards.
 """
 
 import unittest
@@ -31,6 +31,7 @@ HEAD_DIM = 4
 GROUPS_PER_PAGE = PAGE // RATIO
 SLOTS = PAGES * PAGE
 CAP = SLOTS // RATIO
+ITEM_BYTES = GROUPS_PER_PAGE * HEAD_DIM * torch.bfloat16.itemsize
 
 
 def _make_pool():
@@ -39,25 +40,37 @@ def _make_pool():
     pool.qsa_index_kv_heads = 1
     pool.qsa_index_head_dim = HEAD_DIM
     pool.qsa_compressed_capacity = CAP
+    pool.qsa_compressed_dtype = torch.bfloat16
     flat = torch.zeros(LAYERS, CAP * HEAD_DIM, dtype=torch.bfloat16)
     # Compressed slot j of layer l encodes value 1000*l + j in every head.
     for lyr in range(LAYERS):
         flat[lyr] = torch.repeat_interleave(
             torch.arange(CAP, dtype=torch.bfloat16) + 1000 * lyr, HEAD_DIM
         )
-    pool.qsa_compressed_flat = flat
+    # Same per-layer [capacity, heads, dim] views the real pool exposes.
+    pool.qsa_compressed_k_buffer_pool = [
+        flat[lyr].view(CAP, 1, HEAD_DIM) for lyr in range(LAYERS)
+    ]
     return pool
 
 
-class TestQSAHiCacheRegions(CustomTestCase):
+def _host_rows(pool):
+    """Buffer-row views built exactly as QSAIndexerPoolHost builds them."""
+    return [
+        b.view(torch.uint8).reshape(-1, ITEM_BYTES)
+        for b in pool.qsa_compressed_k_buffer_pool
+    ]
+
+
+class TestIndexerRowMath(CustomTestCase):
+    def _host_pool_view(self):
+        return SimpleNamespace(slot_page_size=PAGE)
+
     def test_rows_map_to_page_contiguous_group_blocks(self):
         pool = _make_pool()
-        buffers, row_bytes = pool.qsa_hicache_regions(page_size=PAGE)
+        buffers = _host_rows(pool)
         self.assertEqual(len(buffers), LAYERS)
-        self.assertEqual(
-            row_bytes, GROUPS_PER_PAGE * HEAD_DIM * torch.bfloat16.itemsize
-        )
-        self.assertEqual(tuple(buffers[0].shape), (SLOTS // PAGE, row_bytes))
+        self.assertEqual(tuple(buffers[0].shape), (SLOTS // PAGE, ITEM_BYTES))
         for lyr in range(LAYERS):
             rows = buffers[lyr].view(torch.bfloat16).view(-1, GROUPS_PER_PAGE, HEAD_DIM)
             for r in range(SLOTS // PAGE):
@@ -72,19 +85,9 @@ class TestQSAHiCacheRegions(CustomTestCase):
                     msg=f"layer {lyr} page {r}: expected group ids {expect.tolist()}",
                 )
 
-    def test_rejects_page_not_multiple_of_ratio(self):
-        pool = _make_pool()
-        with self.assertRaises(ValueError):
-            pool.qsa_hicache_regions(page_size=RATIO + 1)
-
-
-class TestSidecarRowMath(CustomTestCase):
-    def _host_pool_view(self):
-        return SimpleNamespace(slot_page_size=PAGE)
-
     def test_kv_index_to_row_lands_on_group_block(self):
         pool = _make_pool()
-        buffers, _ = pool.qsa_hicache_regions(page_size=PAGE)
+        buffers = _host_rows(pool)
         # The executor always passes full page-aligned token vectors.
         kv_indices = torch.arange(0, SLOTS)
         rows = DeepSeekV4PagedHostPool._to_page_indices(
@@ -102,7 +105,7 @@ class TestSidecarRowMath(CustomTestCase):
     def test_backup_then_restore_into_different_pages(self):
         """Emulate the executor's index algebra end to end (pure torch)."""
         pool = _make_pool()
-        buffers, _ = pool.qsa_hicache_regions(page_size=PAGE)
+        buffers = _host_rows(pool)
         dev = buffers[0].view(torch.bfloat16).view(-1, GROUPS_PER_PAGE, HEAD_DIM)
         host = torch.zeros(
             SLOTS // PAGE, GROUPS_PER_PAGE, HEAD_DIM, dtype=torch.bfloat16
@@ -180,14 +183,14 @@ class TestMambaStrategyWiring(CustomTestCase):
             )
         return result, built
 
-    def test_qsa_pool_registers_kv_derived_sidecar(self):
+    def test_qsa_pool_registers_indexer_sidecar(self):
         result, built = self._run_build(host_mode="cache", page_size=PAGE)
-        self.assertIs(built.call_args.kwargs["qsa_kvcache"].__class__, QSATokenToKVPool)
+        self.assertIs(built.call_args.kwargs["qsa_pool"].__class__, QSATokenToKVPool)
         self.assertEqual(len(result.sidecars), 1)
         spec = result.sidecars[0]
-        self.assertIs(spec.pool_name, PoolName.QSA_COMPRESSED_K)
+        self.assertIs(spec.pool_name, PoolName.INDEXER)
         self.assertIs(spec.indices_from_pool, PoolName.KV)
-        self.assertIn("QSA", result.pools_desc)
+        self.assertIn("INDEXER", result.pools_desc)
 
     def test_buffer_only_mode_fails_loud(self):
         with self.assertRaises(NotImplementedError):
