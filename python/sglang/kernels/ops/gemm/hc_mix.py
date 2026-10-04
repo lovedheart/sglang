@@ -154,6 +154,21 @@ def _get_counters(device: torch.device) -> torch.Tensor:
     return buf
 
 
+_ss_cache = {}
+
+
+def _get_ss(device: torch.device, n: int) -> torch.Tensor:
+    # Persistent, kept-zero-between-launches ss buffer (the fold kernel's
+    # final CTA re-zeroes it). torch.empty here would feed garbage into the
+    # ss atomic accumulation, so it must start zeroed like _get_counters.
+    key = (device, n)
+    buf = _ss_cache.get(key)
+    if buf is None:
+        buf = torch.zeros(n, dtype=torch.float32, device=device)
+        _ss_cache[key] = buf
+    return buf
+
+
 def _deterministic_inference() -> bool:
     from sglang.srt.runtime_context import get_exec
 
@@ -269,9 +284,10 @@ def _hc_mix_persistent_fold_kernel(
     for z0 in range(pid * 256, zero_span, num_ctas * 256):
         idx = z0 + offs_z
         tl.store(t_raw_ptr + idx, 0.0, mask=idx < zero_span)
-    if pid == 0:
-        offs_s = tl.arange(0, 64)
-        tl.store(ss_ptr + offs_s, 0.0, mask=offs_s < ROWS * HC)
+    # NB: ss is NOT zeroed at launch. The old pid==0-only zero store sat
+    # before any barrier and raced with the ss atomic_adds below (observed
+    # output corruption, maxdiff ~2). ss is a persistent per-device buffer
+    # kept at zero by the final-ticket CTA reset at the end of this kernel.
     offs_k0 = tl.arange(0, BLOCK_K)
     k_chunks = tl.cdiv(K, BLOCK_K)
     k_per_branch = HS // BLOCK_K
@@ -392,9 +408,18 @@ def _hc_mix_persistent_fold_kernel(
 
     ticket = tl.atomic_add(counters_ptr + 2, 1, sem="acq_rel", scope="gpu")
     if ticket == num_ctas - 1:
+        # Every CTA has now passed both barriers and finished its ss reads
+        # (all ss loads precede its ticket increment past barrier 1), so the
+        # final CTA can safely reset the barriers and re-zero ss for the next
+        # launch. ss must NOT be zeroed at kernel entry: the pid==0-only zero
+        # store there raced with peers' atomic_adds (observed corruption).
         tl.store(counters_ptr + 0, 0)
         tl.store(counters_ptr + 1, 0)
         tl.store(counters_ptr + 2, 0)
+        offs_s = tl.arange(0, 256)
+        for z0 in range(0, ROWS * HC, num_ctas * 256):
+            idx_s = z0 + offs_s
+            tl.store(ss_ptr + idx_s, 0.0, mask=idx_s < ROWS * HC)
 
 
 def fused_hc_mix_fold_supported(
@@ -436,7 +461,7 @@ def fused_hc_mix_fold(
     device = hyper_input.device
     num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
     t_raw = torch.empty((rows_pad, lowrank), dtype=torch.float32, device=device)
-    ss = torch.empty((rows_pad * hc,), dtype=torch.float32, device=device)
+    ss = _get_ss(device, rows_pad * hc)
     g = torch.empty((rows, hc), dtype=torch.float32, device=device)
     out = torch.empty((rows, hs), dtype=hyper_input.dtype, device=device)
     if rows == 0:
