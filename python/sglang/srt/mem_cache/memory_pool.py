@@ -1476,16 +1476,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
             device=device,
+            # PLE side rows ride along the int8 checkpoint (verbatim, no
+            # requantization); the donated active slot is freed as before.
+            side_states=[
+                (self.short_conv_pool.conv_state, 1)
+                if self.short_conv_pool.enabled
+                else None,
+                (self.ngram_pool.context, 0) if self.ngram_pool.enabled else None,
+            ],
         )
-        if self.mamba_ckpt_pool is not None and (
-            self.short_conv_pool.enabled or self.ngram_pool.enabled
-        ):
-            # The int8 checkpoint pool frees the bf16 slot after donating its state,
-            # taking the bf16-slot-indexed PLE side states with it.
-            raise ValueError(
-                "--enable-int8-mamba-checkpoint is incompatible with Qwen4-Exp "
-                "PLE side states"
-            )
 
         self.device = device
         req_pool_size = self.req_to_token.shape[0]
