@@ -32,8 +32,10 @@ class GatedResidualState:
     Unlike the hyper-connection streams in mhc.py and ihc.py, whose read
     produces the coefficient its write-back consumes, the coefficient here is
     computed at write time. What has to survive from a stage's read to its
-    write-back is therefore the normalized residual itself, which this state
-    holds. Parameters belong to the owning layer's modules.
+    write-back is therefore the normalized residual itself -- or, when the norm
+    weight is folded into the projections and no normed residual is
+    materialized, the per-branch norm factors it was folded from -- which this
+    state holds. Parameters belong to the owning layer's modules.
 
     Args:
         expand: Widens the layer stack's input into the stream representation,
@@ -53,6 +55,7 @@ class GatedResidualState:
     ffn_combine: Callable
     # Produced by a stage's read and consumed by that same stage's write-back.
     normed: Optional[torch.Tensor] = None
+    norm_g: Optional[torch.Tensor] = None
 
     def _read(self, mix, residual, out_norm):
         if out_norm is not None:
@@ -60,7 +63,7 @@ class GatedResidualState:
                 "a gated hyper-connection read with a separate norm; the read "
                 "normalizes the streams itself"
             )
-        hidden_states, (residual, self.normed) = mix(residual)
+        hidden_states, (residual, self.normed, self.norm_g) = mix(residual)
         return hidden_states, residual
 
     def read_attn_input(self, residual, out_norm=None):
@@ -71,18 +74,22 @@ class GatedResidualState:
         return self._read(self.ffn_mix, residual, out_norm)
 
     def apply_attn_combine(self, hidden_states, residual):
-        return self.attn_combine(hidden_states, (residual, self.normed))
+        return self.attn_combine(hidden_states, (residual, self.normed, self.norm_g))
 
     def apply_ffn_combine(self, hidden_states, residual):
-        return self.ffn_combine(hidden_states, (residual, self.normed))
+        return self.ffn_combine(hidden_states, (residual, self.normed, self.norm_g))
 
     def clear_coefficients(self):
         self.normed = None
+        self.norm_g = None
 
     def slice_residual_attn_tp(self, residual):
         parallel = get_parallel()
         rank, size = parallel.attn_tp_rank, parallel.attn_tp_size
-        self.normed = self.normed.tensor_split(size)[rank]
+        if self.normed is not None:
+            self.normed = self.normed.tensor_split(size)[rank]
+        if self.norm_g is not None:
+            self.norm_g = self.norm_g.tensor_split(size)[rank]
         return residual.tensor_split(size)[rank]
 
     def gather_residual_attn_tp(self, residual):
