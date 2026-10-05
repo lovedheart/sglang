@@ -40,3 +40,29 @@ def test_tables_cover_every_total_q():
     assert _get_best_config(10**9) == (16, 1, 2)
     assert math.isinf(sparse_attn._L20_CONFIGS[-1][0])
     assert math.isinf(sparse_attn._H20_CONFIGS[-1][0])
+
+
+def test_multi_warp_flag_only_replaces_the_one_warp_bucket(monkeypatch):
+    from sglang.srt.environ import envs
+
+    def set_name(name):
+        monkeypatch.setattr(
+            sparse_attn.torch.cuda, "get_device_name", lambda idx=0: name
+        )
+
+    set_name("NVIDIA L20")
+    with envs.SGLANG_QSA_PREFILL_MULTI_WARP.override(False):
+        assert _get_best_config(10**9) == (16, 1, 2)
+    with envs.SGLANG_QSA_PREFILL_MULTI_WARP.override(True):
+        assert _get_best_config(10**9) == sparse_attn._MULTI_WARP_CONFIG == (16, 2, 3)
+        # Every bucket someone else tuned keeps its own launch, on either table.
+        for name, table in (
+            ("NVIDIA L20", sparse_attn._L20_CONFIGS),
+            ("NVIDIA H20", sparse_attn._H20_CONFIGS),
+        ):
+            set_name(name)
+            for limit, cfg in table:
+                if cfg[1] == 1:
+                    continue
+                # A bucket's own limit is the smallest total_q that reaches it.
+                assert _get_best_config(limit) == cfg, f"{name} at {limit}"

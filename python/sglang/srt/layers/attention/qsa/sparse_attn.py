@@ -21,9 +21,21 @@ _L20_CONFIGS = [
 ]
 
 
+# Launch to use in place of the one-warp tail bucket when SGLANG_QSA_PREFILL_MULTI_WARP
+# is set. Only that bucket is one-warp in either table, so the flag cannot disturb the
+# buckets someone else tuned.
+_MULTI_WARP_CONFIG = (16, 2, 3)
+
+
 def _get_best_config(total_q: int):
+    from sglang.srt.environ import envs
+
     table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
-    return next(cfg for limit, cfg in table if total_q <= limit)
+    cfg = next(cfg for limit, cfg in table if total_q <= limit)
+    # One warp has nowhere to put the head_dim-deep QK reduction, so it serialises it.
+    if cfg[1] == 1 and envs.SGLANG_QSA_PREFILL_MULTI_WARP.get():
+        cfg = _MULTI_WARP_CONFIG
+    return cfg
 
 
 @triton.jit
