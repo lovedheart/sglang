@@ -321,6 +321,15 @@ class Envs:
     # loop (a gather plus a full-context copy per sequence, plus two host
     # synchronizations per layer).
     SGLANG_QSA_VECTOR_PREFILL_GATHER = EnvBool(True)
+    # Give the QSA sparse-prefill kernels two warps and a 3-deep pipeline instead of
+    # the one-warp tail of the tuning tables.  With one warp Triton has nowhere to put
+    # the head_dim-deep QK reduction, so it serialises it; splitting it across two
+    # warps won +11.7% (4096-token chunk) to +21.2% (1024-token chunk) of kernel time
+    # on the RTX PRO 6000 (Blackwell, SM120) over 12 paired CUDA-graph rounds.  It is
+    # not bitwise equal to the one-warp order -- the split changes the fp32
+    # accumulation order, moving ~0.0004% of the outputs by one bf16 ULP -- so it is
+    # opt-in, and it is unmeasured on other parts.
+    SGLANG_QSA_PREFILL_MULTI_WARP = EnvBool(False)
     # Sort the QSA top-k block selection into a deterministic order (the CUDA
     # top-k kernels emit slots in atomic order; sparse attention merges in
     # list order, making logits run-dependent).  0 keeps the raw order.
