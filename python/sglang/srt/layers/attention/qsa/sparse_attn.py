@@ -333,6 +333,244 @@ def sparse_gqa_fwd_interface_triton_ck(
     return out
 
 
+@triton.jit
+def _nvfp4_gather_planes(
+    pk,
+    sf,
+    rows,
+    kvh,
+    N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ROW_STRIDE: tl.constexpr,
+    SF_STRIDE: tl.constexpr,
+    GS,
+):
+    """Dequantize N packed nvfp4 rows as the two column planes the layout gives.
+
+    Packed byte ``b`` of a row holds column ``2b`` in its low nibble and column
+    ``2b + 1`` in its high nibble, so the row splits into a plane of even
+    columns (low nibbles) and one of odd columns (high nibbles) with no
+    shuffling at all: one contiguous ``HEAD_DIM // 2`` byte load per row plus the
+    hardware e2m1->f16x2 converter.  Eight entries of a plane span eight bytes
+    = sixteen columns = exactly one block scale, which is why the scale is
+    applied through the 3-D view.  ``GS`` is the layer's global scale, applied
+    here so the values match ``NVFP4KVQuantizeUtil.dequantize`` bit for bit.
+    """
+    codes = tl.load(
+        pk
+        + rows[:, None] * ROW_STRIDE
+        + kvh * (HEAD_DIM // 2)
+        + tl.arange(0, HEAD_DIM // 2)[None, :]
+    )
+    lo, hi = tl.inline_asm_elementwise(
+        "{ .reg .b8 q; .reg .b32 t; cvt.u8.u32 q, $2; cvt.rn.f16x2.e2m1x2 t, q;"
+        " mov.b32 {$0, $1}, t; }",
+        "=h,=h,r",
+        [codes],
+        dtype=(tl.float16, tl.float16),
+        is_pure=True,
+        pack=1,
+    )
+    scales = (
+        tl.load(
+            sf
+            + rows[:, None] * SF_STRIDE
+            + kvh * (HEAD_DIM // 16)
+            + tl.arange(0, HEAD_DIM // 16)[None, :]
+        )
+        .to(tl.float8e4nv, bitcast=True)
+        .to(tl.float32)
+    )
+    lo3 = tl.reshape(lo.to(tl.float32), (N, HEAD_DIM // 16, 8)) * scales[:, :, None]
+    hi3 = tl.reshape(hi.to(tl.float32), (N, HEAD_DIM // 16, 8)) * scales[:, :, None]
+    return (
+        tl.reshape(lo3 * GS, (N, HEAD_DIM // 2)).to(tl.bfloat16),
+        tl.reshape(hi3 * GS, (N, HEAD_DIM // 2)).to(tl.bfloat16),
+    )
+
+
+@triton.jit
+def _sparse_gqa_chunk_prefill_nvfp4(
+    q,
+    kp,
+    ksf,
+    vp,
+    vsf,
+    out,
+    indices,
+    cu_q,
+    cu_k,
+    kv_lens,
+    scale,
+    k_gs,
+    v_gs,
+    topk,
+    sq_m: tl.constexpr,
+    sq_h: tl.constexpr,
+    sq_d: tl.constexpr,
+    so_m: tl.constexpr,
+    so_h: tl.constexpr,
+    so_d: tl.constexpr,
+    si_m: tl.constexpr,
+    si_g: tl.constexpr,
+    si_n: tl.constexpr,
+    PK_STRIDE: tl.constexpr,
+    SF_STRIDE: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """``_sparse_gqa_chunk_prefill`` reading packed nvfp4 rows instead of
+    dequantized ones, so the gather never materializes the [rows, heads, dim]
+    bf16 scratch.  Same addressing, causal cap and softmax; the only structural
+    change is that every head_dim-deep dot becomes a pair of head_dim/2 dots,
+    one per nibble plane.
+    """
+    query_relative = tl.program_id(0).to(tl.int64)
+    batch_group = tl.program_id(1)
+    group = batch_group % NUM_KV_HEADS
+    batch = batch_group // NUM_KV_HEADS
+    q_start = tl.load(cu_q + batch)
+    q_end = tl.load(cu_q + batch + 1)
+    query = (q_start + query_relative).to(tl.int64)
+    if query >= q_end:
+        return
+    k_start = tl.load(cu_k + batch).to(tl.int64)
+    kv_len = tl.load(kv_lens + batch).to(tl.int64)
+    visible = query_relative + kv_len - (q_end - q_start) + 1
+    row_topk = tl.minimum(topk, visible)
+    row_limit = tl.minimum(topk, ((row_topk + BLOCK_N - 1) // BLOCK_N) * BLOCK_N)
+    HALF: tl.constexpr = HEAD_DIM // 2
+    offs_h = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+    hmask = (offs_h < GROUP_SIZE)[:, None]
+    # Q is split the way the nibbles are: column 2p feeds plane 0, 2p + 1 feeds
+    # plane 1, so the two plane dots add up to the full head_dim dot.
+    q_base = q + query * sq_m + (group * GROUP_SIZE + offs_h[:, None]) * sq_h
+    q_e = (
+        tl.load(
+            q_base + (tl.arange(0, HALF) * 2)[None, :] * sq_d, mask=hmask, other=0.0
+        )
+        * scale
+        * 1.4426950408
+    ).to(tl.bfloat16)
+    q_o = (
+        tl.load(
+            q_base + (tl.arange(0, HALF) * 2 + 1)[None, :] * sq_d, mask=hmask, other=0.0
+        )
+        * scale
+        * 1.4426950408
+    ).to(tl.bfloat16)
+    idx_row = indices + query * si_m + group * si_g
+    k_base = kp + k_start * PK_STRIDE
+    ksf_base = ksf + k_start * SF_STRIDE
+    v_base = vp + k_start * PK_STRIDE
+    vsf_base = vsf + k_start * SF_STRIDE
+    max_value = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    normalizer = tl.zeros([BLOCK_M], tl.float32)
+    acc_e = tl.zeros([BLOCK_M, HALF], tl.float32)
+    acc_o = tl.zeros([BLOCK_M, HALF], tl.float32)
+    for start in range(0, row_limit, BLOCK_N):
+        current = start + offs_n
+        token = tl.load(idx_row + current * si_n, mask=current < topk, other=-1)
+        valid = token >= 0
+        rows = tl.where(valid, token, 0).to(tl.int64)
+        k_e, k_o = _nvfp4_gather_planes(
+            k_base, ksf_base, rows, group, BLOCK_N, HEAD_DIM, PK_STRIDE, SF_STRIDE, k_gs
+        )
+        scores = tl.dot(q_e, tl.trans(k_e)) + tl.dot(q_o, tl.trans(k_o))
+        scores = tl.where(valid[None, :], scores, -float("inf"))
+        v_e, v_o = _nvfp4_gather_planes(
+            v_base, vsf_base, rows, group, BLOCK_N, HEAD_DIM, PK_STRIDE, SF_STRIDE, v_gs
+        )
+        next_max = tl.maximum(max_value, tl.max(scores, 1))
+        alpha = tl.math.exp2(max_value - next_max)
+        probabilities = tl.math.exp2(scores - next_max[:, None])
+        weights = probabilities.to(tl.bfloat16)
+        acc_e = tl.dot(weights, v_e, acc_e * alpha[:, None])
+        acc_o = tl.dot(weights, v_o, acc_o * alpha[:, None])
+        normalizer = normalizer * alpha + tl.sum(probabilities, 1)
+        max_value = next_max
+    output = tl.interleave(acc_e / normalizer[:, None], acc_o / normalizer[:, None])
+    tl.store(
+        out
+        + query * so_m
+        + (group * GROUP_SIZE + offs_h[:, None]) * so_h
+        + offs_d[None, :] * so_d,
+        output,
+        mask=hmask,
+    )
+
+
+def sparse_gqa_fwd_interface_triton_ck_nvfp4(
+    q,
+    k_pk,
+    k_sf,
+    v_pk,
+    v_sf,
+    k_gs,
+    v_gs,
+    indices,
+    cu_q,
+    cu_k,
+    kv_lens,
+    scale,
+    max_q: int | None = None,
+):
+    """``sparse_gqa_fwd_interface_triton_ck`` on packed rows + block scales.
+
+    Only for a layer whose KV cache really is packed nvfp4; anything else must
+    keep the dequantizing path, since a silently mis-read cache is not a
+    fallback but wrong output.
+    """
+    total_q, num_q_heads, head_dim = q.shape
+    num_kv_heads = k_pk.shape[1]
+    group_size = num_q_heads // num_kv_heads
+    if max_q is None:
+        max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
+    block_m = max(16, triton.next_power_of_2(group_size))
+    block_n, warps, stages = _get_best_config(total_q)
+    out = torch.empty_like(q)
+    _sparse_gqa_chunk_prefill_nvfp4[(max_q, (cu_q.shape[0] - 1) * num_kv_heads)](
+        q,
+        k_pk,
+        k_sf,
+        v_pk,
+        v_sf,
+        out,
+        indices,
+        cu_q,
+        cu_k,
+        kv_lens,
+        scale,
+        k_gs,
+        v_gs,
+        indices.shape[-1],
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        indices.stride(0),
+        indices.stride(1) if indices.ndim == 3 else 0,
+        indices.stride(2) if indices.ndim == 3 else indices.stride(1),
+        k_pk.stride(0),
+        k_sf.stride(0),
+        NUM_KV_HEADS=num_kv_heads,
+        GROUP_SIZE=group_size,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=head_dim,
+        num_warps=warps,
+        num_stages=stages,
+    )
+    return out
+
+
 def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
     """Run one packed sparse-attention row per request without a host sync.
 

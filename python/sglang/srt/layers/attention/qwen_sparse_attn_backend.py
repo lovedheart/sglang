@@ -42,6 +42,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_valid_counts_triton,
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
+    sparse_gqa_fwd_interface_triton_ck_nvfp4,
     sparse_gqa_packed_decode_triton,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
@@ -354,6 +355,81 @@ class QwenSparseAttnBackend(AttentionBackend):
             v_scale_rows,
             layer_id,
             dtype=self._fp4_attn_dtype,
+        )
+
+    def _packed_fp4_prefill(
+        self,
+        layer,
+        all_slots: torch.Tensor,
+        q: torch.Tensor,
+        topk_indices: torch.Tensor,
+        cu_q: torch.Tensor,
+        cu_k: torch.Tensor,
+        kv_lens: torch.Tensor,
+        scale: float,
+        max_q: int,
+    ) -> torch.Tensor | None:
+        """Sparse prefill reading the packed FP4 rows directly, or None to fall back.
+
+        ``_gather_kv_fp4`` exists because packed rows cannot be element-indexed,
+        so the prefill that uses it first dequantizes the whole context into BF16
+        scratch -- twice the bytes of the cache it came from -- and then reads all
+        of it back.  The packed kernel skips that round trip: two byte loads per
+        row and the hardware e2m1 converter do the dequantization in registers.
+        Returns None whenever the cache is not a packed NVFP4 one shaped the way
+        the kernel assumes, since reading a differently laid-out cache yields
+        wrong numbers rather than an error.
+        """
+        method = self.kv_cache_quant_method
+        if not (
+            envs.SGLANG_QSA_PREFILL_PACKED_KV.get()
+            and getattr(method, "name", "") == "nvfp4"
+        ):
+            return None
+        # The nibble split is one PTX cvt.rn.f16x2.e2m1x2 instruction, which only
+        # exists on SM100/SM120 -- and an FP4 KV cache does exist on SM90, where it
+        # is dequantized in software.  Widen this no further than the sparse-decode
+        # gate above: SM121/GB10 is not a "close enough" Blackwell.
+        from sglang.srt.utils import is_sm100_supported, is_sm120
+
+        if not (is_sm100_supported() or is_sm120()):
+            return None
+        k_pk, v_pk, k_sf, v_sf = self.token_to_kv_pool.get_raw_kv_buffer(layer.layer_id)
+        head_dim = q.shape[-1]
+        # Each nibble plane and the per-group scale view become tl.arange widths,
+        # so both must be powers of two, and the plane width is also the reduction
+        # width of the QK dot.
+        half, groups = head_dim // 2, head_dim // 16
+        if (
+            k_pk.dtype != torch.uint8
+            or v_pk.dtype != torch.uint8
+            or k_pk.ndim != 3
+            or k_pk.shape[2] * 2 != head_dim
+            or v_pk.shape != k_pk.shape
+            or k_pk.stride(1) != half
+            or k_sf.shape[2] * 16 != head_dim
+            or k_sf.stride(1) != groups
+            or half < 16
+            or half & (half - 1)
+            or groups & (groups - 1)
+        ):
+            return None
+        safe = all_slots.clamp(min=0).long()
+        k_gs, v_gs = method.get_bmm_scales(layer.layer_id)
+        return sparse_gqa_fwd_interface_triton_ck_nvfp4(
+            q,
+            k_pk.index_select(0, safe).view(torch.uint8),
+            k_sf.index_select(0, safe).view(torch.uint8),
+            v_pk.index_select(0, safe).view(torch.uint8),
+            v_sf.index_select(0, safe).view(torch.uint8),
+            k_gs,
+            v_gs,
+            topk_indices,
+            cu_q,
+            cu_k,
+            kv_lens,
+            scale,
+            max_q=max_q,
         )
 
     @staticmethod
@@ -1765,6 +1841,19 @@ class QwenSparseAttnBackend(AttentionBackend):
             else:
                 all_slots = req_to_token.new_empty((0,))
             if self.kv_cache_quant_method is not None:
+                packed = self._packed_fp4_prefill(
+                    layer,
+                    all_slots,
+                    q.contiguous(),
+                    topk_indices,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    sequence_lens_tensor,
+                    layer.scaling,
+                    max_q=max(extend_lens, default=1),
+                )
+                if packed is not None:
+                    return self._pad_extend_output(packed, num_output_rows)
                 k_all, v_all = self._gather_kv_fp4(layer.layer_id, all_slots)
             else:
                 k_all = pool.get_key_buffer(layer.layer_id).index_select(
@@ -1801,6 +1890,19 @@ class QwenSparseAttnBackend(AttentionBackend):
                     for i in range(num_sequences)
                 ]
             )
+            packed = self._packed_fp4_prefill(
+                layer,
+                all_slots,
+                q.contiguous(),
+                topk_indices,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                sequence_lens_tensor,
+                layer.scaling,
+                max_q=max(extend_lens, default=1),
+            )
+            if packed is not None:
+                return self._pad_extend_output(packed, num_output_rows)
             k_all, v_all = self._gather_kv_fp4(layer.layer_id, all_slots)
         else:
             k_buffer = pool.get_key_buffer(layer.layer_id)
