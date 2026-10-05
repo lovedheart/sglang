@@ -28,17 +28,32 @@ def _normalize(residual, seed):
 
 
 def _mix(seed):
-    """Stands in for GatedResidual.mix: returns the mixed input and the pair
-    the write-back consumes, the streams and their normalization."""
+    """Stands in for GatedResidual.mix: returns the mixed input and the triple
+    the write-back consumes, the streams, their normalization, and the norm
+    factors a folded read returns instead of normalizing."""
 
     def mix(hyper_input):
         if hyper_input.shape[0] == 0:
             empty = hyper_input.new_empty((0, HIDDEN))
             # An empty batch puts the un-normalized streams in the second slot.
-            return empty, (hyper_input, hyper_input)
+            return empty, (hyper_input, hyper_input, None)
         normed = _normalize(hyper_input, seed)
         mixed = normed.unflatten(-1, (HC_COUNT, HIDDEN)).mean(dim=-2)
-        return mixed, (hyper_input, normed)
+        return mixed, (hyper_input, normed, None)
+
+    return mix
+
+
+def _mix_folded(seed):
+    """Stands in for a norm-folded GatedResidual.mix: no normalized residual is
+    materialized, only the mixed input and the per-branch norm factors."""
+
+    def mix(hyper_input):
+        g = hyper_input.unflatten(-1, (HC_COUNT, HIDDEN)).pow(2).mean(-1).rsqrt()
+        mixed = (
+            _normalize(hyper_input, seed).unflatten(-1, (HC_COUNT, HIDDEN)).mean(dim=-2)
+        )
+        return mixed, (hyper_input, None, g)
 
     return mix
 
@@ -46,14 +61,19 @@ def _mix(seed):
 def _combine(block_output, residuals):
     """Stands in for GatedResidual.combine: the injection coefficient is
     computed at write time from the normalized residual the read produced."""
-    hyper_input, normed = residuals
+    hyper_input, normed, norm_g = residuals
     if block_output.shape[0] == 0:
         return hyper_input
-    coefficient = 2 * torch.sigmoid(
-        normed.unflatten(-1, (HC_COUNT, HIDDEN)).mean(dim=-1)
-    )
+    streams = hyper_input.unflatten(-1, (HC_COUNT, HIDDEN))
+    if normed is None:
+        # A folded write-back has no normed residual; the streams scaled by the
+        # carried factors stand in for it.
+        normalized = streams * norm_g.unsqueeze(-1)
+    else:
+        normalized = normed.unflatten(-1, (HC_COUNT, HIDDEN))
+    coefficient = 2 * torch.sigmoid(normalized.mean(dim=-1))
     injected = block_output.unsqueeze(-2) * coefficient.unsqueeze(-1)
-    return (hyper_input.unflatten(-1, (HC_COUNT, HIDDEN)) + injected).flatten(-2)
+    return (streams + injected).flatten(-2)
 
 
 def _state(attn_mix=None):
@@ -92,6 +112,7 @@ class TestGatedResidualOps(CustomTestCase):
         residual = ops.attn_readout.init_residual(self.hidden)
 
         self.assertIsNone(state.normed)
+        self.assertIsNone(state.norm_g)
         _, residual = ops.attn_readout.read(residual, None)
         normed = state.normed
         self.assertIsNotNone(normed)
@@ -99,7 +120,7 @@ class TestGatedResidualOps(CustomTestCase):
 
         torch.testing.assert_close(
             ops.attn_update.update(self.output, residual),
-            _combine(self.output, (residual, normed)),
+            _combine(self.output, (residual, normed, state.norm_g)),
         )
 
     def test_the_write_back_reads_the_carried_value_not_a_fresh_one(self):
@@ -114,11 +135,27 @@ class TestGatedResidualOps(CustomTestCase):
         state.normed = torch.full_like(state.normed, -3.0)
         torch.testing.assert_close(
             ops.attn_update.update(self.output, residual),
-            _combine(self.output, (residual, state.normed)),
+            _combine(self.output, (residual, state.normed, state.norm_g)),
+        )
+
+    def test_a_folded_read_carries_the_norm_factors_to_the_write_back(self):
+        """With the norm weight folded into the projections no normalized
+        residual is materialized; the per-branch factors are what reach the
+        write-back."""
+        state = _state(attn_mix=_mix_folded(1))
+        ops = state.residual_ops()
+        residual = ops.attn_readout.init_residual(self.hidden)
+        _, residual = ops.attn_readout.read(residual, None)
+
+        self.assertIsNone(state.normed)
+        self.assertIsNotNone(state.norm_g)
+        torch.testing.assert_close(
+            ops.attn_update.update(self.output, residual),
+            _combine(self.output, (residual, None, state.norm_g)),
         )
 
     def test_ffn_write_back_clears_the_carried_value(self):
-        state = _state()
+        state = _state(attn_mix=_mix_folded(1))
         ops = state.residual_ops()
         residual = ops.attn_readout.init_residual(self.hidden)
         ops.attn_readout.read(residual, None)
@@ -126,10 +163,12 @@ class TestGatedResidualOps(CustomTestCase):
             ops.attn_update, self.output, residual, None
         )
         self.assertIsNotNone(state.normed)
+        self.assertIsNone(state.norm_g)
 
         ops.ffn_update.update(torch.full((2, HIDDEN), 7.0), residual)
         # Nothing survives the layer: the next layer's read produces its own.
         self.assertIsNone(state.normed)
+        self.assertIsNone(state.norm_g)
 
     def test_the_ffn_input_is_read_from_the_updated_streams(self):
         state = _state()
@@ -141,8 +180,8 @@ class TestGatedResidualOps(CustomTestCase):
         got_input, got_residual = ops.ffn_readout.update_and_read(
             ops.attn_update, self.output, residual, None
         )
-        want_residual = _combine(self.output, (residual, attn_normed))
-        want_input, (_, want_normed) = _mix(2)(want_residual)
+        want_residual = _combine(self.output, (residual, attn_normed, state.norm_g))
+        want_input, (_, want_normed, _) = _mix(2)(want_residual)
         torch.testing.assert_close(got_residual, want_residual)
         torch.testing.assert_close(got_input, want_input)
         torch.testing.assert_close(state.normed, want_normed)
@@ -161,7 +200,7 @@ class TestGatedResidualOps(CustomTestCase):
         # The write-back lands on the contributed streams, once.
         torch.testing.assert_close(
             ops.attn_update.update(self.output, residual),
-            _combine(self.output, (entered + contribution, state.normed)),
+            _combine(self.output, (entered + contribution, state.normed, state.norm_g)),
         )
 
     def test_an_empty_batch_keeps_the_streams_and_their_width(self):
@@ -236,6 +275,8 @@ class TestGatedResidualOps(CustomTestCase):
         ops = state.residual_ops()
         residual = torch.arange(4 * WIDE, dtype=torch.float32).reshape(4, WIDE)
         state.normed = _normalize(residual, 1)
+        g = torch.arange(4 * HC_COUNT, dtype=torch.float32).reshape(4, HC_COUNT)
+        state.norm_g = g
         with patch(
             "sglang.srt.layers.layer_boundary.residual.gated.get_parallel"
         ) as parallel:
@@ -245,6 +286,7 @@ class TestGatedResidualOps(CustomTestCase):
         torch.testing.assert_close(sliced, residual[2:])
         # The normalized rows must follow the stream rows they scale.
         torch.testing.assert_close(state.normed, _normalize(residual, 1)[2:])
+        torch.testing.assert_close(state.norm_g, g[2:])
 
     def test_attn_tp_gather_is_rejected(self):
         ops = _state().residual_ops()
