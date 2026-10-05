@@ -30,11 +30,12 @@ class GatedResidualState:
     per-stream gates, and writes its output back scaled by an injection
     coefficient computed from that same normalized residual.
 
-    The read carries its normalized residual to write-back. Decode may also
-    prepare gate partials during the read; otherwise write-back computes the
-    coefficient from that normalized residual. Both follow the residual rows
-    through any slicing and are cleared after the FFN write-back.
-    Parameters belong to the owning layer's modules.
+    The read carries its normalized residual to write-back; when the norm
+    weight is folded into the projections (SGLANG_HC_NORM_FOLD) no normed
+    residual is materialized and the per-branch norm factors take its place.
+    Decode may also prepare gate partials during the read. All of them follow
+    the residual rows through any slicing and are cleared after the FFN
+    write-back. Parameters belong to the owning layer's modules.
 
     Args:
         expand: Widens the layer stack's input into the stream representation,
@@ -58,6 +59,8 @@ class GatedResidualState:
     # Produced by a stage's read and consumed by that same stage's write-back.
     normed: Optional[torch.Tensor] = None
     gate_partials: Optional[torch.Tensor] = None
+    # Set instead of `normed` by a norm-folded read (see above).
+    norm_g: Optional[torch.Tensor] = None
 
     def _read(self, mix, residual, out_norm):
         if out_norm is not None:
@@ -66,7 +69,16 @@ class GatedResidualState:
                 "normalizes the streams itself"
             )
         hidden_states, residuals = mix(residual)
-        residual, self.normed, self.gate_partials = residuals
+        residual, self.normed, payload = residuals
+        # The third slot carries decode gate partials, or -- for a folded
+        # read that materialized no normed residual -- the per-branch norm
+        # factors; the combine distinguishes them by rank.
+        if payload is not None and payload.ndim == 3:
+            self.gate_partials = payload
+            self.norm_g = None
+        else:
+            self.gate_partials = None
+            self.norm_g = payload
         return hidden_states, residual
 
     def read_attn_input(self, residual, out_norm=None):
@@ -77,25 +89,32 @@ class GatedResidualState:
         return self._read(self.ffn_mix, residual, out_norm)
 
     def apply_attn_combine(self, hidden_states, residual):
-        return self.attn_combine(
-            hidden_states, (residual, self.normed, self.gate_partials)
-        )
+        return self.attn_combine(hidden_states, self._combine_state(residual))
 
     def apply_ffn_combine(self, hidden_states, residual):
-        return self.ffn_combine(
-            hidden_states, (residual, self.normed, self.gate_partials)
+        return self.ffn_combine(hidden_states, self._combine_state(residual))
+
+    def _combine_state(self, residual):
+        return (
+            residual,
+            self.normed,
+            self.gate_partials if self.gate_partials is not None else self.norm_g,
         )
 
     def clear_coefficients(self):
         self.normed = None
         self.gate_partials = None
+        self.norm_g = None
 
     def slice_residual_attn_tp(self, residual):
         parallel = get_parallel()
         rank, size = parallel.attn_tp_rank, parallel.attn_tp_size
-        self.normed = self.normed.tensor_split(size)[rank]
+        if self.normed is not None:
+            self.normed = self.normed.tensor_split(size)[rank]
         if self.gate_partials is not None:
             self.gate_partials = self.gate_partials.tensor_split(size)[rank]
+        if self.norm_g is not None:
+            self.norm_g = self.norm_g.tensor_split(size)[rank]
         return residual.tensor_split(size)[rank]
 
     def gather_residual_attn_tp(self, residual):
