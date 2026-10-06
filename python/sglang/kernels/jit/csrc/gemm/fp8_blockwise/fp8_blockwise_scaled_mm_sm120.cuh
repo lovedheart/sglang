@@ -830,7 +830,20 @@ void sm120_fp8_blockwise_dispatch_shape(
         n >= 4096 && k >= 4096;
     const bool warp_flashnext =
         m <= 16 && n <= 32 * num_sms && n % 128 == 0 && k % 128 == 0 && k <= 8192 && (k >= 6144 || n <= 1024);
-    if (warp_pr || warp_flashnext) {
+    // Split-K warp kernel for small-M decode shapes. Its fp32 partials are
+    // reduced in ascending k order, matching swapAB's accumulation order:
+    // verified bit-identical to swapAB (0 differing elements over 840
+    // random-scale comparisons across the shape x batch matrix below).
+    // CUDA-graph
+    // benches on RTX PRO 6000: every m <= 8 shape wins (1.1-2.2x) including
+    // the wide-N K=2560 families the note above called losses -- that
+    // measurement predates splits=16 for m <= 8. For 9 <= m <= 16 only
+    // narrow N (n <= 4096) still wins; wide N stays on swapAB. Beyond
+    // n = 32768 (lm_head-sized) the fp32 partial traffic outweighs the
+    // latency win and swapAB is back ahead, so cap the width.
+    const bool warp_small =
+        m <= 16 && n <= 32768 && n % 128 == 0 && k % 128 == 0 && k <= 8192 && (m <= 8 || n <= 4096);
+    if (warp_pr || warp_flashnext || warp_small) {
       launch_sm120_fp8_decode_warp<OutType>(out, a, b, scales_a, scales_b, stream);
       return;
     }
