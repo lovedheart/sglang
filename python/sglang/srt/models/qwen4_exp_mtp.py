@@ -18,7 +18,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -70,6 +70,32 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+
+    def set_lm_head_from_target(self, target_lm_head):
+        super().set_lm_head_from_target(target_lm_head)
+        if (
+            self.config.tie_word_embeddings
+            or not get_exec().features.enable_nvfp4_draft_lm_head
+        ):
+            return
+        from sglang.srt.layers.nvfp4_draft_head import build_nvfp4_draft_head
+
+        try:
+            nvfp4_head = build_nvfp4_draft_head(target_lm_head)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            nvfp4_head = None
+            logger.exception(
+                "nvfp4 draft lm_head build ran out of memory; "
+                "draft keeps the shared head"
+            )
+        if nvfp4_head is None:
+            logger.warning(
+                "nvfp4 draft lm_head unavailable; draft keeps the shared head"
+            )
+            return
+        self.lm_head = nvfp4_head
+        logger.info("draft runner uses a private NVFP4 W4A16 lm_head")
 
     def _init_pre_fc_norms(self, config: PretrainedConfig) -> None:
         self.pre_fc_norm_embedding = GemmaRMSNorm(
