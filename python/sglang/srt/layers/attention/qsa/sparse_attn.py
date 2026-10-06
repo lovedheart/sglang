@@ -26,11 +26,33 @@ _L20_CONFIGS = [
 # buckets someone else tuned.
 _MULTI_WARP_CONFIG = (16, 2, 3)
 
+# Measured on the RTX PRO 6000 (SM120) with paired CUDA-graph ABBA against the
+# shipped buckets; only rows with a confirmed win differ from _L20_CONFIGS.
+# The <=32 bucket is the one that matters: NEXTN verify runs the extend path at
+# bs*draft-tokens rows (<=16), so it re-runs every decode step -- (64, 4, 2) is
+# +35% there (12/12), the old (32, 8, 2) was tuning a shape SM120 dislikes.
+# The <=512 partial-chunk bucket gains +2.9% (6/6) from one more pipeline
+# stage, and the tail is the multi-warp config committed by 0464f49cc1, now
+# spelled out instead of flag-routed.
+_SM120_CONFIGS = [
+    (32, (64, 4, 2)),
+    (64, (64, 8, 2)),
+    (128, (64, 4, 2)),
+    (512, (32, 4, 3)),
+    (float("inf"), (16, 2, 3)),
+]
+
 
 def _get_best_config(total_q: int):
     from sglang.srt.environ import envs
+    from sglang.srt.utils import is_sm120
 
-    table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
+    if is_sm120():
+        table = _SM120_CONFIGS
+    elif "H20" in torch.cuda.get_device_name(0):
+        table = _H20_CONFIGS
+    else:
+        table = _L20_CONFIGS
     cfg = next(cfg for limit, cfg in table if total_q <= limit)
     # One warp has nowhere to put the head_dim-deep QK reduction, so it serialises it.
     if cfg[1] == 1 and envs.SGLANG_QSA_PREFILL_MULTI_WARP.get():
