@@ -45,6 +45,10 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Store the LM head weight in FP8 e4m3 with 128x128 block scales (SM120 only, ignored elsewhere), halving decode-time head memory traffic.",
     ] = False
+    enable_nvfp4_draft_lm_head: A[
+        bool,
+        "Give the NEXTN/EAGLE draft runner its own NVFP4 W4A16 copy of the LM head (SM120 only, ignored elsewhere), cutting draft-step head traffic ~2x. Draft logits feed proposals only; greedy target verification keeps outputs unchanged.",
+    ] = False
     enable_tf32_matmul: A[
         bool,
         Arg(
