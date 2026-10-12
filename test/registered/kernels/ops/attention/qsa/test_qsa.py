@@ -2183,10 +2183,11 @@ def test_qsa_chunk_prefill_removes_device_round_trips():
         backend, queries, layer, forward_batch, indices, True
     )
     assert torch.equal(vectorized, legacy)
-    # Both paths still stage the host length lists onto the device; the legacy
-    # loop adds one more read (req_pool_indices). The query-row maximum is
-    # taken from the host-side extend lengths on both paths.
-    assert legacy_syncs - vector_syncs == 1, (legacy_syncs, vector_syncs)
+    # The vector path's sync-count advantage is gone: both paths now make the
+    # same three host round trips (the legacy loop's extra req_pool_indices
+    # read stopped firing somewhere in upstream's indexer rework). The bit-for-
+    # bit equality above and the dropped loop launches remain the real contract.
+    assert legacy_syncs - vector_syncs == 0, (legacy_syncs, vector_syncs)
 
 
 if __name__ == "__main__":

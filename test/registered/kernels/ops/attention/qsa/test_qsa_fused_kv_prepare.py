@@ -333,7 +333,8 @@ def test_block_indices_expand_on_attention_fallback(monkeypatch):
     expected = expand_qsa_block_indices(blocks, positions, lengths, 4, 2048)
     marker = object()
 
-    def attention(q, k, v, layer, batch, metadata, indices, trtllm):
+    def attention(q, k, v, layer, batch, metadata, indices, trtllm, gathered_rows=False):
+        assert not gathered_rows
         torch.testing.assert_close(indices, expected, rtol=0, atol=0)
         return marker
 
