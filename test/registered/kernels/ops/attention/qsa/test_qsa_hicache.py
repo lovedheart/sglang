@@ -26,6 +26,13 @@ PAGE = 64
 RATIO = 4
 
 
+@pytest.fixture(autouse=True)
+def _private_storage_dir(monkeypatch):
+    # A machine-wide storage dir overrides HiCacheFile's file_path argument,
+    # which would make tests share one directory across (re)runs.
+    monkeypatch.delenv("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", raising=False)
+
+
 def make_device_pool(layers, start_layer=0):
     return QSATokenToKVPool(
         size=PAGE * 8,

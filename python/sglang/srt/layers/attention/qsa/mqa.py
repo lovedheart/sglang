@@ -611,16 +611,20 @@ def tilelang_qsa_mqa_decode(
             "TileLang QSA decode requires a compressed page size of "
             f"8/16/32/64 (64-row GEMM sub-page packing), got {page_size}"
         )
-    # torch.empty (not torch.full(-inf)): fast_topk scans exactly
-    # [0, context_len) and the kernel writes that prefix in full (rows
-    # at or below min_scored_len select every block), so columns past a
-    # row's context length are never read; the wide -inf fill was pure
-    # traffic.
-    logits = torch.empty(
-        (q.shape[0], max_model_len),
-        dtype=torch.float32,
-        device=q.device,
-    )
+    if min_scored_len > 0:
+        # Bounded callers scan exactly [0, context_len) and the kernel
+        # writes that prefix in full, so columns past a row's context
+        # length are never read and the wide -inf fill is pure traffic.
+        logits = torch.empty(
+            (q.shape[0], max_model_len), dtype=torch.float32, device=q.device
+        )
+    else:
+        logits = torch.full(
+            (q.shape[0], max_model_len),
+            -float("inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
     if not q.shape[0] or not max_model_len:
         return logits
     # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
