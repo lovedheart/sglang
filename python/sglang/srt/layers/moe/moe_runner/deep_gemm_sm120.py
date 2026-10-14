@@ -143,7 +143,14 @@ def _pre_permute_standard_contig(
         scale_tma_aligned=ue8m0,
         scale_ue8m0=ue8m0,
     )
-    dispose_tensor(hidden_states)
+    # dispose_tensor() set_()s the caller's activation to an empty 1-D tensor, so
+    # it may only go here when the caller promised it is dead. Qwen's fused
+    # shared-expert gate reads hidden_states *after* the routed experts run, and
+    # the shared runner honors that through runner_config.inplace; this path used
+    # to dispose unconditionally and crashed the gate kernel on >=1024-token
+    # prefills.
+    if runner_config.inplace:
+        dispose_tensor(hidden_states)
 
     # ep_scatter fills expert slots in blocks of 128; size from a static upper
     # bound and accumulate counts on-device to avoid a GPU->CPU sync.
