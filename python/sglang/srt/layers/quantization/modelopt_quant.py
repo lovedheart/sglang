@@ -1088,6 +1088,14 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4a16_config)
+            if quant_algo == "W4A8_MXFP4_FP8":
+                # MXFP4 packed e2m1 experts + e8m0 g32 scales, MXFP8 dynamic
+                # activations at runtime (true W4A8). The checkpoint tensors
+                # are already in the serialized Mxfp4MoEMethod layout.
+                from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+                return Mxfp4MoEMethod(prefix=prefix)
+
             return None
 
         return None

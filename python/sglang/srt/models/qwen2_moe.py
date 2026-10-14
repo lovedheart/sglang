@@ -337,6 +337,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.RenormalizeNaive,
             num_fused_shared_experts=self.num_fused_shared_experts,
             inplace=not _needs_hidden_after_experts,
+            # Per-expert w1/w3 loads put gate in the first half of w13 rows
+            # and up in the second; only GPT-OSS-style fused checkpoints are
+            # pair-interleaved.
+            gate_up_interleaved=False,
             enable_qwen35_fp8_deferred_finalize=(
                 config.model_type == "qwen3_5_moe_text" and uses_cutedsl_ar_fusion()
             ),

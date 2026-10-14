@@ -344,6 +344,7 @@ def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch, stated_tp_group):
     )
     # The fused func reads the layer's MoE placement off the config.
     config.layer = layer
+    layer.moe_runner_config = config
     method.moe_runner_config = config
     method.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, config)
     method._process_weights_for_sm120_cutlass(layer)
@@ -447,6 +448,92 @@ def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch, stated_tp_group):
         output=expected,
     )
     assert torch.equal(actual, expected[:, :hidden].contiguous())
+
+
+def test_per_expert_w13_sm120_non_interleaved_layout():
+    # Qwen-style checkpoints load per-expert w1/w3, so gate occupies the
+    # first half of the w13 rows and up the second (gate_up_interleaved=False).
+    # The SM120 prep must stack them as contiguous [up; gate] halves.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120 required")
+    pytest.importorskip("flashinfer.fused_moe")
+
+    from flashinfer import block_scale_interleave
+
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+    from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+    num_experts, hidden, intermediate = 4, 256, 256  # no padding needed
+    w13, w2, w13_scale, w2_scale = _random_weights(num_experts, hidden, intermediate)
+    generator = torch.Generator(device="cuda").manual_seed(3)
+    w13_bias = torch.randn(
+        num_experts, 2 * intermediate, dtype=torch.bfloat16, device="cuda"
+    )
+    w2_bias = torch.randn(
+        num_experts, hidden, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    layer = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(
+            w13.view(torch.uint8).clone(), requires_grad=False
+        ),
+        w2_weight=torch.nn.Parameter(w2.view(torch.uint8).clone(), requires_grad=False),
+        w13_weight_scale=torch.nn.Parameter(
+            w13_scale.view(torch.uint8).clone(), requires_grad=False
+        ),
+        w2_weight_scale=torch.nn.Parameter(
+            w2_scale.view(torch.uint8).clone(), requires_grad=False
+        ),
+        w13_weight_bias=torch.nn.Parameter(w13_bias.clone(), requires_grad=False),
+        w2_weight_bias=torch.nn.Parameter(w2_bias.clone(), requires_grad=False),
+        num_local_experts=num_experts,
+        moe_tp_size=1,
+        moe_tp_rank=0,
+        moe_ep_size=1,
+        moe_ep_rank=0,
+    )
+
+    method = Mxfp4MoEMethod.__new__(Mxfp4MoEMethod)
+    method._fi_kernel = "cutlass_sm120"
+    method.num_experts = num_experts
+    method.hidden_size = hidden
+    method.intermediate_size_per_partition = intermediate
+    method._padded_hidden = hidden
+    method._padded_intermediate = intermediate
+    config = MoeRunnerConfig(
+        num_experts=num_experts,
+        num_local_experts=num_experts,
+        hidden_size=hidden,
+        intermediate_size_per_partition=intermediate,
+        top_k=2,
+        activation="silu",
+        is_gated=True,
+        gate_up_interleaved=False,
+    )
+    layer.moe_runner_config = config
+    method.moe_runner_config = config
+    method._process_weights_for_sm120_cutlass(layer)
+
+    gate, up = w13.chunk(2, dim=1)
+    gate_scale, up_scale = w13_scale.view(torch.uint8).chunk(2, dim=1)
+    expected_w13 = torch.cat((up, gate), dim=1)
+    expected_w13_scale = block_scale_interleave(
+        torch.cat((up_scale, gate_scale), dim=1)
+    ).reshape(num_experts, 2 * intermediate, hidden // 32)
+    assert torch.equal(layer.w13_weight, expected_w13.view(torch.uint8))
+    assert torch.equal(layer.w13_weight_scale, expected_w13_scale)
+    assert torch.equal(
+        layer.w13_weight_bias,
+        torch.cat((w13_bias[:, intermediate:], w13_bias[:, :intermediate]), dim=1),
+    )
+    # A plain-SiLU config must not inherit GPT-OSS's OA scalars: the kernel
+    # evaluates gate*sigmoid(alpha*gate)*(up+beta) clamped to +-limit, so
+    # beta=1 adds a constant to every up-projection.
+    assert torch.all(layer.swiglu_alpha == 1.0)
+    assert torch.all(layer.swiglu_beta == 0.0)
+    assert torch.all(layer.swiglu_limit == torch.finfo(torch.float32).max)
+    assert layer._mxfp4_backend == "flashinfer_cutlass_sm120"
 
 
 if __name__ == "__main__":
