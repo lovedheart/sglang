@@ -1341,12 +1341,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         """Prepare GPT-OSS MXFP4 experts for FlashInfer CUTLASS on SM120.
 
         GPT-OSS stores gate/up rows pair-wise as
-        ``[gate_0, up_0, gate_1, up_1, ...]``. FlashInfer's fused MoE consumes
-        two contiguous halves in ``[up; gate]`` order. Build that layout after
-        checkpoint loading so padding cannot move the split, pad both GEMMs to
-        CUTLASS's 128-element alignment, and swizzle the native E8M0 scales for
-        the SM120 MXFP8-by-MXFP4 kernels. Packed FP4 weight bytes themselves do
-        not need an SM120 permutation.
+        ``[gate_0, up_0, gate_1, up_1, ...]``, while per-expert w1/w3 loads
+        (e.g. Qwen4-Exp W4A8_MXFP4_FP8) store gate-first contiguous halves.
+        FlashInfer's fused MoE consumes two contiguous halves in ``[up; gate]``
+        order. Build that layout after checkpoint loading so padding cannot
+        move the split, pad both GEMMs to CUTLASS's 128-element alignment, and
+        swizzle the native E8M0 scales for the SM120 MXFP8-by-MXFP4 kernels.
+        Packed FP4 weight bytes themselves do not need an SM120 permutation.
         """
         from flashinfer import block_scale_interleave
 
@@ -1358,9 +1359,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         E = layer.num_local_experts
         device = layer.w13_weight.device
 
+        interleaved = layer.moe_runner_config.gate_up_interleaved
+
+        def _up_gate_rows(x, row_dim):
+            # Split w13 rows (or the matching bias rows) into up/gate halves.
+            def pick(index):
+                sl = [slice(None)] * x.dim()
+                sl[row_dim] = index
+                return x[tuple(sl)]
+
+            if interleaved:
+                return pick(slice(1, None, 2)), pick(slice(0, None, 2))
+            half = x.shape[row_dim] // 2
+            return pick(slice(half, None)), pick(slice(None, half))
+
         def _stack_up_gate_w13(unpadded, last_pad, last_un):
-            gate_rows = unpadded[:, 0::2, :]
-            up_rows = unpadded[:, 1::2, :]
+            up_rows, gate_rows = _up_gate_rows(unpadded, row_dim=1)
             out = torch.zeros(
                 E, 2 * N_pad, last_pad, dtype=unpadded.dtype, device=device
             )
@@ -1377,8 +1391,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         bias_dtype = layer.w13_weight_bias.dtype
         w13_bias_padded = torch.zeros(E, 2 * N_pad, dtype=bias_dtype, device=device)
-        w13_bias_padded[:, :N_un] = layer.w13_weight_bias.data[:, 1::2]
-        w13_bias_padded[:, N_pad : N_pad + N_un] = layer.w13_weight_bias.data[:, 0::2]
+        up_bias, gate_bias = _up_gate_rows(layer.w13_weight_bias.data, row_dim=1)
+        w13_bias_padded[:, :N_un] = up_bias
+        w13_bias_padded[:, N_pad : N_pad + N_un] = gate_bias
 
         def _pad_w2_3d(unpadded, last_pad, last_un):
             out = torch.zeros(E, K_pad, last_pad, dtype=unpadded.dtype, device=device)
@@ -1410,16 +1425,30 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.w13_weight_bias = Parameter(w13_bias_padded, requires_grad=False)
         layer.w2_weight_bias = Parameter(w2_bias_padded, requires_grad=False)
 
+        cfg = layer.moe_runner_config
+        _alpha = getattr(cfg, "gemm1_alpha", None)
+        _beta = getattr(cfg, "gemm1_beta", None)
+        _limit = getattr(cfg, "gemm1_clamp_limit", None)
+        if _alpha is None and _limit is None:
+            # FlashInfer's SwiGLU epilogue is gate*sigmoid(alpha*gate)*(up+beta)
+            # with both branches clamped to +-limit, so the neutral encoding of a
+            # plain-SiLU model (Qwen MoE) is (1.0, 0.0, float32 max). Inheriting
+            # GPT-OSS's OA scalars here adds a constant to every up-projection.
+            _alpha, _beta, _limit = 1.0, 0.0, torch.finfo(torch.float32).max
+        else:
+            _alpha = 1.702 if _alpha is None else _alpha
+            _beta = 1.0 if _beta is None else _beta
+            _limit = 7.0 if _limit is None else _limit
         layer.swiglu_alpha = Parameter(
-            torch.full((E,), 1.702, dtype=torch.float32, device=device),
+            torch.full((E,), _alpha, dtype=torch.float32, device=device),
             requires_grad=False,
         )
         layer.swiglu_beta = Parameter(
-            torch.ones(E, dtype=torch.float32, device=device),
+            torch.full((E,), _beta, dtype=torch.float32, device=device),
             requires_grad=False,
         )
         layer.swiglu_limit = Parameter(
-            torch.full((E,), 7.0, dtype=torch.float32, device=device),
+            torch.full((E,), _limit, dtype=torch.float32, device=device),
             requires_grad=False,
         )
         # The MXFP4 ABI uses a neutral global weight scale for each GEMM.
