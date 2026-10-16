@@ -1150,6 +1150,10 @@ class Envs:
     # Disable to save the additional weight memory or allow online updates.
     SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
+    # SM120 MXFP4 MoE kernel selection: "cutlass" (cutlass_fused_moe
+    # MXFP8xMXFP4, default) or "b12x" (flashinfer CuTe-DSL b12x backend:
+    # ~2x faster at decode sizes, but no EP and no expert biases).
+    SGLANG_MXFP4_SM120_KERNEL = EnvStr("cutlass")
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     # GLM NextN (MTP): cast the draft layer's bf16 fused MoE to per-channel FP8

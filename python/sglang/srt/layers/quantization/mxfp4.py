@@ -424,7 +424,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if get_platform().is_sm100:
                 self._fi_kernel = "trtllm_sm100"
             elif get_platform().is_sm120:
-                self._fi_kernel = "cutlass_sm120"
+                self._fi_kernel = (
+                    "b12x_sm120"
+                    if envs.SGLANG_MXFP4_SM120_KERNEL.get() == "b12x"
+                    else "cutlass_sm120"
+                )
             elif get_platform().is_sm90:
                 if not _FI_HAS_SM90_CUTLASS_MXFP4:
                     raise RuntimeError(
@@ -490,7 +494,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad = round_up(
                     intermediate_size_per_partition, triton_kernels_padding_alignment
                 )
-        elif self._fi_kernel in ("cutlass_sm90", "cutlass_sm120"):
+        elif self._fi_kernel in ("cutlass_sm90", "cutlass_sm120", "b12x_sm120"):
             # CUTLASS mixed-input GEMM dimensions must be % 128 == 0. The
             # kernels also expect ``fc1_expert_weights`` in halved
             # ``[up; gate]`` layout, which means the padding boundary must
@@ -731,6 +735,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
         if self._fi_kernel == "cutlass_sm120":
             self._process_weights_for_sm120_cutlass(layer)
+            return
+        if self._fi_kernel == "b12x_sm120":
+            self._process_weights_for_sm120_b12x(layer)
             return
         if self.use_flashinfer:
             # Per-expert buffers are local (create_weights uses num_local_experts);
@@ -1459,6 +1466,92 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer._mxfp4_backend = "flashinfer_cutlass_sm120"
         torch.cuda.empty_cache()
 
+    def _process_weights_for_sm120_b12x(self, layer):
+        """Prepare MXFP4 experts for FlashInfer's SM12x CuTe-DSL b12x backend.
+
+        Unlike the CUTLASS path, b12x consumes the loader's row layout in
+        place; weights stay packed and the only conversion is the E8M0 block
+        scales -> scaled-MMA strides (sf_vec_size 32) that the CuTe kernels
+        demand. The backend represents no expert bias and no EP, and compiles
+        one kernel per token bucket, so this method validates those
+        constraints instead of working around them.
+        """
+
+        if layer.moe_ep_size != 1 or layer.moe_tp_size != 1:
+            raise NotImplementedError(
+                "SGLANG_MXFP4_SM120_KERNEL=b12x does not support expert or "
+                f"tensor parallelism (got ep={layer.moe_ep_size}, "
+                f"tp={layer.moe_tp_size})."
+            )
+        for name in ("w13_weight_bias", "w2_weight_bias"):
+            bias = getattr(layer, name, None)
+            if bias is not None and bias.abs().amax().item() != 0.0:
+                raise NotImplementedError(
+                    f"SGLANG_MXFP4_SM120_KERNEL=b12x supports no expert bias ({name} is nonzero)."
+                )
+
+        def _to_mma(scale: torch.Tensor, m: int, k: int) -> Parameter:
+            # Logical (E, n, k/32) -> scaled-MMA tile bytes: the CuTe kernels
+            # read SF at byte (m % 32) * 16 + ((m % 128) // 32) * 4 + k % 4
+            # inside (row-tile, col-tile) blocks laid out (g, mt, kt).
+            e, n, k_groups = scale.shape
+            mt = (n + 127) // 128
+            kt = (k_groups + 3) // 4
+            if mt * 128 != n or kt * 4 != k_groups:
+                padded = scale.new_zeros(e, mt * 128, kt * 4)
+                padded[:, :n, :k_groups] = scale
+                scale = padded
+            tiles = (
+                scale.view(e, mt, 4, 32, kt, 4).permute(0, 1, 4, 3, 2, 5).contiguous()
+            )
+            return Parameter(
+                tiles.view(e, mt, kt, 32, 4, 4).permute(3, 4, 1, 5, 2, 0),
+                requires_grad=False,
+            )
+
+        e, n13, k_half = layer.w13_weight.shape
+        e2, h, i_half = layer.w2_weight.shape
+        # Like the CUTLASS sm120 kernel, b12x consumes w13 as [up; gate]
+        # (the second row half feeds silu); the loader stores HF's
+        # [gate; up] (or gate/up interleaved), so reorder weight rows and
+        # their scales together before the SF conversion.
+        w = layer.w13_weight.data
+        s = layer.w13_weight_scale.data
+        if getattr(layer.moe_runner_config, "gate_up_interleaved", False):
+            w = torch.stack([w[:, 1::2], w[:, ::2]], 1).flatten(1, 2)
+            s = torch.stack([s[:, 1::2], s[:, ::2]], 1).flatten(1, 2)
+        else:
+            half = w.shape[1] // 2
+            w = torch.cat([w[:, half:], w[:, :half]], dim=1)
+            s = torch.cat([s[:, half:], s[:, :half]], dim=1)
+        layer.w13_weight.data = w.contiguous()
+        layer.w13_weight_scale.data = s.contiguous()
+        layer.w13_weight_scale = _to_mma(layer.w13_weight_scale.data, n13, k_half * 2)
+        layer.w2_weight_scale = _to_mma(layer.w2_weight_scale.data, h, i_half * 2)
+        # MXFP4 ABI: neutral global weight scale (the e8m0 blockscales carry
+        # all weight scaling); also serves as the FC1 input-quant multiplier.
+        layer.mxfp4_weight_global_scale = Parameter(
+            torch.ones(e, dtype=torch.float32, device=layer.w13_weight.device),
+            requires_grad=False,
+        )
+
+        # Neutral (1.0, 0.0, inf) SwiGLU for plain-SiLU models, GPT-OSS
+        # scalars otherwise -- same encoding as the CUTLASS sm120 path.
+        cfg = layer.moe_runner_config
+        alpha, beta, limit = getattr(cfg, "gemm1_alpha", None), None, getattr(
+            cfg, "gemm1_clamp_limit", None
+        )
+        beta = getattr(cfg, "gemm1_beta", None)
+        if alpha is None and limit is None:
+            self._b12x_swiglu = (1.0, 0.0, None)
+        else:
+            self._b12x_swiglu = (
+                1.702 if alpha is None else alpha,
+                1.0 if beta is None else beta,
+                7.0 if limit is None else limit,
+            )
+        layer._mxfp4_backend = "flashinfer_b12x_sm120"
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -1499,6 +1592,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "trtllm_sm100",
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        elif self._fi_kernel == "b12x_sm120":
+            # apply() calls flashinfer's b12x entry directly (fused CuTe DSL
+            # op with its own dispatch/finalize, like the megamoe path).
+            return
         else:
             raise NotImplementedError(
                 f"Mxfp4MoEMethod has no MoeRunner for backend={moe_runner_backend} "
@@ -1577,6 +1674,49 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             padded_hidden=self._padded_hidden,
         )
         return self.runner.run(dispatch_output, quant_info)
+
+    def _apply_sm120_b12x(self, layer, dispatch_output):
+        """SM120 MoE via FlashInfer's CuTe-DSL b12x backend (MXFP4 x MXFP4).
+
+        The kernel quantizes activations to MXFP4 internally, so this runs
+        W4A4: faster than the CUTLASS W4A8 path at somewhat higher error.
+        """
+        from flashinfer.fused_moe import b12x_fused_moe
+
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardCombineInput,
+            StandardDispatchOutput,
+        )
+
+        assert isinstance(dispatch_output, StandardDispatchOutput), (
+            f"b12x_sm120 needs the standard dispatcher, got {type(dispatch_output)}"
+        )
+        x = dispatch_output.hidden_states
+        if dispatch_output.hidden_states_scale is not None:
+            raise NotImplementedError("b12x_sm120 expects BF16 activations.")
+        topk = dispatch_output.topk_output
+        alpha, beta, limit = self._b12x_swiglu
+        out = b12x_fused_moe(
+            x,
+            layer.w13_weight.data,
+            layer.w13_weight_scale.data,
+            layer.w2_weight.data,
+            layer.w2_weight_scale.data,
+            topk.topk_ids.to(torch.int32),
+            topk.topk_weights.to(torch.float32),
+            layer.num_experts,
+            topk.topk_ids.shape[1],
+            w1_alpha=layer.mxfp4_weight_global_scale,
+            w2_alpha=layer.mxfp4_weight_global_scale.clone(),
+            # b12x must not allocate its own output while a CUDA graph is
+            # being captured; the caller-owned buffer satisfies that.
+            output=torch.empty_like(x),
+            swiglu_alpha=alpha,
+            swiglu_beta=beta,
+            swiglu_limit=limit,
+            quant_mode="mxfp4",
+        )
+        return StandardCombineInput(hidden_states=out)
 
     def _apply_sm100_trtllm_gen(self, layer, dispatch_output):
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -1730,6 +1870,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return self._apply_sm90_cutlass(layer, dispatch_output)
         if self._fi_kernel == "cutlass_sm120":
             return self._apply_sm120_cutlass(layer, dispatch_output)
+        if self._fi_kernel == "b12x_sm120":
+            return self._apply_sm120_b12x(layer, dispatch_output)
         if self.use_flashinfer:
             return self._apply_sm100_trtllm_gen(layer, dispatch_output)
         if _use_aiter:
