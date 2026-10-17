@@ -2670,10 +2670,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             t = t.to(torch.float32).reshape(-1)
             return t.expand(num_experts) if t.numel() == 1 else t
 
+        hybrid = (
+            envs.SGLANG_SM12X_W4A4_PREFILL_MIN_TOKENS.get() > 0
+            and layer.moe_runner_config.is_gated
+        )
         w13_gs = layer.w13_weight_scale_2.data
+        gate_up_ratio = None
         if layer.moe_runner_config.is_gated and w13_gs.dim() > 1:
             gate_gs = w13_gs[:, 0].to(torch.float32)
             up_gs = w13_gs[:, 1].to(torch.float32)
+            gate_up_ratio = gate_gs / up_gs
             w2_gs = _expert_vec(layer.w2_weight_scale_2.data) * (up_gs / gate_gs)
             w13_gs = gate_gs
         else:
@@ -2684,6 +2690,38 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale.data = swizzle_blockscale(layer.w2_weight_scale.data)
         layer.w13_weight_scale_2.data = w13_gs.contiguous()
         layer.w2_weight_scale_2.data = w2_gs.contiguous()
+        # create_weights pre-allocated swizzled-scale placeholders for the
+        # flashinfer TRTLLM/megamoe paths; we keep the swizzled data on the
+        # weight_scale params, so alias (freeing the placeholders — ~157 MB
+        # per layer) like the TRTLLM branch does.
+        if getattr(layer, "w13_blockscale_swizzled", None) is not None:
+            layer.w13_blockscale_swizzled = layer.w13_weight_scale
+        if getattr(layer, "w2_blockscale_swizzled", None) is not None:
+            layer.w2_blockscale_swizzled = layer.w2_weight_scale
+
+        if hybrid:
+            # W4A4 prefill arm (flashinfer moe_nvfp4_w4a4) reads these same
+            # weights and quantizes activations with these multipliers
+            # (1 / input_scale). The GEMM1 output carries the gate/up
+            # global-scale ratio c on its up half; dividing it out of the FC2
+            # multiplier keeps the FP4 intermediate on the calibrated grid --
+            # this assumes c is ~uniform across experts (exactly 1 for mtpV4).
+            device = layer.w13_weight.device
+
+            def _amax(t: torch.Tensor | None) -> torch.Tensor:
+                if t is None:
+                    return torch.ones((), dtype=torch.float32, device=device)
+                return t.to(torch.float32).amax().reshape(())
+
+            ratio = (
+                gate_up_ratio.amax()
+                if gate_up_ratio is not None
+                else torch.ones((), dtype=torch.float32, device=device)
+            )
+            layer.w4a4_a13_gs = 1.0 / _amax(getattr(layer, "w13_input_scale", None))
+            layer.w4a4_a2_gs = 1.0 / (
+                ratio * _amax(getattr(layer, "w2_input_scale", None))
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
@@ -3216,6 +3254,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w2=layer.w2_weight.data,
                 w2_sf=layer.w2_weight_scale.data,
                 w2_gs=layer.w2_weight_scale_2.data,
+                a13_gs=getattr(layer, "w4a4_a13_gs", None),
+                a2_gs=getattr(layer, "w4a4_a2_gs", None),
             )
             return self.runner.run(dispatch_output, quant_info)
 

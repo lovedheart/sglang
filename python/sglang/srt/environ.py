@@ -1219,6 +1219,12 @@ class Envs:
     # for; larger batches launch at an exact-size bucket rounded up (power of
     # two, then 8192-alignment) to keep the compile set bounded.
     SGLANG_SM12X_W4A16_MOE_MAX_TOKENS = EnvInt(8192)
+    # With --moe-runner-backend sm12x_nvfp4_bf16, route batches with at least
+    # this many tokens through flashinfer's moe_nvfp4_w4a4 kernel
+    # (NVFP4-quantized activations), ~1.4x faster on prefill but slightly
+    # less accurate. 0 (default) disables the hybrid path; 256 is a good
+    # crossover estimate.
+    SGLANG_SM12X_W4A4_PREFILL_MIN_TOKENS = EnvInt(0)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
