@@ -2654,6 +2654,37 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer._mega_moe_nvfp4 = True
         layer._mega_moe_weights_built = True
 
+    def _prepare_sm12x_w4a16_weights(self, layer: torch.nn.Module) -> None:
+        """Prepare raw checkpoint FP4 weights for the SM12x W4A16 kernel.
+
+        Weights stay packed FP4 (BF16 activations, no activation quantization);
+        only the e4m3 block scales are swizzled into the kernel's 128x4 layout.
+        The kernel takes one global FP32 scale per expert, so when the
+        checkpoint stores separate gate/up global scales their ratio rides on
+        ``w2_gs`` — exact for a gated activation, because scaling only the up
+        half scales the activation output by the same constant.
+        """
+        num_experts = layer.w13_weight.shape[0]
+
+        def _expert_vec(t: torch.Tensor) -> torch.Tensor:
+            t = t.to(torch.float32).reshape(-1)
+            return t.expand(num_experts) if t.numel() == 1 else t
+
+        w13_gs = layer.w13_weight_scale_2.data
+        if layer.moe_runner_config.is_gated and w13_gs.dim() > 1:
+            gate_gs = w13_gs[:, 0].to(torch.float32)
+            up_gs = w13_gs[:, 1].to(torch.float32)
+            w2_gs = _expert_vec(layer.w2_weight_scale_2.data) * (up_gs / gate_gs)
+            w13_gs = gate_gs
+        else:
+            w13_gs = _expert_vec(w13_gs)
+            w2_gs = _expert_vec(layer.w2_weight_scale_2.data)
+
+        layer.w13_weight_scale.data = swizzle_blockscale(layer.w13_weight_scale.data)
+        layer.w2_weight_scale.data = swizzle_blockscale(layer.w2_weight_scale.data)
+        layer.w13_weight_scale_2.data = w13_gs.contiguous()
+        layer.w2_weight_scale_2.data = w2_gs.contiguous()
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
@@ -2678,6 +2709,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
         use_nvfp4_dispatch = _use_nvfp4_dispatch()
+        if moe_runner_backend.is_sm12x_nvfp4_bf16():
+            self._prepare_sm12x_w4a16_weights(layer)
+            return
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
             # the gate/up columns to the gate scale here. Other backends keep the
@@ -3068,6 +3102,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             layer._cutedsl_wrapper = None
 
+        if moe_runner_backend.is_sm12x_nvfp4_bf16():
+            if get_device_capability()[0] != 12:
+                raise NotImplementedError(
+                    "--moe-runner-backend sm12x_nvfp4_bf16 supports only "
+                    "SM120/SM121 (Blackwell GeForce / RTX PRO) GPUs."
+                )
+            import sglang.srt.layers.moe.moe_runner.sm12x_nvfp4_bf16  # noqa: F401 – triggers @register_fused_func
+
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
 
@@ -3154,6 +3196,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 apply_routed_scaling_factor=(
                     not layer.should_fuse_routed_scaling_factor_in_topk
                 ),
+            )
+            return self.runner.run(dispatch_output, quant_info)
+
+        if moe_runner_backend.is_sm12x_nvfp4_bf16():
+            from sglang.srt.layers.moe.moe_runner.sm12x_nvfp4_bf16 import (
+                Sm12xNvfp4W4A16MoeQuantInfo,
+            )
+
+            if getattr(layer, "expert_map", None) is not None:
+                raise NotImplementedError(
+                    "sm12x_nvfp4_bf16 does not support expert-parallel "
+                    "expert_map remapping yet."
+                )
+            quant_info = Sm12xNvfp4W4A16MoeQuantInfo(
+                w13=layer.w13_weight.data,
+                w13_sf=layer.w13_weight_scale.data,
+                w13_gs=layer.w13_weight_scale_2.data,
+                w2=layer.w2_weight.data,
+                w2_sf=layer.w2_weight_scale.data,
+                w2_gs=layer.w2_weight_scale_2.data,
             )
             return self.runner.run(dispatch_output, quant_info)
 

@@ -1215,6 +1215,10 @@ class Envs:
     # Use BF16 activations with FlashInfer CuTe DSL NVFP4 dense and MoE weights,
     # including the flashinfer_megamoe runner (BF16 combine).
     SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 = EnvBool(False)
+    # Largest token bucket the sm12x_nvfp4_bf16 MoE kernel compiles a variant
+    # for; larger batches launch at an exact-size bucket rounded up (power of
+    # two, then 8192-alignment) to keep the compile set bounded.
+    SGLANG_SM12X_W4A16_MOE_MAX_TOKENS = EnvInt(8192)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
