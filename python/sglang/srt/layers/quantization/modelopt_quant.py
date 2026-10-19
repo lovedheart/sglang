@@ -2374,6 +2374,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self.enable_flashinfer_trtllm_moe and not get_moe_a2a_backend().is_megamoe()
         )
         self._cache_permute_indices = {}
+        # sm12x_nvfp4_bf16_disk: layers listed here load their payloads to
+        # VRAM exactly like the resident sm12x_nvfp4_bf16 backend.
+        from sglang.srt.layers.moe.moe_runner.sm12x_disk_registry import (
+            parse_layer_ranges,
+        )
+
+        self._sm12x_disk_resident_layers = parse_layer_ranges(
+            envs.SGLANG_SM12X_DISK_RESIDENT_LAYERS.get()
+        )
 
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
@@ -2447,6 +2456,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_loader = self.prepare_weight_loader(
             layer, extra_weight_attrs.get("weight_loader")
         )
+        # Disk backend: routed-expert payload tensors never touch VRAM (they
+        # stream from safetensors per forward); scales stay resident as usual.
+        payload_loader, payload_device = weight_loader, None
+        moe_runner_backend = getattr(
+            self, "_moe_runner_backend", get_moe_runner_backend()
+        )
+        disk_streamed = (
+            moe_runner_backend.is_sm12x_nvfp4_bf16_disk()
+            and layer.layer_id not in self._sm12x_disk_resident_layers
+        )
+        if disk_streamed:
+            from sglang.srt.layers.moe.moe_runner.sm12x_disk_registry import (
+                get_expert_registry,
+                make_payload_recorder,
+            )
+
+            payload_loader = make_payload_recorder(
+                get_expert_registry(), layer.layer_id
+            )
+            payload_device = "meta"
         if get_moe_runner_backend().is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (
                 make_nvfp4_megamoe_weight_loader,
@@ -2463,10 +2492,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,
                 dtype=weight_dtype,
+                device=payload_device,
             ),
             input_dim=1,
             output_dim=2,
-            weight_loader=weight_loader,
+            weight_loader=payload_loader,
         )
         layer.register_parameter("w13_weight", w13_weight)
 
@@ -2478,10 +2508,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // 2,
                 dtype=weight_dtype,
+                device=payload_device,
             ),
             input_dim=1,
             output_dim=2,
-            weight_loader=weight_loader,
+            weight_loader=payload_loader,
         )
         layer.register_parameter("w2_weight", w2_weight)
 
@@ -2706,7 +2737,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # global-scale ratio c on its up half; dividing it out of the FC2
             # multiplier keeps the FP4 intermediate on the calibrated grid --
             # this assumes c is ~uniform across experts (exactly 1 for mtpV4).
-            device = layer.w13_weight.device
+            device = layer.w13_weight_scale.device
 
             def _amax(t: torch.Tensor | None) -> torch.Tensor:
                 if t is None:
@@ -2747,7 +2778,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
         use_nvfp4_dispatch = _use_nvfp4_dispatch()
-        if moe_runner_backend.is_sm12x_nvfp4_bf16():
+        if moe_runner_backend.is_sm12x_nvfp4():
             self._prepare_sm12x_w4a16_weights(layer)
             return
         if moe_runner_backend.is_marlin():
@@ -3140,13 +3171,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             layer._cutedsl_wrapper = None
 
-        if moe_runner_backend.is_sm12x_nvfp4_bf16():
+        if moe_runner_backend.is_sm12x_nvfp4():
             if get_device_capability()[0] != 12:
                 raise NotImplementedError(
-                    "--moe-runner-backend sm12x_nvfp4_bf16 supports only "
-                    "SM120/SM121 (Blackwell GeForce / RTX PRO) GPUs."
+                    f"--moe-runner-backend {moe_runner_backend.value} supports "
+                    "only SM120/SM121 (Blackwell GeForce / RTX PRO) GPUs."
                 )
-            import sglang.srt.layers.moe.moe_runner.sm12x_nvfp4_bf16  # noqa: F401 – triggers @register_fused_func
+            if moe_runner_backend.is_sm12x_nvfp4_bf16_disk():
+                if layer.moe_ep_size > 1 or layer.moe_tp_size > 1:
+                    raise NotImplementedError(
+                        "--moe-runner-backend sm12x_nvfp4_bf16_disk supports "
+                        "only moe_ep_size == moe_tp_size == 1 (the payload "
+                        "registry indexes whole checkpoint experts)."
+                    )
+                import sglang.srt.layers.moe.moe_runner.sm12x_nvfp4_bf16_disk  # noqa: F401 – triggers @register_fused_func
+            else:
+                import sglang.srt.layers.moe.moe_runner.sm12x_nvfp4_bf16  # noqa: F401 – triggers @register_fused_func
 
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
@@ -3237,15 +3277,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
             return self.runner.run(dispatch_output, quant_info)
 
-        if moe_runner_backend.is_sm12x_nvfp4_bf16():
+        if moe_runner_backend.is_sm12x_nvfp4():
             from sglang.srt.layers.moe.moe_runner.sm12x_nvfp4_bf16 import (
                 Sm12xNvfp4W4A16MoeQuantInfo,
             )
 
             if getattr(layer, "expert_map", None) is not None:
                 raise NotImplementedError(
-                    "sm12x_nvfp4_bf16 does not support expert-parallel "
-                    "expert_map remapping yet."
+                    f"{moe_runner_backend.value} does not support "
+                    "expert-parallel expert_map remapping yet."
                 )
             quant_info = Sm12xNvfp4W4A16MoeQuantInfo(
                 w13=layer.w13_weight.data,
@@ -3256,6 +3296,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w2_gs=layer.w2_weight_scale_2.data,
                 a13_gs=getattr(layer, "w4a4_a13_gs", None),
                 a2_gs=getattr(layer, "w4a4_a2_gs", None),
+                layer_id=layer.layer_id,
             )
             return self.runner.run(dispatch_output, quant_info)
 

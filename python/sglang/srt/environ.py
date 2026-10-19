@@ -1225,6 +1225,42 @@ class Envs:
     # less accurate. 0 (default) disables the hybrid path; 256 is a good
     # crossover estimate.
     SGLANG_SM12X_W4A4_PREFILL_MIN_TOKENS = EnvInt(0)
+    # VRAM slot-cache budget (MiB) for expert weight payloads streamed by the
+    # sm12x_nvfp4_bf16_disk runner; the slot count rounds down to a power of two.
+    SGLANG_SM12X_DISK_SLOTS_MB = EnvInt(256)
+    # Pinned host staging slabs for the sm12x_nvfp4_bf16_disk runner; each
+    # slab holds one expert payload, so pinned bytes = SLABS * payload_bytes.
+    # A deeper ring keeps more misses in flight (pread ahead of H2D).
+    SGLANG_SM12X_DISK_SLABS = EnvInt(8)
+    # Expert slots pinned in host RAM, the middle tier of the streaming
+    # path: on a miss the expert is pread from NVMe directly into its
+    # slot, then copied slot -> VRAM; a later reuse skips disk I/O
+    # ("0" = off; fills then stage through the SLABS pinned ring).
+    # Counted in experts per MoE layer: a plain int is
+    # uniform, "a;b;c" sizes layers positionally, and "0-15:8,16-39:16"
+    # sizes layer-id ranges (same coordinate as RESIDENT_LAYERS;
+    # uncovered layers get 0). Layers with 0 allocate nothing.
+    SGLANG_SM12X_DISK_HOST_SLOTS = EnvStr("0")
+    # Comma-separated layer ranges (e.g. "1-4,7") whose expert payloads stay
+    # fully resident in VRAM instead of being streamed from disk.
+    SGLANG_SM12X_DISK_RESIDENT_LAYERS = EnvStr("")
+    # Number of MoE layers of posix_fadvise lookahead past the layer in flight.
+    SGLANG_SM12X_DISK_PREFETCH = EnvInt(1)
+    # Ping-pong (ring) VRAM layer buffers for eager (prefill-sized) launches:
+    # 0 disables. Each buffer holds one full streamed layer; 2 is the
+    # recommended default, 3 pays off when ~4-6 layers stream and VRAM is
+    # spare, and N >= n_streamed layers keeps them permanently resident
+    # (resident-speed prefill). Large streamed sets are H2D-link-bound,
+    # where deeper rings add VRAM cost without speed.
+    SGLANG_SM12X_DISK_PREFILL_LAYERS = EnvInt(0)
+    # fadvise the whole checkpoint into the page cache at startup.
+    SGLANG_SM12X_DISK_PREWARM = EnvBool(False)
+    # Page experts from a pinned RAM mirror with device-side LRU so the
+    # whole decode step (fill included) captures into a FULL CUDA graph.
+    # Needs one pinned copy of all routed payloads in host RAM.
+    SGLANG_SM12X_DISK_INGRAPH = EnvBool(False)
+    # Log slot hit/miss and the slot->expert table.
+    SGLANG_SM12X_DISK_DEBUG = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)

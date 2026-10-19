@@ -145,6 +145,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
     "sm12x_nvfp4_bf16",  # SM120/SM121 NVFP4 W4A16 (BF16 activations) CuTe DSL MoE
+    "sm12x_nvfp4_bf16_disk",  # ... with expert payloads streamed from safetensors on disk
     "flashinfer_megamoe",
     "cutlass",
     "aiter",

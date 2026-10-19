@@ -37,6 +37,12 @@ def fused_a_gemm_weight_eligible(layer: torch.nn.Module) -> bool:
         layer.weight.dtype == torch.bfloat16
         and layer.weight.shape[0] % 16 == 0
         and layer.weight.shape[1] % 256 == 0
+        # The sm120 auto pick (CuteDSL) tiles K in units of 1024; with a K
+        # that is not a multiple, fall back to the plain linear path.
+        and (
+            layer.weight.shape[1] % 1024 == 0
+            or _AUTO_BACKEND != FusedAGemmBackend.CUTEDSL
+        )
         and _IS_CUDA
         and _DEVICE_SM >= 90
     )

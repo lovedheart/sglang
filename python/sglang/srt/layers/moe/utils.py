@@ -152,6 +152,17 @@ class _MoeRunnerBackendPredicates:
     def is_sm12x_nvfp4_bf16(self):
         return self.value == MoeRunnerBackend.SM12X_NVFP4_BF16.value
 
+    def is_sm12x_nvfp4_bf16_disk(self):
+        return self.value == MoeRunnerBackend.SM12X_NVFP4_BF16_DISK.value
+
+    def is_sm12x_nvfp4(self):
+        # Both sm12x variants share weight prep and the CuTe-DSL kernel; the
+        # disk backend only changes where the expert payload is streamed from.
+        return self.value in (
+            MoeRunnerBackend.SM12X_NVFP4_BF16.value,
+            MoeRunnerBackend.SM12X_NVFP4_BF16_DISK.value,
+        )
+
     def is_flashinfer_megamoe(self):
         return self.value == MoeRunnerBackend.FLASHINFER_MEGAMOE.value
 
@@ -196,6 +207,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     SM12X_NVFP4_BF16 = "sm12x_nvfp4_bf16"
+    SM12X_NVFP4_BF16_DISK = "sm12x_nvfp4_bf16_disk"
     FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUTLASS = "cutlass"
     MARLIN = "marlin"

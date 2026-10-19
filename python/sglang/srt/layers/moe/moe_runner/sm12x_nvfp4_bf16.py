@@ -22,7 +22,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.kernels.ops.moe.sm12x_nvfp4_w4a16_moe import (
     allocate_workspace,
     run_moe_w4a16,
@@ -68,6 +67,8 @@ class Sm12xNvfp4W4A16MoeQuantInfo(MoeQuantInfo):
     # (1 / input_scale); see _prepare_sm12x_w4a16_weights for their derivation.
     a13_gs: torch.Tensor | None = None
     a2_gs: torch.Tensor | None = None
+    # MoE layer index; only read by the disk backend (slot-cache keying).
+    layer_id: int | None = None
 
 
 # Scratch buffers are keyed by (bucket tokens, hidden, inter, N13, experts,
@@ -136,10 +137,14 @@ def _w4a4_workspace(
         if arena is None:
             upper = _w4a4_upper_tokens(bucket)
             if upper is not None and upper >= bucket:
-                cap = _ws_bytes(_entry(upper, h, i, n13, e, topk, torch.device(device))[1])
+                cap = _ws_bytes(
+                    _entry(upper, h, i, n13, e, topk, torch.device(device))[1]
+                )
                 if cap >= need:
                     arena = [
-                        torch.empty(cap + _ARENA_SLACK, dtype=torch.uint8, device=device),
+                        torch.empty(
+                            cap + _ARENA_SLACK, dtype=torch.uint8, device=device
+                        ),
                         0,
                     ]
                     _W4A4_ARENAS[device] = arena
@@ -148,7 +153,11 @@ def _w4a4_workspace(
             ws = []
             for shape, dtype in shapes:
                 n = math.prod(shape)
-                nbytes = (n * dtype.itemsize + _ARENA_ALIGN - 1) // _ARENA_ALIGN * _ARENA_ALIGN
+                nbytes = (
+                    (n * dtype.itemsize + _ARENA_ALIGN - 1)
+                    // _ARENA_ALIGN
+                    * _ARENA_ALIGN
+                )
                 view = arena[0][off : off + n * dtype.itemsize].view(dtype)
                 ws.append(view.view(tuple(shape)))
                 off += nbytes
@@ -239,8 +248,6 @@ def _pad_rows(x: torch.Tensor, rows: int, dtype: torch.dtype, pad_value: float):
     out = torch.full((rows, *x.shape[1:]), pad_value, dtype=dtype, device=x.device)
     out[: x.shape[0]] = x.to(dtype)
     return out
-
-
 
 
 @register_fused_func("none", "sm12x_nvfp4_bf16")
