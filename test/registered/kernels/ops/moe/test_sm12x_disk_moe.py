@@ -138,13 +138,13 @@ def ck(request, tmp_path):
     """Synthetic ckpt published as model_path. ``slots_mb`` (default 1 ->
     K=16 slots) via indirect parametrisation; 0 pins K to the expert count
     so every call must thrash."""
-    slots_mb = getattr(request, "param", 1)
+    expert_slots = getattr(request, "param", 1)
     raws = {L: [_expert_raw(L, e) for e in range(E)] for L in LAYERS}
     _write_ckpt(tmp_path, raws)
     override = get_context().override_server_args(model_path=str(tmp_path))
     override.install()
     knobs = (
-        (envs.SGLANG_SM12X_DISK_SLOTS_MB, slots_mb),
+        (envs.SGLANG_SM12X_DISK_VRAM_EXPERT_SLOTS, expert_slots),
         (envs.SGLANG_SM12X_DISK_PREFETCH, 0),
         (envs.SGLANG_SM12X_DISK_PREWARM, False),
         (envs.SGLANG_SM12X_DISK_RESIDENT_LAYERS, ""),
@@ -284,13 +284,13 @@ def _qi_b(L, raw):
 @pytest.fixture()
 def ckb(request, tmp_path):
     """Same synthetic bytes as ``ck``, published in layout B naming."""
-    slots_mb = getattr(request, "param", 1)
+    expert_slots = getattr(request, "param", 1)
     raws = {L: [_expert_raw(L, e) for e in range(E)] for L in LAYERS}
     _write_ckpt_b(tmp_path, raws)
     override = get_context().override_server_args(model_path=str(tmp_path))
     override.install()
     knobs = (
-        (envs.SGLANG_SM12X_DISK_SLOTS_MB, slots_mb),
+        (envs.SGLANG_SM12X_DISK_VRAM_EXPERT_SLOTS, expert_slots),
         (envs.SGLANG_SM12X_DISK_PREFETCH, 0),
         (envs.SGLANG_SM12X_DISK_PREWARM, False),
         (envs.SGLANG_SM12X_DISK_RESIDENT_LAYERS, ""),

@@ -1627,6 +1627,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
+            from sglang.srt.layers.moe.moe_runner.sm12x_disk_ingraph import (
+                get_ingraph_pager,
+            )
+
+            pager = get_ingraph_pager()
+            if pager is not None and pager.budgeted:
+                # Budgeted mirror: a starved step refills pinned rows and
+                # replays the same graph before its output is consumed.
+                rerun = pager.end_step(
+                    lambda: self.backend.replay(self._replay_graph_key, forward_batch)
+                )
+                if rerun is not None:
+                    output = rerun
+
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)
 

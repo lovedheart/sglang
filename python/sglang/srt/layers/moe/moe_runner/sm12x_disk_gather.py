@@ -296,7 +296,8 @@ class ExpertSlotCache:
     """LRU slot pool over the expert payloads of one geometry.
 
     ``K`` (slots == kernel ``num_experts``) is a power of two from the
-    ``SGLANG_SM12X_DISK_SLOTS_MB`` budget, floored at the real expert count
+    ``SGLANG_SM12X_DISK_VRAM_EXPERT_SLOTS`` count, floored at the real expert
+    count
     so the experts of any single launch always fit simultaneously.
     """
 
@@ -321,8 +322,25 @@ class ExpertSlotCache:
             self.slot_bytes += (
                 quant_info.w13_sf[0].numel() + quant_info.w2_sf[0].numel()
             )
-        budget = int(envs.SGLANG_SM12X_DISK_SLOTS_MB.get()) << 20
-        n = max(budget // self.slot_bytes, 1)
+        # True VRAM cost of ONE slot: payload (+ streamed sf) above, plus the
+        # per-slot resident scale-factor and scale_2 regions, which exist in
+        # both layouts. slot_vram_bytes = full per-slot cost (log only now).
+        self.slot_vram_bytes = self.slot_bytes + sum(
+            t[0].numel() * t.element_size()
+            for t in (
+                # streamed sf is already inside slot_bytes; resident sf is a
+                # per-slot copy on top of it. gs is always per-slot.
+                *(
+                    (quant_info.w13_sf, quant_info.w2_sf)
+                    if not self.sf_streamed
+                    else ()
+                ),
+                quant_info.w13_gs,
+                quant_info.w2_gs,
+            )
+        )
+        n = max(int(envs.SGLANG_SM12X_DISK_VRAM_EXPERT_SLOTS.get()), 1)
+        self.slot_budget_experts = n  # log echo: requested expert slots
         k = min(1 << (n - 1).bit_length(), 4096)
         # Floor at the expert count: every expert a single launch can
         # simultaneously address must have a slot (K doubles as the
@@ -392,8 +410,10 @@ class ExpertSlotCache:
         )
         if prewarm and self.prefetcher is not None:
             self.prefetcher.prewarm()
-        n_pp = 0 if in_graph else min(
-            max(int(envs.SGLANG_SM12X_DISK_PREFILL_LAYERS.get()), 0), 4
+        n_pp = (
+            0
+            if in_graph
+            else min(max(int(envs.SGLANG_SM12X_DISK_PREFILL_LAYERS.get()), 0), 4)
         )
         if n_pp and self.sf_streamed:
             # pread_layer stages payloads only; the ping-pong path would
@@ -441,12 +461,8 @@ class ExpertSlotCache:
                         self.slot_w2_sf,
                     )
                 )
-                + bytes(
-                    self.slot_w13_gs[sl : sl + 1].view(torch.uint8).cpu().numpy()
-                )
-                + bytes(
-                    self.slot_w2_gs[sl : sl + 1].view(torch.uint8).cpu().numpy()
-                )
+                + bytes(self.slot_w13_gs[sl : sl + 1].view(torch.uint8).cpu().numpy())
+                + bytes(self.slot_w2_gs[sl : sl + 1].view(torch.uint8).cpu().numpy())
             ).hexdigest()[:8]
             dig.append(f"{ex}:{sl}:{h}")
         logger.info("IGDBG L%d %s", layer_id, " ".join(dig[:6]))
@@ -607,7 +623,7 @@ def get_slot_cache(
         raise RuntimeError(f"sm12x disk cache on a {device.type} device?")
     name = (
         f"sm12x_disk_cache:{device}:{h}:{i}:{num_experts}:"
-        f"{envs.SGLANG_SM12X_DISK_SLOTS_MB.get()}:"
+        f"{envs.SGLANG_SM12X_DISK_VRAM_EXPERT_SLOTS.get()}:"
         f"{'sf' if quant_info.w13_sf.device.type == 'meta' else 'res'}:"
         f"{'ig' if envs.SGLANG_SM12X_DISK_INGRAPH.get() else 'host'}"
     )

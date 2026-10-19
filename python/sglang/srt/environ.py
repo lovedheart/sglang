@@ -1225,9 +1225,13 @@ class Envs:
     # less accurate. 0 (default) disables the hybrid path; 256 is a good
     # crossover estimate.
     SGLANG_SM12X_W4A4_PREFILL_MIN_TOKENS = EnvInt(0)
-    # VRAM slot-cache budget (MiB) for expert weight payloads streamed by the
-    # sm12x_nvfp4_bf16_disk runner; the slot count rounds down to a power of two.
-    SGLANG_SM12X_DISK_SLOTS_MB = EnvInt(256)
+    # Number of expert slots in VRAM for the experts streamed by the
+    # sm12x_nvfp4_bf16_disk runner (one slot holds one (layer, expert)
+    # payload + its scale regions; contents are LRU-chosen across all MoE
+    # layers). The slot count rounds up to a power of two (kernel bucketing)
+    # and is floored at the per-layer expert count; VRAM spent =
+    # slots x per-slot bytes, logged at boot.
+    SGLANG_SM12X_DISK_VRAM_EXPERT_SLOTS = EnvInt(256)
     # Pinned host staging slabs for the sm12x_nvfp4_bf16_disk runner; each
     # slab holds one expert payload, so pinned bytes = SLABS * payload_bytes.
     # A deeper ring keeps more misses in flight (pread ahead of H2D).
@@ -1259,8 +1263,22 @@ class Envs:
     # whole decode step (fill included) captures into a FULL CUDA graph.
     # Needs one pinned copy of all routed payloads in host RAM.
     SGLANG_SM12X_DISK_INGRAPH = EnvBool(False)
+    # Budget (MiB) for the in-graph mirror when SGLANG_SM12X_DISK_INGRAPH=1.
+    # 0 (default) mirrors every expert (full-graph decode never stalls);
+    # a smaller budget keeps a pinned LRU cache of expert payloads, and a
+    # step that routes to an unmirrored expert is transparently replayed
+    # after the refiller thread pages it in. Only safe for models whose
+    # decode step is replay-idempotent (pure attention state); models with
+    # in-place recurrent state (mamba/KDA/GDN) ignore the budget.
+    SGLANG_SM12X_DISK_MIRROR_MB = EnvInt(0)
     # Log slot hit/miss and the slot->expert table.
     SGLANG_SM12X_DISK_DEBUG = EnvBool(False)
+    # DEBUG: pin the in-graph mirror to exactly N rows (0 = off, derive
+    # from MIRROR_MB). Forces budgeted mode for tests/benchmarks,
+    # overriding the replay-idempotence guard — on models with in-place
+    # recurrent state (mamba/KDA/GDN) starved-step replays make outputs
+    # numerically invalid, so this is a performance knob ONLY.
+    SGLANG_SM12X_DISK_DEBUG_MIRROR_ROWS = EnvInt(0)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
