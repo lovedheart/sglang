@@ -2717,42 +2717,63 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer._mega_moe_nvfp4 = True
         layer._mega_moe_weights_built = True
 
+    def _sm12x_global_scales(
+        self, layer: torch.nn.Module
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-expert GEMM scales (gs13, gs2) for the SM12x W4A16 kernel.
+
+        The kernel takes one global FP32 scale per expert, so when the
+        checkpoint stores separate gate/up global scales their ratio rides on
+        ``gs2`` — exact for a gated activation, because scaling only the up
+        half scales the activation output by the same constant. Cached on the
+        layer; a zero gate scale keeps its raw GEMM2 scale instead of dividing.
+        """
+        cached = getattr(layer, "_sm12x_gs_fold", None)
+        if cached is not None:
+            return cached
+        w13 = layer.w13_weight_scale_2
+
+        def _expert_vec(t: torch.Tensor) -> torch.Tensor:
+            t = t.to(torch.float32).reshape(-1)
+            return t.expand(w13.shape[0]) if t.numel() == 1 else t
+
+        if w13.dim() > 1 and w13.shape[-1] >= 2:
+            gate_gs = w13[..., 0].to(torch.float32)
+            up_gs = w13[..., 1].to(torch.float32)
+            gs13 = gate_gs
+            gs2 = _expert_vec(layer.w2_weight_scale_2) * torch.where(
+                gate_gs > 0, up_gs / gate_gs, torch.ones_like(up_gs)
+            )
+        else:
+            gs13 = _expert_vec(w13)
+            gs2 = _expert_vec(layer.w2_weight_scale_2)
+        folded = (gs13.contiguous(), gs2.contiguous())
+        layer._sm12x_gs_fold = folded
+        return folded
+
     def _prepare_sm12x_w4a16_weights(self, layer: torch.nn.Module) -> None:
         """Prepare raw checkpoint FP4 weights for the SM12x W4A16 kernel.
 
         Weights stay packed FP4 (BF16 activations, no activation quantization);
         only the e4m3 block scales are swizzled into the kernel's 128x4 layout.
-        The kernel takes one global FP32 scale per expert, so when the
-        checkpoint stores separate gate/up global scales their ratio rides on
-        ``w2_gs`` — exact for a gated activation, because scaling only the up
-        half scales the activation output by the same constant.
+        The gate/up global-scale fold is in ``_sm12x_global_scales``.
         """
-        num_experts = layer.w13_weight.shape[0]
-
-        def _expert_vec(t: torch.Tensor) -> torch.Tensor:
-            t = t.to(torch.float32).reshape(-1)
-            return t.expand(num_experts) if t.numel() == 1 else t
-
         hybrid = (
             envs.SGLANG_SM12X_W4A4_PREFILL_MIN_TOKENS.get() > 0
             and layer.moe_runner_config.is_gated
         )
-        w13_gs = layer.w13_weight_scale_2.data
+        w13_gs_raw = layer.w13_weight_scale_2.data
         gate_up_ratio = None
-        if layer.moe_runner_config.is_gated and w13_gs.dim() > 1:
-            gate_gs = w13_gs[:, 0].to(torch.float32)
-            up_gs = w13_gs[:, 1].to(torch.float32)
+        if layer.moe_runner_config.is_gated and w13_gs_raw.dim() > 1:
+            gate_gs = w13_gs_raw[:, 0].to(torch.float32)
+            up_gs = w13_gs_raw[:, 1].to(torch.float32)
             gate_up_ratio = gate_gs / up_gs
-            w2_gs = _expert_vec(layer.w2_weight_scale_2.data) * (up_gs / gate_gs)
-            w13_gs = gate_gs
-        else:
-            w13_gs = _expert_vec(w13_gs)
-            w2_gs = _expert_vec(layer.w2_weight_scale_2.data)
+        w13_gs, w2_gs = self._sm12x_global_scales(layer)
 
         layer.w13_weight_scale.data = swizzle_blockscale(layer.w13_weight_scale.data)
         layer.w2_weight_scale.data = swizzle_blockscale(layer.w2_weight_scale.data)
-        layer.w13_weight_scale_2.data = w13_gs.contiguous()
-        layer.w2_weight_scale_2.data = w2_gs.contiguous()
+        layer.w13_weight_scale_2.data = w13_gs
+        layer.w2_weight_scale_2.data = w2_gs
         # create_weights pre-allocated swizzled-scale placeholders for the
         # flashinfer TRTLLM/megamoe paths; we keep the swizzled data on the
         # weight_scale params, so alias (freeing the placeholders — ~157 MB
