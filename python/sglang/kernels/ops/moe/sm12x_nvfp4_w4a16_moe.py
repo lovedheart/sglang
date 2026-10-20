@@ -1641,7 +1641,14 @@ def _planA(H, N13, I, S):
 
 # Plans and compiled kernels only: scratch belongs to the caller (see
 # ``allocate_workspace``) so layers and concurrent streams never share it.
-_COMPILED: dict = {}
+# ``cute.compile`` costs ~15 s per token-count specialization, so compiled
+# objects also persist across process restarts via the CuTe AOT cache.
+_PLANS: dict = {}
+_COMPILED = None  # lazily a cute_aot_cache.JITCache; see ``run_moe_w4a16``.
+
+
+def _entry_key(T, H, I, N13, E, TOPK, dev):
+    return (dev.type, dev.index, T, H, I, N13, E, TOPK)
 
 
 def _persistent_plan(T, H, I, N13, TOPK, S, dev, sf13, sf2):
@@ -1756,8 +1763,8 @@ def _scale_shape(E: int, rows: int, k: int) -> tuple[int, int, int]:
 def _entry(T, H, I, N13, E, TOPK, dev):
     sf13 = _scale_shape(E, N13, H)
     sf2 = _scale_shape(E, H, I)
-    key = (dev, T, H, I, N13, E, TOPK)
-    entry = _COMPILED.get(key)
+    key = _entry_key(T, H, I, N13, E, TOPK, dev)
+    entry = _PLANS.get(key)
     if entry is None:
         S = T * TOPK
         BM = _pick_bm(S, E)
@@ -1770,7 +1777,7 @@ def _entry(T, H, I, N13, E, TOPK, dev):
         consts, fp32_elems, int32_elems = plan
         sizes = (fp32_elems, int32_elems, max(1, S * I))
         entry = [persistent, consts, sizes, None]
-        _COMPILED[key] = entry
+        _PLANS[key] = entry
     return entry
 
 
@@ -1898,11 +1905,25 @@ def run_moe_w4a16(
         )
         launcher = moe_jit
     if compiled is None:
-        fake = [from_dlpack(t, assumed_align=16, enable_tvm_ffi=True) for t in args]
-        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        compiled = cute.compile(
-            launcher, *fake, stream, *consts.values(), options="--enable-tvm-ffi"
-        )
+        from sglang.kernels.jit.cute_aot_cache import get_jit_cache
+
+        global _COMPILED
+        if _COMPILED is None:
+            _COMPILED = get_jit_cache(
+                "sm12x_nvfp4_w4a16_moe",
+                source_paths=(__file__,),
+                enable_tvm_ffi=True,
+            )
+        key = _entry_key(T, H, I, N13, E, TOPK, dev)
+        if key in _COMPILED:
+            compiled = _COMPILED[key]
+        else:
+            fake = [from_dlpack(t, assumed_align=16, enable_tvm_ffi=True) for t in args]
+            stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+            compiled = cute.compile(
+                launcher, *fake, stream, *consts.values(), options="--enable-tvm-ffi"
+            )
+            _COMPILED[key] = compiled
         entry[3] = compiled
     compiled(*args)
     return out
