@@ -1303,11 +1303,19 @@ class Envs:
     # for; larger batches launch at an exact-size bucket rounded up (power of
     # two, then 8192-alignment) to keep the compile set bounded.
     SGLANG_SM12X_W4A16_MOE_MAX_TOKENS = EnvInt(8192)
+    # Use the single fused persistent-launch kernel of the sm12x_nvfp4_bf16
+    # runner at decode sizes instead of the separate route/gemm/act/final
+    # launches.  Off by default: the tiled launches measured faster at every
+    # swept token bucket on SM120 (e.g. 13.0 vs 19.7 us per layer at T=1).
+    SGLANG_SM12X_W4A16_PERSISTENT = EnvBool(False)
     # With --moe-runner-backend sm12x_nvfp4_bf16, route batches with at least
     # this many tokens through flashinfer's moe_nvfp4_w4a4 kernel
-    # (NVFP4-quantized activations), ~1.4x faster on prefill but slightly
-    # less accurate. 0 (default) disables the hybrid path; 256 is a good
-    # crossover estimate.
+    # (NVFP4-quantized activations) instead of the W4A16 kernel.  Cold-L2
+    # crossover on Qwen3.8-Flash geometry (E=512,H=2560,I=640,top-10): a tie
+    # near 128 tokens, then +13% at 256, 1.7x at 512, 3x at 1024; W4A16 wins
+    # below.  0 (default) disables the hybrid path; 256 is the measured
+    # safe margin, but the W4A4 arm quantizes activations (slightly less
+    # accurate), so enabling it stays a deliberate accuracy tradeoff.
     SGLANG_SM12X_W4A4_PREFILL_MIN_TOKENS = EnvInt(0)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
