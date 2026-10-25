@@ -529,6 +529,20 @@ class ModelOptFp8Config(ModelOptQuantConfig):
         )
 
 
+def _resident_layer(layer):
+    spec = envs.SGLANG_W2A16_RESIDENT_LAYERS.get().strip()
+    if spec.lower() in ("", "all"):
+        return True
+    ids = set()
+    for part in spec.split(","):
+        if "-" in part:
+            a, b = part.split("-")
+            ids.update(range(int(a), int(b) + 1))
+        elif part.strip():
+            ids.add(int(part))
+    return int(getattr(layer, "layer_id", 0)) in ids
+
+
 class ModelOptFp8LinearMethod(LinearMethodBase):
     """Linear method for ModelOpt static FP8 quantization.
 
@@ -2881,6 +2895,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     w2p.to("cuda"), s2.to("cuda"),
                 )
                 del mm, w13p, s13, w2p, s2
+        elif mode == "stream" and envs.SGLANG_W2A16_GPU_DECODE.get() \
+                and _resident_layer(layer):
+            mm, w13p, s13, w2p, s2 = archive.load_layer(layer.layer_id, E, H, I)
+            gpu = (w13p.to("cuda"), s13.to("cuda"),
+                   w2p.to("cuda"), s2.to("cuda"))
+            del mm, w13p, s13, w2p, s2
         layer._w2a16_gpu_planes = gpu
         layer._w2a16_archive = archive
         # SM12x cubin prefill arm (vLLM-Moet moe_w2_mm): planes repacked

@@ -106,9 +106,15 @@ def fused_experts_none_to_w2a16_offload(
     assert topk <= 8, "w2a16 staging rows are width 8"
 
     cpu_min = max(2, envs.SGLANG_W2A16_PREFILL_MIN_TOKENS.get())
-    if torch.cuda.is_current_stream_capturing() and quant_info.cpu is not None:
-        # Decode graphs only; the cubin arms use raw cuLaunchKernel and
-        # host copies, neither legal during capture.
+    if t < cpu_min and envs.SGLANG_W2A16_GPU_DECODE.get() and \
+            quant_info.gpu_w13 is not None:
+        # Partial decode: this layer's planes are VRAM-resident; Triton
+        # arm is cuda-graph legal, unlike the cubin arms.
+        return _gpu_path(hidden, topk_ids, topk_weights, quant_info)
+    if t < cpu_min and torch.cuda.is_current_stream_capturing() and \
+            quant_info.cpu is not None:
+        # Decode graphs on layers without resident planes go to the CPU
+        # kernel; cubin arms use raw cuLaunchKernel, illegal in capture.
         return _cpu_path(hidden, topk_ids, topk_weights, quant_info)
     # prefill-sized batches go to the GPU arm; everything smaller (every
     # graph-captured decode step) goes to the CPU kernel.
