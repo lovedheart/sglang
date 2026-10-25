@@ -188,6 +188,46 @@ def _desc_kernel(eids_ptr, npad_ptr, d_ptr,
         tl.store(d + 5, m, mask=ok)
 
 
+@triton.jit
+def _silu_quant_kernel(c13_ptr, a2_ptr, as2_ptr, I,
+                       CLAMP: tl.constexpr, GS: tl.constexpr,
+                       IB: tl.constexpr, GB: tl.constexpr):
+    """c13 [S,2I] bf16 (gate|up) -> a2 [S,I] e4m3 bytes, as2 [S,I/32] f32."""
+    row = tl.program_id(0)
+    offs = tl.arange(0, IB)
+    m = offs < I
+    g = tl.load(c13_ptr + row * 2 * I + offs, mask=m, other=0.0).to(tl.float32)
+    u = tl.load(c13_ptr + row * 2 * I + I + offs, mask=m, other=0.0).to(tl.float32)
+    g = tl.minimum(g, CLAMP)
+    act = g * tl.sigmoid(g) * tl.minimum(tl.maximum(u, -CLAMP), CLAMP)
+    # match the unfused reference: bf16 intermediate rounding before quant
+    act = act.to(tl.bfloat16).to(tl.float32)
+    a = tl.reshape(act, (GB, 32))
+    s = tl.maximum(tl.max(tl.abs(a), axis=1) / 448.0, 1e-30)
+    q = tl.clamp(a / s[:, None], -448.0, 448.0).to(tl.float8e4nv)
+    tl.store(a2_ptr + row * I + offs,
+             tl.reshape(q.to(tl.uint8, bitcast=True), (IB,)), mask=m)
+    go = tl.arange(0, GB)
+    tl.store(as2_ptr + row * GB + go, s * GS)
+
+
+@triton.jit
+def _unpermute_kernel(c2_ptr, inv_ptr, w_ptr, out_ptr, H,
+                      TOPK: tl.constexpr, HB: tl.constexpr):
+    """out[t] = sum_j w[t,j] * c2[inv[t*TOPK+j]]  (inv = -1 for invalid)."""
+    t = tl.program_id(0)
+    row = tl.arange(0, HB)
+    m = row < H
+    acc = tl.zeros((HB,), dtype=tl.float32)
+    for j in tl.static_range(TOPK):
+        pos = tl.load(inv_ptr + t * TOPK + j)
+        w = tl.load(w_ptr + t * TOPK + j)
+        v = tl.load(c2_ptr + pos.to(tl.int64) * H + row,
+                    mask=m & (pos >= 0), other=0.0).to(tl.float32)
+        acc += tl.where(pos >= 0, v * w, 0.0)
+    tl.store(out_ptr + t.to(tl.int64) * H + row, acc, mask=m)
+
+
 def _launch(fn, k, n, desc, pairs, stream):
     args = [ctypes.c_uint64(desc.data_ptr()),
             ctypes.c_uint32(k), ctypes.c_uint32(k // 64),
@@ -252,10 +292,11 @@ def cubin_forward(x, topk_ids, topk_weights, planes, E, H, I, k13, k2,
         pairs, pairs * 6, E, BLOCK=256)
     stream = torch.cuda.current_stream().cuda_stream
     _launch(fn13, k13, 2 * I, desc[0], pairs, stream)
-    g = c13[:, :I].float().clamp(max=silu_clamp)
-    act = (g * torch.sigmoid(g) * c13[:, I:].float().clamp(
-        -silu_clamp, silu_clamp)).to(torch.bfloat16)
-    a2, as2 = _quant_a32(act, k2)
+    assert k2 == I, "fused silu+quant assumes cubin K2 == I"
+    a2 = torch.empty(slots, I, dtype=torch.uint8, device=dev)
+    as2 = torch.empty(slots, I // 32, dtype=torch.float32, device=dev)
+    _silu_quant_kernel[(slots,)](c13, a2, as2, I, CLAMP=silu_clamp, GS=1.0,
+                                 IB=triton.next_power_of_2(I), GB=I // 32)
     c2 = torch.empty(slots, H, dtype=torch.bfloat16, device=dev)
     _desc_kernel[(triton.cdiv(pairs, 256),)](
         expert_ids, npad, desc,
@@ -266,12 +307,18 @@ def cubin_forward(x, topk_ids, topk_weights, planes, E, H, I, k13, k2,
         pairs, pairs * 6, E, BLOCK=256)
     _launch(fn2, k2, H, desc[1], pairs, stream)
 
-    # weighted unpermute (deterministic: fixed-order sum over topk)
+    # weighted unpermute (deterministic: fixed-order sum over topk).
+    # inverse map via scatter (no device sync); garbage slack slots land
+    # in the dropped extra bucket.
     sids = sorted_ids[:slots]
     valid = (sids >= 0) & (sids < numel)
-    w = topk_weights.reshape(-1)[sids[valid].long()].float()
-    c2v = c2[:slots][valid].float() * w.unsqueeze(1)
-    out = torch.zeros(numel, H, dtype=torch.float32, device=dev)
-    dst = sids[valid].long()
-    out.index_copy_(0, dst, c2v)
-    return out.view(t, topk_ids.shape[1], H).sum(1)
+    slots_ar = torch.arange(slots, dtype=torch.int32, device=dev)
+    buf = torch.full((numel + 1,), -1, dtype=torch.int32, device=dev)
+    buf.scatter_(0, torch.where(valid, sids, numel),
+                 torch.where(valid, slots_ar, slots_ar.new_tensor(-1)))
+    inv = buf[:numel]
+    out = torch.empty(t, H, dtype=torch.float32, device=dev)
+    _unpermute_kernel[(t,)](c2, inv, topk_weights.contiguous(), out, H,
+                            TOPK=topk_ids.shape[1],
+                            HB=triton.next_power_of_2(H))
+    return out

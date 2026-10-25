@@ -24,7 +24,7 @@ def _rowmajor(codes):
 
 class TestCubinSelect(unittest.TestCase):
     def test_k_selection(self):
-        self.assertEqual(cubin_k_for(1536, _MC4_KS), 2048)
+        self.assertEqual(cubin_k_for(1536, _MC4_KS), 1536)  # exact-K cubin shipped
         self.assertEqual(cubin_k_for(512, _MC4_KS), 512)
         self.assertEqual(cubin_k_for(1537, _MC4_KS), 2048)
 
