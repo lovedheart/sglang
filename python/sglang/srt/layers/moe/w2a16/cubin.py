@@ -228,6 +228,58 @@ def _unpermute_kernel(c2_ptr, inv_ptr, w_ptr, out_ptr, H,
     tl.store(out_ptr + t.to(tl.int64) * H + row, acc, mask=m)
 
 
+class _StreamRing:
+    """Two device slots streamed from pinned host planes, one per parity of
+    layer id: layer i's H2D rides layer i-1's compute on slot i%2^1."""
+
+    def __init__(self):
+        self.slots = None
+        self.ev_free = None
+        self.ev_copy = None
+        self.copy_stream = torch.cuda.Stream()
+
+    def ensure(self, cpu_planes, device):
+        # Shared ring: all MoE layers have identical plane shapes, so ONE
+        # pair of slots (2x planes size) serves every layer. Allocating per
+        # layer would cost 2 planes x num_layers on device and defeat the
+        # whole point of stream mode.
+        if self.slots is None:
+            self.slots = [[torch.empty(c.shape, dtype=c.dtype, device=device)
+                           for c in cpu_planes] for _ in range(2)]
+            self.ev_free = [torch.cuda.Event() for _ in range(2)]
+            self.ev_copy = [torch.cuda.Event() for _ in range(2)]
+
+
+_RING = None
+
+
+def _ring():
+    global _RING
+    if _RING is None:
+        _RING = _StreamRing()
+    return _RING
+
+
+def cubin_forward_streamed(x, topk_ids, topk_weights, cpu_planes, layer_id,
+                           E, H, I, k13, k2, silu_clamp=20):
+    """Prefill with the packed planes kept in host RAM (GPU holds only a
+    2-slot ping-pong ring). Transfer-bound on purpose: buys back the
+    ~2.4 GB resident footprint for KV cache."""
+    ring = _ring()
+    ring.ensure(cpu_planes, x.device)
+    slot = layer_id % 2
+    with torch.cuda.stream(ring.copy_stream):
+        ring.ev_free[slot].wait(ring.copy_stream)
+        for d, s_ in zip(ring.slots[slot], cpu_planes):
+            d.copy_(s_, non_blocking=True)
+        ring.ev_copy[slot].record(ring.copy_stream)
+    torch.cuda.current_stream().wait_event(ring.ev_copy[slot])
+    out = cubin_forward(x, topk_ids, topk_weights,
+                        tuple(ring.slots[slot]), E, H, I, k13, k2, silu_clamp)
+    ring.ev_free[slot].record()
+    return out
+
+
 def _launch(fn, k, n, desc, pairs, stream):
     args = [ctypes.c_uint64(desc.data_ptr()),
             ctypes.c_uint32(k), ctypes.c_uint32(k // 64),

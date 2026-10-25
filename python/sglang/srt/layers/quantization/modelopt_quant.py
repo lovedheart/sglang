@@ -2886,16 +2886,25 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # SM12x cubin prefill arm (vLLM-Moet moe_w2_mm): planes repacked
         # once into fragment-major layout, K padded to a shipped cubin.
         moet = None
-        if mode == "moet":
+        if mode in ("moet", "stream"):
             from sglang.srt.layers.moe.w2a16.cubin import (
                 _MC4_KS, cubin_k_for, pack_planes_for_cubin, shapes_supported)
             if shapes_supported(H, I):
                 k13 = cubin_k_for(H, _MC4_KS)
                 k2 = cubin_k_for(I, _MC4_KS)
                 mm, w13p, s13, w2p, s2 = archive.load_layer(layer.layer_id, E, H, I)
-                packed = pack_planes_for_cubin(w13p, s13, w2p, s2, E, H, I,
-                                               k13, k2, "cuda")
-                del mm, w13p, s13, w2p, s2
+                stream_mode = mode == "stream"
+                if stream_mode:
+                    # Pack on host to avoid per-layer GPU temporaries that
+                    # leave allocator segments reserved on a shared GPU.
+                    packed = pack_planes_for_cubin(w13p, s13, w2p, s2, E, H, I,
+                                                   k13, k2, "cpu")
+                    del mm, w13p, s13, w2p, s2
+                    packed = tuple(t.pin_memory() for t in packed)
+                else:
+                    packed = pack_planes_for_cubin(w13p, s13, w2p, s2, E, H, I,
+                                                   k13, k2, "cuda")
+                    del mm, w13p, s13, w2p, s2
                 moet = (packed, k13, k2)
                 if not getattr(layer, "_w2a16_moet_logged", False):
                     logger.info(
@@ -3510,7 +3519,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 gpu_s13=None if gpu is None else gpu[1],
                 gpu_w2=None if gpu is None else gpu[2],
                 gpu_s2=None if gpu is None else gpu[3],
-                moet_planes=None if moet is None else moet[0],
+                moet_planes=None if moet is None else (
+                    None if moet[0][0].is_cpu else moet[0]),
+                moet_cpu_planes=moet[0] if (
+                    moet is not None and moet[0][0].is_cpu) else None,
+                moet_layer_id=int(getattr(layer, "layer_id", 0) or 0),
                 moet_k13=0 if moet is None else moet[1],
                 moet_k2=0 if moet is None else moet[2],
                 E=cfg.num_local_experts,

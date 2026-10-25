@@ -52,6 +52,8 @@ class W2A16OffloadMoeQuantInfo(MoeQuantInfo):
     gpu_w2: torch.Tensor | None = None
     gpu_s2: torch.Tensor | None = None
     moet_planes: tuple | None = None   # cubin-packed planes (GPU_MODE=moet)
+    moet_cpu_planes: tuple | None = None  # pinned host planes (GPU_MODE=stream)
+    moet_layer_id: int = 0
     moet_k13: int = 0
     moet_k2: int = 0
     E: int = 0
@@ -106,6 +108,8 @@ def fused_experts_none_to_w2a16_offload(
     cpu_min = max(2, envs.SGLANG_W2A16_PREFILL_MIN_TOKENS.get())
     # prefill-sized batches go to the GPU arm; everything smaller (every
     # graph-captured decode step) goes to the CPU kernel.
+    if t >= cpu_min and quant_info.moet_cpu_planes is not None:
+        return _moet_stream_path(hidden, topk_ids, topk_weights, quant_info)
     if t >= cpu_min and quant_info.moet_planes is not None:
         return _moet_path(hidden, topk_ids, topk_weights, quant_info)
     if quant_info.gpu_w13 is not None and t >= cpu_min:
@@ -124,6 +128,22 @@ def _moet_path(hidden, topk_ids, topk_weights, quant_info):
     out = cubin_forward(
         hidden, topk_ids, topk_weights.float(), quant_info.moet_planes,
         quant_info.E, quant_info.H, quant_info.I,
+        quant_info.moet_k13, quant_info.moet_k2,
+    )
+    return StandardCombineInput(hidden_states=out.to(hidden.dtype))
+
+
+def _moet_stream_path(hidden, topk_ids, topk_weights, quant_info):
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from sglang.srt.layers.moe.w2a16.cubin import cubin_forward_streamed
+
+    if not hasattr(_moet_stream_path, "_hit"):
+        _moet_stream_path._hit = True
+        logger.info("w2a16_offload: cubin STREAMED arm serving %d tokens "
+                    "(planes in host RAM)", hidden.shape[0])
+    out = cubin_forward_streamed(
+        hidden, topk_ids, topk_weights.float(), quant_info.moet_cpu_planes,
+        quant_info.moet_layer_id, quant_info.E, quant_info.H, quant_info.I,
         quant_info.moet_k13, quant_info.moet_k2,
     )
     return StandardCombineInput(hidden_states=out.to(hidden.dtype))
