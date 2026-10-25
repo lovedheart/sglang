@@ -2895,8 +2895,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 mm, w13p, s13, w2p, s2 = archive.load_layer(layer.layer_id, E, H, I)
                 stream_mode = mode == "stream"
                 if stream_mode:
-                    # Pack on host to avoid per-layer GPU temporaries that
-                    # leave allocator segments reserved on a shared GPU.
+                    spec = envs.SGLANG_W2A16_RESIDENT_LAYERS.get().strip()
+                    if spec.lower() in ("", "all"):
+                        resident = True
+                    else:
+                        ids = set()
+                        for part in spec.split(","):
+                            if "-" in part:
+                                a, b = part.split("-")
+                                ids.update(range(int(a), int(b) + 1))
+                            elif part.strip():
+                                ids.add(int(part))
+                        resident = int(getattr(layer, "layer_id", 0)) in ids
+                if stream_mode and not resident:
+                    # Pinned RAM planes; pack on host to avoid per-layer GPU
+                    # temporaries that leave allocator segments reserved.
                     packed = pack_planes_for_cubin(w13p, s13, w2p, s2, E, H, I,
                                                    k13, k2, "cpu")
                     del mm, w13p, s13, w2p, s2

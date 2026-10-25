@@ -1333,6 +1333,9 @@ class Envs:
     # load (~half the NVFP4 bytes); "window" keeps a pinned host mirror and
     # streams an LRU window of layers (SGLANG_W2A16_GPU_WINDOW_GB).
     SGLANG_W2A16_GPU_MODE = EnvStr("resident")
+    # GPU_MODE=stream: which layer ids keep planes in VRAM; others
+    # stream from pinned RAM. "1-8", "1,2", "all" (default), "" = all.
+    SGLANG_W2A16_RESIDENT_LAYERS = EnvStr("all")
     # Sliding-window budget in GiB for GPU_MODE=window.
     SGLANG_W2A16_GPU_WINDOW_GB = EnvFloat(4.0)
     # Prefill kernel arm: "triton" (portable dequant grouped GEMM) or

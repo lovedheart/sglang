@@ -106,6 +106,10 @@ def fused_experts_none_to_w2a16_offload(
     assert topk <= 8, "w2a16 staging rows are width 8"
 
     cpu_min = max(2, envs.SGLANG_W2A16_PREFILL_MIN_TOKENS.get())
+    if torch.cuda.is_current_stream_capturing() and quant_info.cpu is not None:
+        # Decode graphs only; the cubin arms use raw cuLaunchKernel and
+        # host copies, neither legal during capture.
+        return _cpu_path(hidden, topk_ids, topk_weights, quant_info)
     # prefill-sized batches go to the GPU arm; everything smaller (every
     # graph-captured decode step) goes to the CPU kernel.
     if t >= cpu_min and quant_info.moet_cpu_planes is not None:

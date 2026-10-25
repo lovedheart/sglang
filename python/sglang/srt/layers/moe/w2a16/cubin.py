@@ -268,6 +268,15 @@ def cubin_forward_streamed(x, topk_ids, topk_weights, cpu_planes, layer_id,
     ring = _ring()
     ring.ensure(cpu_planes, x.device)
     slot = layer_id % 2
+    serial = os.environ.get("W2A16_STREAM_SERIAL")
+    if serial:
+        # No side stream/events: plain copy on the current stream. Slower
+        # (no overlap) but legal inside CUDA graph capture.
+        for d, s_ in zip(ring.slots[slot], cpu_planes):
+            d.copy_(s_, non_blocking=True)
+        return cubin_forward(x, topk_ids, topk_weights,
+                             tuple(ring.slots[slot]), E, H, I, k13, k2,
+                             silu_clamp)
     with torch.cuda.stream(ring.copy_stream):
         ring.ev_free[slot].wait(ring.copy_stream)
         for d, s_ in zip(ring.slots[slot], cpu_planes):
