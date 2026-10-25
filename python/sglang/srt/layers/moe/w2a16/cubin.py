@@ -202,13 +202,13 @@ def _silu_quant_kernel(c13_ptr, a2_ptr, as2_ptr, I,
     act = g * tl.sigmoid(g) * tl.minimum(tl.maximum(u, -CLAMP), CLAMP)
     # match the unfused reference: bf16 intermediate rounding before quant
     act = act.to(tl.bfloat16).to(tl.float32)
-    a = tl.reshape(act, (GB, 32))
+    a = tl.reshape(act, (IB // 32, 32))          # IB pow2; pad groups are 0
     s = tl.maximum(tl.max(tl.abs(a), axis=1) / 448.0, 1e-30)
     q = tl.clamp(a / s[:, None], -448.0, 448.0).to(tl.float8e4nv)
     tl.store(a2_ptr + row * I + offs,
              tl.reshape(q.to(tl.uint8, bitcast=True), (IB,)), mask=m)
-    go = tl.arange(0, GB)
-    tl.store(as2_ptr + row * GB + go, s * GS)
+    go = tl.arange(0, IB // 32)
+    tl.store(as2_ptr + row * GB + go, s * GS, mask=go < GB)
 
 
 @triton.jit
@@ -376,7 +376,7 @@ def cubin_forward(x, topk_ids, topk_weights, planes, E, H, I, k13, k2,
     slots_ar = torch.arange(slots, dtype=torch.int32, device=dev)
     buf = torch.full((numel + 1,), -1, dtype=torch.int32, device=dev)
     buf.scatter_(0, torch.where(valid, sids, numel),
-                 torch.where(valid, slots_ar, slots_ar.new_tensor(-1)))
+                 slots_ar.masked_fill(~valid, -1))
     inv = buf[:numel]
     out = torch.empty(t, H, dtype=torch.float32, device=dev)
     _unpermute_kernel[(t,)](c2, inv, topk_weights.contiguous(), out, H,
