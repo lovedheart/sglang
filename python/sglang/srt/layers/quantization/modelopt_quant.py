@@ -2867,7 +2867,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # GPU copy for the prefill arm (TS4 is ~2x smaller than the NVFP4
         # checkpoint layout; the window guard bounds the resident total).
         gpu = None
-        if envs.SGLANG_W2A16_GPU_MODE.get() == "resident":
+        mode = envs.SGLANG_W2A16_GPU_MODE.get()
+        if mode == "resident":
             budget = envs.SGLANG_W2A16_GPU_WINDOW_GB.get()
             per_layer = (
                 E * 2 * I * H // 4 + E * 2 * I * H // 32
@@ -2882,6 +2883,28 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 del mm, w13p, s13, w2p, s2
         layer._w2a16_gpu_planes = gpu
         layer._w2a16_archive = archive
+        # SM12x cubin prefill arm (vLLM-Moet moe_w2_mm): planes repacked
+        # once into fragment-major layout, K padded to a shipped cubin.
+        moet = None
+        if mode == "moet":
+            from sglang.srt.layers.moe.w2a16.cubin import (
+                _MC4_KS, cubin_k_for, pack_planes_for_cubin, shapes_supported)
+            if shapes_supported(H, I):
+                k13 = cubin_k_for(H, _MC4_KS)
+                k2 = cubin_k_for(I, _MC4_KS)
+                mm, w13p, s13, w2p, s2 = archive.load_layer(layer.layer_id, E, H, I)
+                packed = pack_planes_for_cubin(w13p, s13, w2p, s2, E, H, I,
+                                               k13, k2, "cuda")
+                del mm, w13p, s13, w2p, s2
+                moet = (packed, k13, k2)
+                if not getattr(layer, "_w2a16_moet_logged", False):
+                    logger.info(
+                        "w2a16_offload: SM12x cubin prefill arm (K13=%d "
+                        "K2=%d, %.2f GB/layer, %d packed tensors)",
+                        k13, k2, sum(t.numel() for t in packed) / 1e9,
+                        len(packed))
+                    layer._w2a16_moet_logged = True
+        layer._w2a16_moet = moet
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
@@ -3480,12 +3503,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 layer._w2a16_engine = eng
             gpu = getattr(layer, "_w2a16_gpu_planes", None)
+            moet = getattr(layer, "_w2a16_moet", None)
             quant_info = W2A16OffloadMoeQuantInfo(
                 cpu=eng,
                 gpu_w13=None if gpu is None else gpu[0],
                 gpu_s13=None if gpu is None else gpu[1],
                 gpu_w2=None if gpu is None else gpu[2],
                 gpu_s2=None if gpu is None else gpu[3],
+                moet_planes=None if moet is None else moet[0],
+                moet_k13=0 if moet is None else moet[1],
+                moet_k2=0 if moet is None else moet[2],
                 E=cfg.num_local_experts,
                 H=cfg.hidden_size,
                 I=cfg.intermediate_size_per_partition,
