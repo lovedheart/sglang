@@ -88,9 +88,13 @@ def load_fn(variant: str, k: int):
 
 
 def cubin_k_for(k: int, table) -> int:
-    """Smallest cubin K >= k in the given K table, or -1."""
-    cands = [kx for kx in table if kx >= k and (kx * 4) % 128 == 0]
-    return min(cands) if cands else -1
+    """Prefer an exact-K cubin on disk, else smallest cubin K >= k, else -1."""
+    d = os.environ.get("SGLANG_W2A16_MOET_DIR", _CUBIN_DIR_DEFAULT)
+    for kx in sorted({k, *table}):
+        if kx >= k and (kx * 4) % 128 == 0 and os.path.exists(
+                os.path.join(d, f"moe_w2_mm_mc4_k{kx}_a32.cubin")):
+            return kx
+    return -1
 
 
 _MC4_KS = [384, 512, 768, 1024, 2048, 3584, 4096, 6144, 7168]
