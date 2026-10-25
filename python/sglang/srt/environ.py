@@ -1317,6 +1317,31 @@ class Envs:
     # safe margin, but the W4A4 arm quantizes activations (slightly less
     # accurate), so enabling it stays a deliberate accuracy tradeoff.
     SGLANG_SM12X_W4A4_PREFILL_MIN_TOKENS = EnvInt(0)
+    # w2a16_offload: TS4 2-bit MoE engine (vendored ig_moe) that keeps routed
+    # expert weights off the GPU: decode runs the AVX-512 ts4_a16_ffn kernel
+    # over memory-mapped host expert planes, prefill runs the same planes on
+    # the SM12x GPU. Directory for the per-checkpoint TS4 archive (built once
+    # from the NVFP4 checkpoint, reused across launches); empty =
+    # <model-path>/.ts4-cache.
+    SGLANG_W2A16_TS4_CACHE = EnvStr("")
+    # Route batches with at least this many tokens (and every extend/prefill
+    # batch) through the GPU arm; below it, decode runs on the CPU engine.
+    SGLANG_W2A16_PREFILL_MIN_TOKENS = EnvInt(2)
+    # OpenMP threads for the CPU ts4_a16_ffn kernel (0 = library default).
+    SGLANG_W2A16_CPU_THREADS = EnvInt(8)
+    # GPU expert-weight tier: "resident" uploads every layer's TS4 planes at
+    # load (~half the NVFP4 bytes); "window" keeps a pinned host mirror and
+    # streams an LRU window of layers (SGLANG_W2A16_GPU_WINDOW_GB).
+    SGLANG_W2A16_GPU_MODE = EnvStr("resident")
+    # Sliding-window budget in GiB for GPU_MODE=window.
+    SGLANG_W2A16_GPU_WINDOW_GB = EnvFloat(4.0)
+    # Prefill kernel arm: "triton" (portable dequant grouped GEMM) or
+    # "moet_cubin" (vLLM-Moet moe_w2_mm SASS cubins, fp8-A a32 numerics).
+    SGLANG_W2A16_PREFILL_ARM = EnvStr("triton")
+    # Run CPU decode inside decode CUDA graphs via a cuLaunchHostFunc host
+    # node on pinned fixed-address staging. 0 = eager CPU decode.
+    SGLANG_W2A16_GRAPH_CPU_DECODE = EnvBool(True)
+    SGLANG_W2A16_DEBUG = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)

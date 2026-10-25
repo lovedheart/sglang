@@ -66,7 +66,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_platform, get_server_args
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
@@ -2807,6 +2807,82 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 ratio * _amax(getattr(layer, "w2_input_scale", None))
             )
 
+    def _prepare_w2a16_offload_weights(self, layer: torch.nn.Module) -> None:
+        """NVFP4 checkpoint -> TS4 planes for the w2a16_offload engine.
+
+        Quantizes on the GPU, writes/opens the per-checkpoint archive, and
+        keeps the raw checkpoint tensors alive for exactly one layer (the
+        archive caches them; the next layer's conversion can then reuse the
+        freed VRAM). The engine itself is built in ``apply`` — the first
+        forward — so the weight params may free afterwards.
+        """
+        import os
+
+        from sglang.srt.layers.moe.w2a16.transfer import (
+            Ts4Archive,
+            build_layer_planes,
+            fingerprint_of,
+        )
+
+        if getattr(layer, "expert_map", None) is not None or layer.moe_ep_size > 1:
+            raise NotImplementedError(
+                "w2a16_offload does not support expert parallelism yet."
+            )
+        if layer.moe_tp_size > 1:
+            raise NotImplementedError(
+                "w2a16_offload does not support tensor-parallel MoE yet."
+            )
+        cfg = layer.moe_runner_config
+        H = cfg.hidden_size
+        I = cfg.intermediate_size_per_partition
+        E = cfg.num_local_experts
+        model_path = get_server_args().model_path
+
+        cdir = envs.SGLANG_W2A16_TS4_CACHE.get() or os.path.join(
+            model_path, ".ts4-cache"
+        )
+        archive = Ts4Archive(cdir, fingerprint_of(model_path))
+        if not archive.has_layer(layer.layer_id, E, H, I):
+            logger.info(
+                "w2a16_offload: quantizing layer %d to TS4 (%d experts)...",
+                layer.layer_id,
+                E,
+            )
+            # Convert on CPU: the GPU may be tight and the kernels are
+            # one-shot at load; peak intermediates stay out of CUDA.
+            w13_plane, s13, w2_plane, s2 = build_layer_planes(layer, "cpu")
+            archive.write_layer(layer.layer_id, E, H, I,
+                                w13_plane, s13, w2_plane, s2)
+            del w13_plane, s13, w2_plane, s2
+        # The packed NVFP4 params are dead once TS4 planes exist; drop them
+        # from GPU memory (the decode arm reads planes, never these).
+        for p in ("w13_weight", "w13_weight_scale", "w2_weight",
+                  "w2_weight_scale"):
+            t = getattr(layer, p, None)
+            if t is not None and t.device.type != "cpu":
+                layer.__dict__[p] = None
+                t.data = torch.empty(0, dtype=t.dtype, device="cpu")
+        torch.cuda.empty_cache()
+
+        # GPU copy for the prefill arm (TS4 is ~2x smaller than the NVFP4
+        # checkpoint layout; the window guard bounds the resident total).
+        gpu = None
+        if envs.SGLANG_W2A16_GPU_MODE.get() == "resident":
+            budget = envs.SGLANG_W2A16_GPU_WINDOW_GB.get()
+            per_layer = (
+                E * 2 * I * H // 4 + E * 2 * I * H // 32
+                + E * H * I // 4 + E * H * I // 32
+            ) / 1e9
+            if budget >= per_layer:
+                mm, w13p, s13, w2p, s2 = archive.load_layer(layer.layer_id, E, H, I)
+                gpu = (
+                    w13p.to("cuda"), s13.to("cuda"),
+                    w2p.to("cuda"), s2.to("cuda"),
+                )
+                del mm, w13p, s13, w2p, s2
+        layer._w2a16_gpu_planes = gpu
+        layer._w2a16_archive = archive
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
@@ -2835,6 +2911,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         use_nvfp4_dispatch = _use_nvfp4_dispatch()
         if moe_runner_backend.is_sm12x_nvfp4_bf16():
             self._prepare_sm12x_w4a16_weights(layer)
+            return
+        if moe_runner_backend.is_w2a16_offload():
+            self._prepare_w2a16_offload_weights(layer)
             return
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
@@ -3247,6 +3326,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
             import sglang.srt.layers.moe.moe_runner.sm12x_nvfp4_bf16  # noqa: F401 – triggers @register_fused_func
 
+        if moe_runner_backend.is_w2a16_offload():
+            from sglang.srt.layers.moe.w2a16 import native
+
+            if not native.cpu_supports_kernel():
+                raise NotImplementedError(
+                    "--moe-runner-backend w2a16_offload needs an AVX-512 "
+                    "(F/BW/DQ/VL + F16C) x86 host for its CPU decode kernel."
+                )
+            import sglang.srt.layers.moe.moe_runner.w2a16_offload  # noqa: F401 – triggers @register_fused_func
+
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
 
@@ -3358,6 +3447,51 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w2_gs=layer.w2_weight_scale_2.data,
                 a13_gs=getattr(layer, "w4a4_a13_gs", None),
                 a2_gs=getattr(layer, "w4a4_a2_gs", None),
+            )
+            return self.runner.run(dispatch_output, quant_info)
+
+        if moe_runner_backend.is_w2a16_offload():
+            from sglang.srt.layers.moe.moe_runner.w2a16_offload import (
+                W2A16OffloadMoeQuantInfo,
+            )
+
+            eng = getattr(layer, "_w2a16_engine", None)
+            cfg = layer.moe_runner_config
+            if eng is None:
+                from sglang.srt.layers.moe.w2a16.cpu_engine import W2A16CpuEngine
+
+                mm, w13p, s13, w2p, s2 = layer._w2a16_archive.load_layer(
+                    layer.layer_id,
+                    cfg.num_local_experts,
+                    cfg.hidden_size,
+                    cfg.intermediate_size_per_partition,
+                )
+                cap = min(
+                    512,
+                    get_server_args().max_running_requests or 512,
+                )
+                eng = W2A16CpuEngine(
+                    w13p, s13, w2p, s2, mm,
+                    E=cfg.num_local_experts,
+                    H=cfg.hidden_size,
+                    I=cfg.intermediate_size_per_partition,
+                    K=cfg.top_k,
+                    max_rows=cap,
+                )
+                layer._w2a16_engine = eng
+            gpu = getattr(layer, "_w2a16_gpu_planes", None)
+            quant_info = W2A16OffloadMoeQuantInfo(
+                cpu=eng,
+                gpu_w13=None if gpu is None else gpu[0],
+                gpu_s13=None if gpu is None else gpu[1],
+                gpu_w2=None if gpu is None else gpu[2],
+                gpu_s2=None if gpu is None else gpu[3],
+                E=cfg.num_local_experts,
+                H=cfg.hidden_size,
+                I=cfg.intermediate_size_per_partition,
+                apply_routed_scaling_factor=(
+                    not layer.should_fuse_routed_scaling_factor_in_topk
+                ),
             )
             return self.runner.run(dispatch_output, quant_info)
 

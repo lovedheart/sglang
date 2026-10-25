@@ -2538,6 +2538,7 @@ class DeepseekV2AttentionMLA(
                 and not get_exec().deterministic.enable_deterministic_inference
                 and not self.is_packed_weight
                 and fused_a_gemm_weight_eligible(self.fused_qkv_a_proj_with_mqa)
+                and self.fused_qkv_a_proj_with_mqa.weight.shape[1] % 1024 == 0
             )
         if self._use_min_latency_fused_a_gemm:
             return linear_with_fused_a_gemm(

@@ -135,6 +135,12 @@ class MoeRunner:
             from sglang.srt.layers.moe.moe_runner import (  # noqa: F401
                 sm12x_nvfp4_bf16,
             )
+        elif runner_backend.is_w2a16_offload():
+            self.runner_core = None  # w2a16_offload only supports fused path
+            # Import here (not at module top) to register the fused func.
+            from sglang.srt.layers.moe.moe_runner import (  # noqa: F401
+                w2a16_offload,
+            )
         elif runner_backend.is_flashinfer_cutlass():
             self.runner_core = None  # FlashInfer CUTLASS only supports fused path
         elif runner_backend.is_flashinfer_mxfp4():
