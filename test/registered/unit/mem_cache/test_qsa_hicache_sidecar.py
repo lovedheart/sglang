@@ -166,7 +166,8 @@ class TestMambaStrategyWiring(CustomTestCase):
             patch.object(
                 assembler,
                 "build_hybrid_mamba_stack",
-                return_value=(group, MagicMock()),
+                # Upstream returns (host_pool_group, cache_controller, config).
+                return_value=(group, MagicMock(), MagicMock()),
             ) as built,
             patch.object(
                 assembler,
