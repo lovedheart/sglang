@@ -1752,6 +1752,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             :, src_indices[valid_indices], steps[valid_indices]
         ]
 
+
 def update_ple_state_after_mtp_verify(
     req_to_token_pool,
     state_indices_tensor: torch.Tensor,
