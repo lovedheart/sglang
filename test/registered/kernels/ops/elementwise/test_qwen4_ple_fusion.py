@@ -1,11 +1,9 @@
 import pytest
 import torch
 
-from sglang.kernels.ops.qwen4_ple import (
-    fused_qwen4_gate_value,
-    fused_qwen4_ngram_hash,
-    fused_qwen4_short_conv_state,
-)
+from sglang.kernels.ops.elementwise.qwen4_gate import fused_qwen4_gate_value
+from sglang.kernels.ops.embeddings.qwen4_ngram import fused_qwen4_ngram_hash
+from sglang.kernels.ops.mamba.qwen4_short_conv import fused_qwen4_short_conv_state
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 
