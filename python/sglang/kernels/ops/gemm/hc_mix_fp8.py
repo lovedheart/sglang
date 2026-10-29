@@ -21,8 +21,16 @@ from sglang.kernels.ops.gemm.hc_mix import (
 )
 
 # Rows a prefill chunk must reach before the W8A8 GEMMs beat the compiled
-# BF16 dequant chain on this GPU (measured crossover ~2-3k; keep margin).
-_W8A8_MIN_ROWS = 4096
+# BF16 dequant chain on this GPU. Measured on sm_120 (RTX PRO 6000,
+# HC=4/HS=2560/LR=320, median of 50 timed calls) against the *full* fallback
+# cost -- per-call MXFP8 dequant of both mix weights + the compiled chain:
+# fallback wins below ~256 rows (0.83-0.95x for the small-launch path), the
+# paths cross at ~512 (1.04x), and W8A8 pulls away to 1.1-1.5x through the
+# 4k chunk band and 1.24x at 6144. The old 4096 floor timed the W8A8-only
+# side of that comparison, so serving prefill chunks (17..4095 rows after a
+# 4096-token chunk split) never actually reached it and re-dequantized the
+# mix weights on every call.
+_W8A8_MIN_ROWS = 512
 
 
 @triton.jit

@@ -11,6 +11,11 @@ from sglang.kernels.ops.gemm.hc_mix import (
     fused_hc_mix_fold_supported,
     fused_hc_mix_supported,
 )
+from sglang.kernels.ops.gemm.hc_mix_fp8 import (
+    _W8A8_MIN_ROWS,
+    fused_hc_mix_fp8_w8a8,
+    fused_hc_mix_fp8_w8a8_supported,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -171,6 +176,61 @@ def test_fused_hc_mix_fold_gate_rejects_prefill_rows():
         _FUSED_MIX_MAX_ROWS + 1, torch.bfloat16
     )
     assert not fused_hc_mix_fold_supported(x, w_down_fold, w_up)
+
+
+# --------------------------------------------------------------------------
+# W8A8 prefill path: activations are MXFP8-quantized on the fly so both mix
+# GEMMs run on fp8 tensor cores. The activation quantization dominates the
+# error budget, so these check a relative-norm bound, not per-element closeness.
+# --------------------------------------------------------------------------
+
+
+def _make_w8a8_weights(dtype: torch.dtype):
+    from sglang.srt.layers.fp8_hc_mix import mxfp8_quantize_rowmajor
+
+    _, w_down, w_up = _make_inputs(1, dtype)
+    return (
+        mxfp8_quantize_rowmajor(w_down),
+        mxfp8_quantize_rowmajor(w_up),
+    )
+
+
+def _dequant(w8, scale_u8):
+    from sglang.srt.layers.fp8_hc_mix import mxfp8_dequantize_to_bf16
+
+    return mxfp8_dequantize_to_bf16(w8, scale_u8)
+
+
+@pytest.mark.parametrize("num_tokens", [_W8A8_MIN_ROWS, 1024, 4090])
+def test_fused_hc_mix_w8a8_matches_reference(num_tokens):
+    x, _, _ = _make_inputs(num_tokens, torch.bfloat16)
+    (d8, ds), (u8, us) = _make_w8a8_weights(torch.bfloat16)
+    assert fused_hc_mix_fp8_w8a8_supported(x, d8, u8, ds, us)
+    out = fused_hc_mix_fp8_w8a8(x, d8, ds, u8, us, HC_COUNT, HIDDEN_SIZE)
+    ref = _reference_mix(x, _dequant(d8, ds), _dequant(u8, us), HC_COUNT, HIDDEN_SIZE)
+    assert torch.isfinite(out).all()
+    rel = ((out.to(torch.float64) - ref).norm() / ref.norm()).item()
+    # Activations lose to e4m3+ue8m0, but the long K reduction averages the
+    # per-element error down; the mix gate stays well inside 1%.
+    assert rel < 0.01, f"rel_err {rel:.2e} at rows={num_tokens}"
+
+
+def test_fused_hc_mix_w8a8_gate_bounds():
+    (d8, ds), (u8, us) = _make_w8a8_weights(torch.bfloat16)
+
+    big = torch.randn(_W8A8_MIN_ROWS, HC_COUNT * HIDDEN_SIZE, device="cuda").to(
+        torch.bfloat16
+    )
+    assert fused_hc_mix_fp8_w8a8_supported(big, d8, u8, ds, us)
+    small = big[: _W8A8_MIN_ROWS - 1]
+    assert not fused_hc_mix_fp8_w8a8_supported(small, d8, u8, ds, us)
+    # Non-contiguous rows (e.g. a width slice) must stay on the fallback.
+    wide = torch.randn(
+        _W8A8_MIN_ROWS, 2 * HC_COUNT * HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+    )
+    sliced = wide[:, : HC_COUNT * HIDDEN_SIZE]
+    assert not sliced.is_contiguous()
+    assert not fused_hc_mix_fp8_w8a8_supported(sliced, d8, u8, ds, us)
 
 
 if __name__ == "__main__":
