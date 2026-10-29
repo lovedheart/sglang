@@ -1522,14 +1522,33 @@ def moe_jit(
 # host glue
 # ======================================================================================
 def _pick_bm(S, E):
-    # rows-per-CTA = next power of two >= the mean slots per expert.  Rounding UP costs no
-    # extra padded rows versus rounding down (ceil(c/BM)*BM is the same for BM in [c, 2c))
-    # but halves how often each expert's weights have to be streamed.
+    # Rows-per-CTA ladder measured on the Qwen3.8-Flash-Next geometry
+    # (E=512, H=2560, I=640, top-10) over token buckets 1..8192, cold-L2 event
+    # timing cross-checked with paired CUDA-graph ABBA on the runner path.
+    # Identical to the old next-pow2(mean slots/expert) rule except in the
+    # 129..896-token band, where BM=8 beats the old BM=16 choice by ~10% at
+    # T=512 (a taller M-tile mostly buys padding, not weight reuse).  Still
+    # capped by next_pow2(mean slots/expert) so small-E shapes never sit on a
+    # tile taller than any expert actually fills.
+    if S <= 320:
+        bm = 1
+    elif S <= 640:
+        bm = 2
+    elif S <= 1280:
+        bm = 4
+    elif S <= 8192:
+        bm = 8
+    else:
+        bm = 32
     r = S / max(1, min(E, S))
-    bm = 1
-    while bm < 32 and bm < r:
-        bm *= 2
-    return bm
+    cap = 1
+    while cap < 32 and cap < r:
+        cap *= 2
+    if r > 32:
+        # few experts, many rows each: weight reuse per CTA dominates and only
+        # the widest tile keeps it (the old rule's choice; never tune down).
+        bm = 32
+    return min(bm, cap)
 
 
 def _divs(n):
@@ -1759,10 +1778,18 @@ def _entry(T, H, I, N13, E, TOPK, dev):
     key = (dev, T, H, I, N13, E, TOPK)
     entry = _COMPILED.get(key)
     if entry is None:
+        from sglang.srt.environ import envs
+
         S = T * TOPK
         BM = _pick_bm(S, E)
+        # The fused single-launch kernel measures slower than the separate
+        # route/gemm/act/final launches at every token bucket swept on SM120
+        # (e.g. 19.7 vs 13.0 us at T=1 under graph replay); tiled is the
+        # default and the persistent arm is an escape hatch only.
         plan = (
-            _persistent_plan(T, H, I, N13, TOPK, S, dev, sf13, sf2) if BM == 1 else None
+            _persistent_plan(T, H, I, N13, TOPK, S, dev, sf13, sf2)
+            if BM == 1 and envs.SGLANG_SM12X_W4A16_PERSISTENT.get()
+            else None
         )
         persistent = plan is not None
         if not persistent:
