@@ -61,6 +61,10 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Also quantize the NEXTN MTP draft layer's shared expert to FP8 b128. Draft-path error feeds proposal accept-length directly, so it is a separate opt-in; has no effect unless --enable-fp8-shared-expert is also set.",
     ] = False
+    enable_fp8_hc_mix: A[
+        bool,
+        "Store the per-layer hyper-connection mix projections (input_mix_weight_down/up) in MXFP8 (e4m3 + 1x32 UE8M0 scales) at load time, halving ~1.27 GB of BF16 mix weights; the decode mix kernel descales in registers (W8A16: BF16 activations). The last main layer, the final mixer, and the NEXTN/MTP draft stay BF16.",
+    ] = False
     enable_tf32_matmul: A[
         Optional[bool],
         Arg(

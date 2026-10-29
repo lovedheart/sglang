@@ -2703,6 +2703,21 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     "128x128 block scales",
                     n,
                 )
+        if get_exec().features.enable_fp8_hc_mix:
+            from sglang.srt.layers.fp8_hc_mix import quantize_hc_mix_to_mxfp8
+
+            # The MTP draft builds its own GatedResiduals through this model
+            # class with is_nextn=True and a separate load_weights, which
+            # deliberately omits this call: the draft stays BF16.
+            cfg = getattr(self.config, "text_config", self.config)
+            n = quantize_hc_mix_to_mxfp8(
+                self.model, last_layer=int(cfg.num_hidden_layers) - 1
+            )
+            if n:
+                logger.info(
+                    "Quantized %d HC mix modules to MXFP8 (last layer left BF16)",
+                    n,
+                )
 
         return loaded_params
 

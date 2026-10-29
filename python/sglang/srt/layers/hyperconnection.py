@@ -7,11 +7,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import (
+    _FUSED_MIX_MAX_ROWS,
     fused_hc_mix,
     fused_hc_mix_fold,
     fused_hc_mix_fold_supported,
     fused_hc_mix_supported,
     hc_norm_fold_enabled,
+)
+from sglang.kernels.ops.gemm.hc_mix_fp8 import (
+    fused_hc_mix_fold_fp8,
+    fused_hc_mix_fold_fp8_supported,
+    fused_hc_mix_fp8,
+    fused_hc_mix_fp8_supported,
+    fused_hc_mix_fp8_w8a8,
+    fused_hc_mix_fp8_w8a8_supported,
 )
 
 
@@ -215,6 +224,8 @@ class GatedResidual(HyperConnectionBase):
         self._wn = None
         self._w_down_fold = None
         self._w_inject_fold = None
+        # Set by fp8_hc_mix.quantize_hc_mix_to_mxfp8 at load time.
+        self._mxfp8_mix = False
 
         def _mix_compute(
             hyper_input_normed: torch.Tensor,
@@ -306,9 +317,11 @@ class GatedResidual(HyperConnectionBase):
             return
         wn = (1.0 + self.hc_norm.weight.float()).contiguous()
         self._wn = wn
-        if self._use_mix:
+        if self._use_mix and not self._mxfp8_mix:
             w_down = self.input_mix_weight_down.weight
             self._w_down_fold = (w_down.float() * wn).to(w_down.dtype).contiguous()
+        # For _mxfp8_mix modules no BF16 down fold is ever materialized: the
+        # fp8 fold kernel applies the gain in-register on the packed tiles.
         if self._use_combine:
             w_inject = self.block_inject_weight.weight
             self._w_inject_fold = (
@@ -330,14 +343,42 @@ class GatedResidual(HyperConnectionBase):
         # The CuTe split-K pair wants the normed residual and only exists on
         # sm_100 at decode sizes; there, keep the unfused norm.
         fold = (
-            self._norm_fold_ok
+            (self._norm_fold_ok or self._mxfp8_mix)
             and hyper_input.is_cuda
             and hyper_input.dtype in (torch.bfloat16, torch.float16)
             and not (self._jit_mix_ok and hyper_input.shape[0] <= 24)
         )
         if fold:
             self._ensure_fold_weights()
-            if fused_hc_mix_fold_supported(
+            if self._mxfp8_mix:
+                if fused_hc_mix_fold_fp8_supported(
+                    hyper_input,
+                    self.input_mix_weight_down.weight,
+                    self.input_mix_weight_up.weight,
+                    getattr(self.input_mix_weight_down, "_mxfp8_scale", None),
+                    getattr(self.input_mix_weight_up, "_mxfp8_scale", None),
+                ):
+                    # Packed MXFP8 fold: no BF16 copy anywhere, RMSNorm gain
+                    # applied in-register after the e4m3 descale.
+                    mixed_input, norm_g = fused_hc_mix_fold_fp8(
+                        hyper_input,
+                        self.input_mix_weight_down.weight,
+                        self.input_mix_weight_up.weight,
+                        self._wn,
+                        self.hc_count,
+                        self.hidden_size,
+                        self.config.rms_norm_eps,
+                        getattr(self.input_mix_weight_down, "_mxfp8_scale", None),
+                        getattr(self.input_mix_weight_up, "_mxfp8_scale", None),
+                    )
+                    return mixed_input.to(self.params_dtype), (
+                        hyper_input,
+                        None,
+                        norm_g,
+                    )
+                # Unsupported (rows/env/cuda-graph-off): fall through to the
+                # normed paths below, which dequantize on the fly.
+            elif fused_hc_mix_fold_supported(
                 hyper_input, self._w_down_fold, self.input_mix_weight_up.weight
             ):
                 mixed_input, norm_g = fused_hc_mix_fold(
@@ -349,6 +390,7 @@ class GatedResidual(HyperConnectionBase):
                     self.hidden_size,
                     self.config.rms_norm_eps,
                 )
+                return mixed_input.to(self.params_dtype), (hyper_input, None, norm_g)
             else:
                 mixed_input, norm_g = self._mix_folded(
                     hyper_input,
@@ -359,7 +401,7 @@ class GatedResidual(HyperConnectionBase):
                     self.hidden_size,
                     self.config.rms_norm_eps,
                 )
-            return mixed_input.to(self.params_dtype), (hyper_input, None, norm_g)
+                return mixed_input.to(self.params_dtype), (hyper_input, None, norm_g)
 
         if normalized_input is not None:
             assert self.config.hc_per_branch_norm
@@ -371,7 +413,60 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed = self.hc_norm(
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
-        if (
+        if self._mxfp8_mix:
+            if fused_hc_mix_fp8_supported(
+                hyper_input_normed,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                getattr(self.input_mix_weight_down, "_mxfp8_scale", None),
+                getattr(self.input_mix_weight_up, "_mxfp8_scale", None),
+            ):
+                mixed_input = fused_hc_mix_fp8(
+                    hyper_input_normed,
+                    self.input_mix_weight_down.weight,
+                    self.input_mix_weight_up.weight,
+                    self.hc_count,
+                    self.hidden_size,
+                    self.input_mix_weight_down._mxfp8_scale,
+                    self.input_mix_weight_up._mxfp8_scale,
+                ).to(self.params_dtype)
+            elif fused_hc_mix_fp8_w8a8_supported(
+                hyper_input_normed,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                getattr(self.input_mix_weight_down, "_mxfp8_scale", None),
+                getattr(self.input_mix_weight_up, "_mxfp8_scale", None),
+            ):
+                # Prefill sizes: activations quantized to MXFP8 on the fly so
+                # both mix GEMMs run on fp8 tensor cores (~25% faster mix).
+                mixed_input = fused_hc_mix_fp8_w8a8(
+                    hyper_input_normed,
+                    self.input_mix_weight_down.weight,
+                    self.input_mix_weight_down._mxfp8_scale,
+                    self.input_mix_weight_up.weight,
+                    self.input_mix_weight_up._mxfp8_scale,
+                    self.hc_count,
+                    self.hidden_size,
+                ).to(self.params_dtype)
+            else:
+                # Prefill / long-batch / CPU / triton-off: dequantize on the
+                # fly and keep the torch.compile chain.
+                from sglang.srt.layers.fp8_hc_mix import mxfp8_dequantize_to_bf16
+
+                mixed_input = self._mix_compute(
+                    hyper_input_normed,
+                    mxfp8_dequantize_to_bf16(
+                        self.input_mix_weight_down.weight,
+                        self.input_mix_weight_down._mxfp8_scale,
+                    ),
+                    mxfp8_dequantize_to_bf16(
+                        self.input_mix_weight_up.weight,
+                        self.input_mix_weight_up._mxfp8_scale,
+                    ),
+                    self.hc_count,
+                    self.hidden_size,
+                ).to(self.params_dtype)
+        elif (
             self._jit_mix_ok
             and hyper_input_normed.is_cuda
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
