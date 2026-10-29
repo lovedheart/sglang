@@ -155,6 +155,7 @@ class TestMambaStrategyWiring(CustomTestCase):
     def _run_build(self, *, host_mode, page_size):
         params = SimpleNamespace(
             page_size=page_size,
+            token_to_kv_pool_allocator=MagicMock(),
             req_to_token_pool=SimpleNamespace(
                 mamba_map={0: 0, 1: 1, 2: 2, 4: 3, 5: 4, 6: 5, 8: 6, 9: 7, 10: 8},
                 mamba_pool=MagicMock(),
