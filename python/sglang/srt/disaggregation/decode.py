@@ -183,7 +183,7 @@ def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     req.host_hit_length = 0
 
 
-class DecodeReqToTokenPool:
+class DecodeReqToTokenPool(ReqToTokenPool):
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
     DecodeReqToTokenPool subscribes memory for pre-allocated requests.
@@ -378,6 +378,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         self.state.slots.clear()
+
 
 
 @dataclass
