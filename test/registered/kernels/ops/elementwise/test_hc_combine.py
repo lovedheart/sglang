@@ -5,7 +5,12 @@ import torch.nn.functional as F
 from sglang.kernels.ops.elementwise.hc_combine import hc_combine
 from sglang.test.ci.ci_register import register_cuda_ci
 
+<<<<<<< HEAD
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+=======
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+>>>>>>> 0511acd92d (QSA: compressed-K HiCache sidecar, fused NVFP4 sparse-decode, test ports)
 
 HC_COUNT = 4
 HIDDEN_SIZE = 2560
@@ -152,6 +157,53 @@ def test_hc_combine_bad_hidden_size():
             inject_weight,
             4,
             1000,
+        )
+
+
+def test_hc_combine_unsupported_dtype():
+    block_output, residual, normed_residual, inject_weight = _make_inputs(
+        4, torch.float32
+    )
+    with pytest.raises(RuntimeError, match="dtype"):
+        hc_combine(
+            block_output,
+            residual,
+            normed_residual,
+            inject_weight,
+            HC_COUNT,
+            HIDDEN_SIZE,
+        )
+
+
+def test_hc_combine_dtype_mismatch():
+    block_output, residual, normed_residual, inject_weight = _make_inputs(
+        4, torch.bfloat16
+    )
+    with pytest.raises(RuntimeError, match="dtype"):
+        hc_combine(
+            block_output.float(),
+            residual,
+            normed_residual,
+            inject_weight,
+            HC_COUNT,
+            HIDDEN_SIZE,
+        )
+
+
+def test_hc_combine_shape_mismatch():
+    dtype = torch.bfloat16
+    block_output, residual, normed_residual, inject_weight = _make_inputs(4, dtype)
+    bad_weight = torch.randn(
+        HC_COUNT, HC_COUNT * HIDDEN_SIZE + 2048, dtype=dtype, device="cuda"
+    )
+    with pytest.raises(RuntimeError):
+        hc_combine(
+            block_output,
+            residual,
+            normed_residual,
+            bad_weight,
+            HC_COUNT,
+            HIDDEN_SIZE,
         )
 
 
