@@ -250,6 +250,7 @@ def _block_linear_method(runner, weight_dtype="e4m3"):
     method.block_quant = True
     method.weight_block_size = [BLOCK, BLOCK]
     method.convert_mxfp8_to_block = False
+    method.use_npu_block_fp8 = False
     method.is_checkpoint_fp8_serialized = True
     method.w8a8_block_fp8_linear = runner
     method.quant_config = SimpleNamespace(
