@@ -1,0 +1,35 @@
+{
+ "10": {
+  "problem": 10,
+  "pred": 156,
+  "correct": true,
+  "completion_tokens": 26850,
+  "prompt_tokens": 196,
+  "reasoning_tokens": 25823,
+  "elapsed_s": 137.5,
+  "finish": "stop",
+  "tail": "65),\\ (560,0),\\ (405,-135),\\ (0,0),\\ (-43,201).\n\\]\n\nUsing the shoelace formula,\n\n\\[\nS_1=200\\cdot465+405\\cdot0+560(-135)+405\\cdot0+0\\cdot201+(-43)\\cdot480=-3240,\n\\]\n\n\\[\nS_2=480\\cdot405+465\\cdot560+0\\cdot405+(-135)\\cdot0+0(-43)+201\\cdot200=495000.\n\\]\n\nThe area is\n\n\\[\n\\frac{|S_1-S_2|}{2\\cdot 40^2}\n=\n\\frac{498240}{3200}\n=\n\\frac{1557}{10}\n=\n155.7.\n\\]\n\nThe closest integer is therefore\n\n\\[\n\\boxed{156}\n\\]"
+ },
+ "11": {
+  "problem": 11,
+  "pred": 64,
+  "correct": false,
+  "completion_tokens": 32768,
+  "prompt_tokens": 248,
+  "reasoning_tokens": 32768,
+  "elapsed_s": 196.3,
+  "finish": "length",
+  "tail": "4-l, new l-1, change=2l-65, average l~17 => -31 each, total -124. Bad.\n\nSwap a low corner label32 with high interior label64? x black corner deg2 label32, y white interior deg4 label64. x edges: neighbors white high labels maybe 33..64? If y not neighbor. old h-32, new |64? no x label64 high, neighbors high h: change h-64 - (h-32)= -32 each => -64. y edges: label32 low, neighbors black low labels\n"
+ },
+ "15": {
+  "problem": 15,
+  "pred": 0,
+  "correct": false,
+  "completion_tokens": 32768,
+  "prompt_tokens": 268,
+  "reasoning_tokens": 32769,
+  "elapsed_s": 194.1,
+  "finish": "length",
+  "tail": "d left column length a, and possibly bottom/right sides. Since it must intersect both diagonals in exactly two cells (for 10x10 into5), what are possible (a,b)? It contains (1,1). Main diagonal cells it occupies: (1,1) and maybe (m,m) where m=min(a,b) if a\u2260b? If a=b, (a,a). If a<b, main exits bottom at (a,a) (if a<=b) -> pair (1,a). If b<a, exits right at (b,b) -> pair (1,b). So main pair (1, min\n"
+ }
+}
