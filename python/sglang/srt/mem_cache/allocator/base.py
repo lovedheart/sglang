@@ -56,6 +56,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """The state slot allocator, or None without recurrent state."""
         return None if self.state is None else self.state.slots
 
+    _kvcache = None
+
     @abc.abstractmethod
     def __init__(
         self,
