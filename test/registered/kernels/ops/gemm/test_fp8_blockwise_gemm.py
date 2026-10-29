@@ -78,12 +78,61 @@ def _test_accuracy_once(M, N, K, out_dtype, device):
 @pytest.mark.skipif(
     not is_sm120_supported(), reason="fp8_blockwise_scaled_mm requires SM120 (>= 12.0)"
 )
-@pytest.mark.parametrize("M", [1, 3, 5, 32, 48, 64, 127, 128, 512, 1024, 4096])
+# M=256 is the only case that reaches the 64-wide token-tile arm (128 < M <= 256):
+# 127/128 take the 32-wide tile and 512 the non-swapAB one, so without it that arm
+# would have no accuracy coverage at all.
+@pytest.mark.parametrize("M", [1, 3, 5, 32, 48, 64, 127, 128, 256, 512, 1024, 4096])
 @pytest.mark.parametrize("N", [128, 512, 1024, 4096, 8192])
 @pytest.mark.parametrize("K", [512, 1024, 4096, 8192])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 def test_accuracy(M, N, K, out_dtype):
     _test_accuracy_once(M, N, K, out_dtype, "cuda")
+
+
+# Decode shapes newly routed to the split-K warp arm (m <= 8 any width;
+# m <= 16 narrow): the arm must stay bit-stable across CUDA-graph replays
+# (ascending split-K reduction, no atomics) and exact against the fp32
+# dequant reference.
+@pytest.mark.skipif(
+    not is_sm120_supported(), reason="fp8_blockwise_scaled_mm requires SM120 (>= 12.0)"
+)
+@pytest.mark.parametrize(
+    "M, N, K",
+    [(1, 2048, 2560), (4, 2560, 2048), (8, 512, 2560), (4, 16384, 2560), (16, 2560, 6144)],
+)
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16])
+def test_warp_arm_stability(M, N, K, out_dtype):
+    device = "cuda"
+    torch.manual_seed(0)
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    a = ((torch.rand(M, K, device=device) - 0.5) * 2 * fp8_max).to(torch.float8_e4m3fn)
+    b = ((torch.rand(N, K, device=device) - 0.5) * 2 * fp8_max).to(torch.float8_e4m3fn).t()
+    scale_a = torch.randn(M, cdiv(K, 128), device=device, dtype=torch.float32) * 0.001
+    scale_b = torch.randn(cdiv(K, 128), cdiv(N, 128), device=device, dtype=torch.float32) * 0.001
+    # The blockwise kernels take col-major scale tensors (loader convention).
+    scale_a = scale_a.t().contiguous().t()
+    scale_b = scale_b.t().contiguous().t()
+    ref = baseline_scaled_mm(a, b, scale_a, scale_b, out_dtype)
+    out = fp8_blockwise_scaled_mm(a, b, scale_a, scale_b, out_dtype)
+    # Tighter than the generic sweep (rtol 0.02, atol 1): the warp arm's
+    # fp32 partials reduce in ascending k order, so deviation from the
+    # reference is rounding-only.
+    torch.testing.assert_close(out, ref, rtol=0.008, atol=0.25)
+    first = fp8_blockwise_scaled_mm(a, b, scale_a, scale_b, out_dtype)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            fp8_blockwise_scaled_mm(a, b, scale_a, scale_b, out_dtype)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(8):
+            out2 = fp8_blockwise_scaled_mm(a, b, scale_a, scale_b, out_dtype)
+    for _ in range(4):
+        graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out2.view(torch.uint16), first.view(torch.uint16))
 
 
 if __name__ == "__main__":
