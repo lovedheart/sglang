@@ -319,6 +319,26 @@ class Envs:
     # loop (a gather plus a full-context copy per sequence, plus two host
     # synchronizations per layer).
     SGLANG_QSA_VECTOR_PREFILL_GATHER = EnvBool(True)
+    # Give the QSA sparse-prefill kernels two warps and a 3-deep pipeline instead of
+    # the one-warp tail of the tuning tables.  With one warp Triton has nowhere to put
+    # the head_dim-deep QK reduction, so it serialises it; splitting it across two
+    # warps won +11.7% (4096-token chunk) to +21.2% (1024-token chunk) of kernel time
+    # on the RTX PRO 6000 (Blackwell, SM120) over 12 paired CUDA-graph rounds.  It is
+    # not bitwise equal to the one-warp order -- the split changes the fp32
+    # accumulation order, moving ~0.0004% of the outputs by one bf16 ULP -- so it is
+    # opt-in, and it is unmeasured on other parts.
+    SGLANG_QSA_PREFILL_MULTI_WARP = EnvBool(False)
+    # Read the packed NVFP4 KV rows in the sparse-prefill kernel itself instead of
+    # dequantizing the context into BF16 scratch first (half a byte per value read
+    # rather than two bytes written and then read back).  Won every one of 64
+    # paired CUDA-graph rounds on the RTX PRO 6000 (Blackwell, SM120): +10.4% at an
+    # 8k context / topk 2048 / 1k queries, +14.1% at 32k / 4k, +19.7% at topk 512
+    # and +29.2% on a 4k context.  On cache-like data it matches the path it
+    # replaces to a BF16 ULP or two; where the softmax is a near-tie (huge scores
+    # from an uncalibrated scale) the two arms' last-bit score difference can pick
+    # the other row, so outputs are not bit-identical.  Opt-in until measured
+    # end to end; it only applies to a packed NVFP4 cache and falls back otherwise.
+    SGLANG_QSA_PREFILL_PACKED_KV = EnvBool(False)
     # Sort the QSA top-k block selection into a deterministic order (the CUDA
     # top-k kernels emit slots in atomic order; sparse attention merges in
     # list order, making logits run-dependent).  0 keeps the raw order.
