@@ -2432,8 +2432,12 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     )
                 )
 
+<<<<<<< HEAD
         # Print warning once per load_weights() call
         ple_warned_downcast = False
+=======
+        self._ple_downcast_warned = False
+>>>>>>> f2790af045 ([ moe ] SM120: W4A8/W4A4 dispatch, b12x + sm12x backends, launch tuning)
 
         def load_qwen4_exp_ple_shard(name: str, loaded_weight: torch.Tensor) -> bool:
             nonlocal ple_warned_downcast
@@ -2484,8 +2488,13 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 emb.weight.dtype == torch.float8_e4m3fn
                 and loaded_weight.dtype != torch.float8_e4m3fn
             ):
+<<<<<<< HEAD
                 if not ple_warned_downcast:
                     ple_warned_downcast = True
+=======
+                if not self._ple_downcast_warned:
+                    self._ple_downcast_warned = True
+>>>>>>> f2790af045 ([ moe ] SM120: W4A8/W4A4 dispatch, b12x + sm12x backends, launch tuning)
                     logger.warning(
                         "PLE checkpoint shards are %s but the embedding storage "
                         "is fp8 (ple_embedding_dtype / fp8 quant config); "
