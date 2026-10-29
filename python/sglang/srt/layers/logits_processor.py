@@ -53,6 +53,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.fp8_lm_head import fp8_blockwise_lm_head_apply
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
     LogprobStage,
@@ -1452,7 +1453,12 @@ class LogitsProcessor(nn.Module):
             )
             # A shared FP32 buffer must not change the lm_head's output precision.
             # Keep the same rounding as the unbuffered path unless FP32 is enabled.
-            if use_mm_out_dtype and (
+            if lm_head.weight.dtype == torch.float8_e4m3fn:
+                # Load-time block-quantized head (--enable-fp8-lm-head, SM120)
+                logits = fp8_blockwise_lm_head_apply(
+                    lm_head, hidden_states, bias=embedding_bias
+                )
+            elif use_mm_out_dtype and (
                 self.use_fp32_lm_head or self.use_fp32_lm_head_output
             ):
                 if out is None and _gfx1250_lmhead_applies(
