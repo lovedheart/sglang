@@ -1099,6 +1099,94 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     batch.mamba_track_seqlens_cpu = None
 
 
+def _pptrace_verify(batch, accept_lens, steps_to_track):
+    # TEMP ABAB-parity forensics (SGLANG_PPTRACE=1): one line per verify step
+    # per request: pre/post seq lens, accept len, crossing step, and the
+    # physical slot the crossing state scatters into.
+    import hashlib
+    import os as _os
+
+    if (
+        _os.environ.get("SGLANG_PPTRACE") != "1"
+        or batch.forward_mode.is_idle()
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    try:
+        pre = batch.seq_lens.tolist()
+        post = (batch.seq_lens + accept_lens).tolist()
+        al = accept_lens.tolist()
+        st = steps_to_track.tolist() if steps_to_track is not None else [-9] * al
+        ti = (
+            batch.mamba_track_indices.tolist()
+            if batch.mamba_track_indices is not None
+            else [-1] * al
+        )
+        bufs = getattr(batch, "reqs", None)
+        pp = []
+        if bufs is not None:
+            for r in bufs:
+                b = getattr(r.kv, "mamba_ping_pong_track_buffer", None)
+                pp.append(
+                    b.tolist()
+                    if b is not None
+                    else None
+                )
+        iv = mamba_track_grid(batch.tree_cache.page_size)
+
+        def _hh(slot):
+            try:
+                t = (
+                    batch.tree_cache.req_to_token_pool.mamba_pool.mamba_cache.temporal[
+                        :, int(slot)
+                    ]
+                    .float()
+                    .cpu()
+                )
+                return hashlib.sha256(
+                    t[:, :, :4].contiguous().numpy().tobytes()
+                ).hexdigest()[:8]
+            except Exception:
+                return "err"
+
+        def _hhact(req):
+            try:
+                pidx = (
+                    batch.tree_cache.req_to_token_pool.translate_mamba_indices(
+                        req.kv.mamba_pool_idx.view(-1).to(torch.int64)
+                    )
+                    .item()
+                )
+                t = (
+                    batch.tree_cache.req_to_token_pool.mamba_pool.mamba_cache.temporal[
+                        :, pidx
+                    ]
+                    .float()
+                    .cpu()
+                )
+                return hashlib.sha256(
+                    t[:, :, :4].contiguous().numpy().tobytes()
+                ).hexdigest()[:8]
+            except Exception:
+                return "err"
+
+        with open("/tmp/pptrace.log", "a") as f:
+            for i in range(len(al)):
+                preb = (pre[i] // iv) != (post[i] // iv)
+                f.write(
+                    f"V step={st[i]} al={al[i]} pre={pre[i]} post={post[i]} "
+                    f"cross_py={int(preb)} slot={ti[i]} pp={pp[i] if i < len(pp) else '?'}"
+                    f" nxt={getattr(bufs[i].kv, 'mamba_next_track_idx', None) if bufs and i < len(bufs) else '?'}"
+                    f" last={getattr(bufs[i].kv, 'mamba_last_track_idx', None) if bufs and i < len(bufs) else '?'}"
+                    f" hh0={_hh(pp[i][0]) if i < len(pp) and pp[i] else '-'}"
+                    f" hh1={_hh(pp[i][1]) if i < len(pp) and pp[i] else '-'}"
+                    f" hhact={_hhact(bufs[i]) if bufs and i < len(bufs) else '-'}"
+                    f"\n"
+                )
+    except Exception:
+        pass
+
+
 def _verify_commit_step_indices(
     *,
     batch: ScheduleBatch,
@@ -1121,13 +1209,16 @@ def _verify_commit_step_indices(
             if batch.mamba_track_indices is not None
             else 0
         )
-        return fused_commit_track_indices(
-            accept_index,
+        last_correct, steps_to_track = fused_commit_track_indices(
+            accept_index.contiguous(),
             accept_lens,
             batch.seq_lens if track_grid > 0 else None,
             draft_token_num,
             track_grid,
         )
+        if track_grid > 0:
+            _pptrace_verify(batch, accept_lens, steps_to_track)
+        return last_correct, steps_to_track
     accept_indices_offset = torch.arange(
         0,
         bs * draft_token_num,
@@ -1236,6 +1327,23 @@ def commit_mamba_states_after_verify(
             src_indices_raw=src_indices_raw,
             null_block_id=-1,
         )
+        # PLE side states (ngram / short-conv) keep their own per-step
+        # intermediate scratch regardless of ReplaySSM, so the fold path must
+        # scatter them too -- otherwise they freeze for the whole spec run.
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            update_ple_state_after_mtp_verify,
+        )
+
+        track_idx = batch.mamba_track_indices
+        if track_idx is not None:
+            track_idx = req_pool.translate_mamba_indices(track_idx)
+        update_ple_state_after_mtp_verify(
+            req_pool,
+            state_batch_indices,
+            last_correct_step_indices,
+            track_idx,
+            mamba_steps_to_track,
+        )
         return
 
     if (
@@ -1315,6 +1423,25 @@ def commit_mamba_states_after_verify(
                 mamba_steps_to_track,
                 src_indices_raw,
             )
+        # PLE side states (ngram / short-conv) keep their own per-step
+        # intermediate scratch regardless of ReplaySSM, so the circular path
+        # must scatter them too -- otherwise they freeze for the whole spec run
+        # (same bug the fold branch already guards against; upstream moved
+        # GDN off the fold path into this circular path without it).
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            update_ple_state_after_mtp_verify,
+        )
+
+        track_idx = batch.mamba_track_indices
+        if track_idx is not None:
+            track_idx = req_pool.translate_mamba_indices(track_idx)
+        update_ple_state_after_mtp_verify(
+            req_pool,
+            state_batch_indices,
+            last_correct_step_indices,
+            track_idx,
+            mamba_steps_to_track,
+        )
         return
 
     # KDA ReplaySSM (fold-every-commit): KDA keeps its own recurrent verify kernel
