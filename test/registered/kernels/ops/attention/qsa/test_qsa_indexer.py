@@ -276,8 +276,13 @@ def test_tilelang_mqa_matches_torch_reference(dtype):
     max_model_len = max_pages * page_size
     ref = torch_qsa_mqa_decode(q, cache, page_table, context_lens, max_model_len)
     out = tilelang_qsa_mqa_decode(q, cache, page_table, context_lens, max_model_len)
-    finite = torch.isfinite(ref)
-    assert torch.equal(finite, torch.isfinite(out))
+    # Bounded-write contract: the kernel writes [0, context_len) only and
+    # top-k scans that prefix; columns past the context are never read, so
+    # compare inside the window only (the reference -inf-poisons all of them).
+    cols = torch.arange(max_model_len, device=device)
+    window = cols.unsqueeze(0) < context_lens.long().unsqueeze(1)
+    finite = torch.isfinite(ref) & window
+    assert torch.equal(finite, torch.isfinite(out) & window)
     torch.testing.assert_close(out[finite], ref[finite], rtol=2e-3, atol=2e-3)
     row_starts = torch.zeros_like(context_lens)
     sel_ref = _selected_score_multisets(
@@ -296,8 +301,11 @@ def test_tilelang_mqa_matches_torch_reference(dtype):
     row_ends = torch.randint(1, keys + 1, (rows,), device=device).to(torch.int32)
     ref_p = torch_qsa_mqa_prefill(qp, kp, row_starts, row_ends)
     out_p = tilelang_qsa_mqa_prefill(qp, kp, row_starts, row_ends)
-    finite = torch.isfinite(ref_p)
-    assert torch.equal(finite, torch.isfinite(out_p))
+    window_p = torch.arange(keys, device=device).unsqueeze(
+        0
+    ) < row_ends.long().unsqueeze(1)
+    finite = torch.isfinite(ref_p) & window_p
+    assert torch.equal(finite, torch.isfinite(out_p) & window_p)
     torch.testing.assert_close(out_p[finite], ref_p[finite], rtol=2e-3, atol=2e-3)
 
 
