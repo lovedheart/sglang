@@ -1566,9 +1566,12 @@ def _e3m4_block_linear(
     m = xq.shape[0]
     wsc = weight_scale.contiguous()
     if use_sm120_fp8_e3m4_gemv(m, n, k):
-        print_info_once(
-            f"[fp8_e3m4] GEMV kernel enabled: weights are e3m4 codes "
-            f"(block-128 scales); first call shape m=1 n={n} k={k}"
+        # Debug-only: a fresh line per first-seen shape read like spam.
+        logger.debug(
+            "[fp8_e3m4] GEMV kernel enabled: weights are e3m4 codes "
+            "(block-128 scales); first call shape m=1 n=%s k=%s",
+            n,
+            k,
         )
         result = (
             sm120_fp8_e3m4_gemv(xq[0], weight, xs[0].contiguous(), wsc)
@@ -1576,10 +1579,13 @@ def _e3m4_block_linear(
             .view(1, -1)
         )
     elif use_sm120_fp8_e3m4_gemm(m, n, k):
-        print_info_once(
-            f"[fp8_e3m4] GEMM (patched-QMMA cubin) kernel enabled: weights "
-            f"are e3m4 codes (block-128 scales); first call shape "
-            f"m={m} n={n} k={k}"
+        logger.debug(
+            "[fp8_e3m4] GEMM (patched-QMMA cubin) kernel enabled: weights "
+            "are e3m4 codes (block-128 scales); first call shape "
+            "m=%s n=%s k=%s",
+            m,
+            n,
+            k,
         )
         result = sm120_fp8_e3m4_gemm(xq, weight, xs.contiguous(), wsc)
         if result.shape[0] != input_2d.shape[0]:
