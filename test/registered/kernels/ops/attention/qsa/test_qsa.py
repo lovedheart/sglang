@@ -32,6 +32,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton_ck,
     sparse_gqa_paged_prefill_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseMultiStepDraftBackend,
@@ -486,18 +487,18 @@ def test_qsa_target_verify_rejects_branching_speculation():
         assert "topk=1" in str(exc)
     else:
         raise AssertionError("QSA target verification must reject tree branches")
-    # The pending-group ring keys state by position % ratio: a verify window
-    # wider than the ratio would collide within one forward.
+    # The pending-group ring strides 2*ratio positions (see qsa_ring_stride):
+    # a verify window wider than that could alias a member still in use.
     try:
         backend._require_chain_speculation(
-            ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=1, draft_token_num=5)
+            ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=1, draft_token_num=9)
         )
     except NotImplementedError as exc:
         assert "compress ratio" in str(exc)
     else:
         raise AssertionError("QSA must reject draft windows wider than the ratio")
     backend._require_chain_speculation(
-        ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=1, draft_token_num=4)
+        ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=1, draft_token_num=8)
     )
 
 
@@ -646,6 +647,7 @@ def _make_paged_extend_backend():
     )
     backend = QwenSparseAttnBackend()
     backend.forward_metadata = metadata
+    backend.kv_cache_quant_method = None
 
     class Pool:
         def set_kv_buffer(self, layer, loc, k, v):
@@ -1170,6 +1172,126 @@ def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
     torch.testing.assert_close(actual, expected)
 
 
+def _qsa_window_mask(rows, keys, starts, ends):
+    columns = torch.arange(keys, device=starts.device)
+    return (columns >= starts[:, None].long()) & (columns < ends[:, None].long())
+
+
+def _qsa_poison_outside_window(logits, inside):
+    """Overwrite every out-of-window lane with a rotating poison pattern.
+
+    The tilelang prefill scorer leaves columns outside a row's window as
+    uninitialized scratch (torch.empty, no -inf fill pass). The top-k
+    consumers must never observe those lanes, so an all -inf fill -- the
+    old behaviour -- is the weakest possible test. Cycle fp32 max, +inf,
+    and quiet NaN instead: any out-of-window read reaching the radix
+    histogram would flip the selection.
+    """
+    poisons = (
+        torch.finfo(torch.float32).max,
+        float("inf"),
+        float("nan"),
+    )
+    out = ~inside
+    columns = torch.arange(logits.shape[1], device=logits.device)
+    for phase, pattern in enumerate(poisons):
+        logits = logits.masked_fill(out & ((columns % 3) == phase)[None, :], pattern)
+    return logits
+
+
+def test_qsa_fast_topk_reference_reads_only_the_window():
+    """Contract test for the window-only semantics the tilelang scorer now
+    relies on: out-of-window columns are scratch and top-k selection must be
+    invariant to their contents. Exercises the CPU/reference path, so it
+    runs everywhere and mirrors what the CUDA kernels promise."""
+    torch.manual_seed(3)
+    rows, keys = 3, 4096
+    scores = torch.randn(rows, keys, dtype=torch.float32)
+    starts = torch.tensor([0, 5, 17], dtype=torch.int32)
+    ends = torch.tensor([31, 4096, 3000], dtype=torch.int32)
+    inside = _qsa_window_mask(rows, keys, starts, ends)
+    clean = scores.masked_fill(~inside, -float("inf"))
+    poisoned = _qsa_poison_outside_window(scores.clone(), inside)
+    for topk in (512, 2048):
+        expected = qsa_fast_topk(clean, starts, ends, topk=topk)
+        actual = qsa_fast_topk(poisoned, starts, ends, topk=topk)
+        assert torch.equal(actual, expected), topk
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="tilelang scorer + CUDA top-k required"
+)
+def test_qsa_tilelang_prefill_scale_inline_is_bitwise_identical():
+    """Inlining the score-scale division at the store must match the old
+    unscaled-store-then-full-width-div_ pipeline bit for bit.
+
+    Score 1.0 in the kernel reproduces the pre-change unscaled store
+    exactly (__fdiv_rn(x, 1.0) == x), so applying Tensor.div_ afterwards
+    re-creates the legacy result; the default path (division fused into the
+    kernel via __fdiv_rn) must equal it on every in-window element.
+    """
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_prefill,
+    )
+
+    if not HAS_TILELANG:
+        pytest.skip("TileLang unavailable")
+    torch.manual_seed(5)
+    # Rows below block_q and a non-4-aligned window start exercise both the
+    # padding path and the ragged tile boundary.
+    rows, keys, heads, head_dim = 5, 900, 4, 128
+    q = torch.randn(rows, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(keys, 1, head_dim, dtype=torch.bfloat16, device="cuda")
+    starts = torch.tensor([0, 1, 17, 300, 899], dtype=torch.int32, device="cuda")
+    ends = torch.tensor([2, 64, 900, 897, 900], dtype=torch.int32, device="cuda")
+    inside = _qsa_window_mask(rows, keys, starts.cpu(), ends.cpu()).cuda()
+    fused = tilelang_qsa_mqa_prefill(q, k, starts, ends)
+    legacy = tilelang_qsa_mqa_prefill(q, k, starts, ends, score_scale=1.0)
+    legacy.div_(head_dim**0.5)
+    assert torch.equal(fused[inside], legacy[inside])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="tilelang scorer + CUDA top-k required"
+)
+def test_qsa_prefill_topk_ignores_out_of_window_scratch():
+    """End-to-end: with the -inf fill pass deleted, poison whatever the
+    scorer left outside each window and require identical selections.
+
+    Scoring and selection run the production paths (tilelang prefill kernel,
+    then qsa_fast_topk's CUDA branch), so this is the direct proof that no
+    scratch lane ever reaches a consumer.
+    """
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_prefill,
+    )
+
+    if not HAS_TILELANG:
+        pytest.skip("TileLang unavailable")
+    torch.manual_seed(11)
+    rows, keys, heads, head_dim = 2, 8192, 4, 128
+    q = torch.randn(rows, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(keys, 1, head_dim, dtype=torch.bfloat16, device="cuda")
+    starts = torch.tensor([0, 17], dtype=torch.int32, device="cuda")
+    ends = torch.tensor([8192, 8180], dtype=torch.int32, device="cuda")
+    inside = _qsa_window_mask(rows, keys, starts.cpu(), ends.cpu()).cuda()
+    logits = tilelang_qsa_mqa_prefill(q, k, starts, ends)
+    clean = logits.masked_fill(~inside, -float("inf"))
+    poisoned = _qsa_poison_outside_window(logits.clone(), inside)
+    for topk in (512, 2048):
+        try:
+            expected = qsa_fast_topk(clean, starts, ends, topk=topk)
+            actual = qsa_fast_topk(poisoned, starts, ends, topk=topk)
+        except (ImportError, ValueError, RuntimeError):
+            if topk == 2048:
+                pytest.skip("sgl_kernel fast_topk_v2 unavailable")
+            raise
+        # CUDA kernels emit in atomic order; compare the selected sets.
+        assert torch.equal(expected.sort(dim=-1).values, actual.sort(dim=-1).values)
+
+
 def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
     rows, keys, heads, head_dim = 65, 64, 4, 8
     token_topk, compress_ratio = 8, 4
@@ -1456,7 +1578,6 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
         )
         for field in (
             "graph_write_locs",
-            "graph_compressed_page_table",
             "graph_compressed_lengths",
             "decode_logical_positions",
             "pending_ring_slots",
@@ -1465,6 +1586,25 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
             kernel_buf = getattr(kernel_metadata.indexer_metadata, field)
             host_buf = getattr(host_metadata.indexer_metadata, field)
             assert torch.equal(kernel_buf, host_buf), (mode, field)
+        # The page table matches exactly on the readable prefix of every row
+        # (ceil(compressed_len / compressed_page) columns). Past it the kernel
+        # skips writes for speed and the values are stale-but-unread, per the
+        # contract in metadata.compressed_decode_view.
+        kernel_table = kernel_metadata.indexer_metadata.graph_compressed_page_table
+        host_table = host_metadata.indexer_metadata.graph_compressed_page_table
+        lens = kernel_metadata.indexer_metadata.graph_compressed_lengths
+        used_pages = (lens.long() + 16 - 1) // 16  # compressed_page_size=16
+        cols = torch.arange(kernel_table.shape[1], device=device)[None, :]
+        readable = cols < used_pages[:, None]
+        assert torch.equal(
+            kernel_table.masked_fill(~readable, 0),
+            host_table.masked_fill(~readable, 0),
+        ), (mode, "graph_compressed_page_table prefix")
+        # The kernel never writes the unread tail at all: it stays at init.
+        assert torch.equal(
+            kernel_table.masked_fill(readable, 0),
+            torch.zeros_like(kernel_table),
+        ), (mode, "page table tail must stay untouched")
 
     # Decode: lengths straddling boundaries (256 is a boundary, others not).
     run_case(mode=0, bs=4, num_rows=4, seq_lens_list=[255, 256, 257, 512], extend_len=0)
@@ -2230,6 +2370,239 @@ def test_qsa_large_fp8_prefill_float_reference(head_dim, heads):
             torch.softmax(q[row].double() @ keys.T * head_dim**-0.5, dim=-1) @ values
         )
         torch.testing.assert_close(actual[row].double(), expected, rtol=2e-2, atol=2e-2)
+
+
+def _fold_sort_case(rows, seed, pad_rows=80):
+    torch.manual_seed(seed)
+    bi = torch.randint(0, 6000, (rows, BLOCK_TOPK), device="cuda", dtype=torch.int32)
+    for r in range(rows):
+        pad = int(torch.randint(0, pad_rows, (1,)))
+        if pad:
+            bi[r, BLOCK_TOPK - pad :] = -1
+    query_positions = torch.randint(
+        100, 90000, (rows,), device="cuda", dtype=torch.int64
+    )
+    sequence_lengths = torch.randint(
+        50, 90000, (rows,), device="cuda", dtype=torch.int32
+    )
+    return bi, query_positions, sequence_lengths
+
+
+def test_qsa_fold_sort_matches_sort_then_expand():
+    """sort_input=True must equal the torch.sort -> expand pipeline exactly.
+
+    The fold replaces the 5-launch torch.sort chain on the decode path; it
+    sorts the row inside the expand kernel (bitonic networks are data-order
+    independent, preserving the run-determinism contract) and reorders
+    ``block_indices`` in place.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    for seed, rows in ((0, 1), (1, 3), (2, 8), (3, 4)):
+        bi, qp, sl = _fold_sort_case(rows, seed)
+        expected = triton_expand_qsa_block_indices(
+            bi.sort(dim=-1, descending=True).values, qp, sl, COMPRESS_RATIO, TOKEN_TOPK
+        )
+        actual = triton_expand_qsa_block_indices(
+            bi.clone(), qp, sl, COMPRESS_RATIO, TOKEN_TOPK, sort_input=True
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(actual, expected), (seed, rows)
+
+
+def test_qsa_fold_sort_reorders_input_in_place():
+    bi, qp, sl = _fold_sort_case(2, seed=7)
+    before = bi.clone()
+    expand_qsa_block_indices(
+        bi, qp, sl, COMPRESS_RATIO, TOKEN_TOPK, sort_input=True
+    )
+    torch.cuda.synchronize()
+    assert not torch.equal(bi, before)
+    assert torch.equal(bi, before.sort(dim=-1, descending=True).values)
+
+
+def test_qsa_fold_sort_cuda_graph_capture_replay():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    bi, qp, sl = _fold_sort_case(4, seed=11)
+
+    def run(buffer):
+        return expand_qsa_block_indices(
+            buffer, qp, sl, COMPRESS_RATIO, TOKEN_TOPK, sort_input=True
+        )
+
+    eager = run(bi.clone())
+    graph_input = bi.clone()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        run(graph_input)  # warm the JIT outside capture
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    static = bi.clone()
+    with torch.cuda.graph(graph):
+        captured = run(static)
+    # Replay on freshly re-sorted inputs: the in-place fold re-sorts each
+    # replay, so replaying over an unsorted copy must reproduce eager.
+    static.copy_(bi)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, eager)
+
+
+
+def _make_chunk_prefill_backend(prefix_lens, extend_lens, req_pool_indices, seed):
+    """Chunk-prefill attention over a ragged batch with random KV."""
+    device = "cuda"
+    sequence_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+    torch.manual_seed(seed)
+    table = torch.zeros(
+        max(req_pool_indices) + 2,
+        max(sequence_lens, default=1) + 8,
+        dtype=torch.int32,
+        device=device,
+    )
+    used = 0
+    for row, length in zip(req_pool_indices, sequence_lens):
+        table[row, :length] = torch.arange(
+            used, used + length, dtype=torch.int32, device=device
+        )
+        used += length
+
+    class Pool:
+        def set_kv_buffer(self, layer, loc, k, v):
+            pass
+
+        def get_key_buffer(self, layer_id):
+            return k_buffer
+
+        def get_value_buffer(self, layer_id):
+            return v_buffer
+
+    k_buffer = torch.randn(used + 8, 1, 32, dtype=torch.bfloat16, device=device)
+    v_buffer = torch.randn(used + 8, 1, 32, dtype=torch.bfloat16, device=device)
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.token_to_kv_pool = Pool()
+    backend.req_to_token_pool = SimpleNamespace(req_to_token=table)
+    backend.kv_cache_quant_method = None
+    backend.forward_metadata = None
+
+    query_rows = max(sum(extend_lens), 1)
+    # Keep every selection inside what the query row can see, so nothing is
+    # masked out and both gather paths must read the same K/V rows.
+    indices = torch.stack(
+        [
+            torch.randint(
+                0, prefix + offset + 1, (8,), dtype=torch.int32, device=device
+            )
+            for prefix, extend in zip(prefix_lens, extend_lens)
+            for offset in range(extend)
+        ]
+    ).reshape(query_rows, 8)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        token_to_kv_pool=backend.token_to_kv_pool,
+        req_to_token_pool=backend.req_to_token_pool,
+        req_pool_indices=torch.tensor(
+            req_pool_indices, dtype=torch.int32, device=device
+        ),
+        seq_lens=torch.tensor(sequence_lens, dtype=torch.int32, device=device),
+        seq_lens_cpu=torch.tensor(sequence_lens, dtype=torch.int32, device=device),
+        extend_seq_lens=torch.tensor(extend_lens, dtype=torch.int32, device=device),
+        extend_seq_lens_cpu=list(extend_lens),
+        out_cache_loc=torch.arange(query_rows, dtype=torch.int32, device=device),
+    )
+    layer = SimpleNamespace(tp_q_head_num=4, head_dim=32, layer_id=0, scaling=0.1)
+    queries = torch.randn(query_rows, 4, 32, dtype=torch.bfloat16, device=device)
+    return backend, queries, layer, forward_batch, indices
+
+
+@pytest.mark.parametrize(
+    ("prefix_lens", "extend_lens", "req_pool_indices"),
+    [
+        ([3000], [900], [0]),
+        ([1000, 0, 2500, 7], [640, 33, 129, 90], [0, 1, 2, 3]),
+        ([2048, 4096], [1, 1], [2, 5]),
+        ([60000], [512], [0]),
+        ([7000] * 8, [1] * 8, list(range(8))),
+    ],
+)
+def test_qsa_chunk_prefill_vector_gather_matches_legacy(
+    prefix_lens, extend_lens, req_pool_indices
+):
+    """The one-shot slot gather must reproduce the per-sequence slice/cat loop
+    bit for bit: same addresses, same order, no reordering."""
+    backend, queries, layer, forward_batch, indices = _make_chunk_prefill_backend(
+        prefix_lens, extend_lens, req_pool_indices, seed=len(prefix_lens) * 7 + 1
+    )
+
+    def run():
+        return backend.forward_extend(
+            queries,
+            queries.clone(),
+            queries.clone(),
+            layer,
+            forward_batch,
+            save_kv_cache=False,
+            topk_indices=indices,
+        )
+
+    with envs.SGLANG_QSA_VECTOR_PREFILL_GATHER.override(True):
+        vectorized = run()
+    with envs.SGLANG_QSA_VECTOR_PREFILL_GATHER.override(False):
+        legacy = run()
+    assert torch.equal(vectorized, legacy)
+    assert torch.isfinite(vectorized).all()
+
+def test_qsa_chunk_prefill_removes_device_round_trips():
+    """The vectorized gather must drop the legacy loop's device reads: it never
+    sends req_pool_indices back to the host and takes the query-row maximum
+    from host-side metadata instead of reading it off the device."""
+    import warnings
+
+    def count_syncs(backend, queries, layer, forward_batch, indices, flag):
+        with envs.SGLANG_QSA_VECTOR_PREFILL_GATHER.override(flag):
+            for _ in range(3):  # JIT/module load may block legitimately
+                backend.forward_extend(
+                    queries,
+                    queries.clone(),
+                    queries.clone(),
+                    layer,
+                    forward_batch,
+                    save_kv_cache=False,
+                    topk_indices=indices,
+                )
+            torch.cuda.synchronize()
+            torch.cuda.set_sync_debug_mode(1)
+            try:
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    out = backend.forward_extend(
+                        queries,
+                        queries.clone(),
+                        queries.clone(),
+                        layer,
+                        forward_batch,
+                        save_kv_cache=False,
+                        topk_indices=indices,
+                    )
+            finally:
+                torch.cuda.set_sync_debug_mode(0)
+        torch.cuda.synchronize()
+        return (
+            sum("synchroniz" in str(warning.message).lower() for warning in caught),
+            out,
+        )
+
+    backend, queries, layer, forward_batch, indices = _make_chunk_prefill_backend(
+        [1500, 400], [128, 64], [1, 0], seed=11
+    )
+    legacy_syncs, legacy = count_syncs(backend, queries, layer, forward_batch, indices, False)
+    vector_syncs, vectorized = count_syncs(backend, queries, layer, forward_batch, indices, True)
+    assert torch.equal(vectorized, legacy)
+    # Both paths still stage the host length lists onto the device; the legacy
+    # loop adds one more read (req_pool_indices). The query-row maximum is
+    # taken from the host-side extend lengths on both paths.
+    assert legacy_syncs - vector_syncs == 1, (legacy_syncs, vector_syncs)
 
 
 if __name__ == "__main__":

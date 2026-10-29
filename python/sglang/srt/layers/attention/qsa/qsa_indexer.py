@@ -215,7 +215,6 @@ class QSAIndexer(MultiPlatformOp):
         pool=None,
         cache_loc: torch.Tensor | None = None,
         q_heads_padded: int | None = None,
-        ensure_cos_sin_cache: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
         qk, _ = self.index_qk_proj(hidden_states)
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
@@ -231,14 +230,7 @@ class QSAIndexer(MultiPlatformOp):
                 qsa_index_q_norm_rope_store,
             )
 
-            if (
-                ensure_cos_sin_cache
-                and not get_is_capture_mode()
-                and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length")
-            ):
-                self.rotary_emb._ensure_cos_sin_cache_length(
-                    int(positions.max().item())
-                )
+            self._ensure_rope_cache_for(positions)
             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
                 qk,
@@ -261,7 +253,7 @@ class QSAIndexer(MultiPlatformOp):
         q = self.q_layernorm(q_raw.reshape(-1, self.index_head_dim)).reshape(
             -1, self.index_n_heads, self.index_head_dim
         )
-        q = self.apply_rope(positions, q, ensure_cos_sin_cache=ensure_cos_sin_cache)
+        q = self.apply_rope(positions, q)
         if pool is not None:
             q = q.to(pool.qsa_compressed_dtype)
         return q, token_k, False
@@ -461,24 +453,45 @@ class QSAIndexer(MultiPlatformOp):
             return positions[0]
         return positions
 
-    def apply_rope(
-        self,
-        positions: torch.Tensor,
-        tensor: torch.Tensor,
-        ensure_cos_sin_cache: bool = True,
-    ) -> torch.Tensor:
+    def _ensure_rope_cache_for(self, positions: torch.Tensor) -> None:
+        """Grow the shared RoPE table only when it cannot cover the model.
+
+        A table of ``max_position_embeddings`` rows already covers every
+        position the model can emit, and
+        ``reserve_rope_cache_for_long_sequences`` pre-expands it past that for
+        any longer context (plus the speculative margin) at startup, so the
+        serving case is a host-side comparison.  Reading the position maximum
+        back costs a round-trip per layer and per call site, so growth falls
+        back to it only for a table that really is too short.
+
+        A table that claims coverage is still checked on the device: an out-of
+        range position is a caller bug, and the assert turns what would be a
+        silent out-of-bounds cache read into a loud failure without paying a
+        synchronization.
+        """
+
+        if get_is_capture_mode():
+            return
+        ensure = getattr(self.rotary_emb, "_ensure_cos_sin_cache_length", None)
+        if not callable(ensure):
+            return
+        cache_length = int(self.rotary_emb.cos_sin_cache.shape[0])
+        if cache_length >= int(
+            getattr(self.rotary_emb, "max_position_embeddings", cache_length)
+        ):
+            if positions.numel():
+                torch._assert_async(positions.max() < cache_length)
+            return
+        ensure(int(positions.max().item()))
+
+    def apply_rope(self, positions: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.numel() == 0:
             return tensor
         positions = positions.long()
         num_positions = positions.shape[-1] if positions.ndim == 2 else positions.numel()
         if num_positions != tensor.shape[0]:
             raise ValueError("QSA RoPE positions must match the token dimension")
-        if (
-            ensure_cos_sin_cache
-            and not get_is_capture_mode()
-            and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length")
-        ):
-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+        self._ensure_rope_cache_for(positions)
 
         # Let the exact Qwen4-Exp RoPE instance compose regular or three-axis
         # multimodal positions.  Its public cache view repeats cos/sin to the
@@ -643,19 +656,29 @@ class QSAIndexer(MultiPlatformOp):
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
             from sglang.kernels.ops.attention.fast_topk import fast_topk
+            from sglang.srt.environ import envs
             from sglang.srt.layers.attention.qsa.kernel import (
                 _sort_qsa_topk_indices,
             )
 
-            block_indices = _sort_qsa_topk_indices(
-                fast_topk(
-                    logits,
-                    compressed_lengths.to(torch.int32),
-                    topk=self.block_topk,
-                    row_starts=None,
-                )
+            # Fold the determinism sort into the expand kernel below (one
+            # launch instead of the five-launch torch.sort chain); when the
+            # env kill-switch is off the fold is off and behavior matches
+            # SORT_TOPK=0 exactly.
+            fold_sort = envs.SGLANG_QSA_SORT_TOPK.get()
+            topk_indices = fast_topk(
+                logits,
+                compressed_lengths.to(torch.int32),
+                topk=self.block_topk,
+                row_starts=None,
+            )
+            block_indices = (
+                topk_indices
+                if fold_sort
+                else _sort_qsa_topk_indices(topk_indices)
             )
         else:
+            fold_sort = False
             row_starts = torch.zeros_like(compressed_lengths, dtype=torch.int32)
             block_indices = qsa_fast_topk(
                 logits, row_starts, compressed_lengths, topk=self.block_topk
@@ -677,6 +700,7 @@ class QSAIndexer(MultiPlatformOp):
             sequence_lengths,
             compress_ratio=self.compress_ratio,
             token_topk=self.token_topk,
+            sort_input=fold_sort,
         )
 
     def forward_cuda_cp(
@@ -723,13 +747,12 @@ class QSAIndexer(MultiPlatformOp):
         )
         # Use the compressed-cache dtype for Q. Leaving cache_loc unset defers
         # the ring store until raw local K has been gathered into global order.
-        # The load-time RoPE reservation covers these positions, as this layer's
-        # attention already assumed; re-checking costs a device sync per layer.
+        # _ensure_rope_cache_for checks coverage on the host, so going through
+        # the normal path costs no device sync per layer.
         q, token_k, _ = self.project_qk(
             hidden_states,
             positions,
             pool=indexer_metadata.token_to_kv_pool,
-            ensure_cos_sin_cache=False,
         )
         # Raw keys of all new tokens in global packed order: the ring store
         # and compression use the global write plan unchanged. Cached prefix
