@@ -2478,6 +2478,13 @@ def _make_chunk_prefill_backend(prefix_lens, extend_lens, req_pool_indices, seed
         def get_value_buffer(self, layer_id):
             return v_buffer
 
+        # Upstream moved buffer reads onto the typed layer router.
+        layer_router = SimpleNamespace(
+            read=lambda layer_id: SimpleNamespace(
+                key=lambda: k_buffer, value=lambda: v_buffer
+            )
+        )
+
     k_buffer = torch.randn(used + 8, 1, 32, dtype=torch.bfloat16, device=device)
     v_buffer = torch.randn(used + 8, 1, 32, dtype=torch.bfloat16, device=device)
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
