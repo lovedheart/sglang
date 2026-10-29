@@ -67,6 +67,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_block_fp8_mxfp8_linear,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
+    e3m4_block_fp8_linear,
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -272,8 +273,14 @@ class Fp8Config(QuantizationConfig):
         is_fp4_experts: bool = False,
         kv_cache_quant_algo: Optional[str] = None,
         scale_fmt: Optional[str] = None,
+        weight_dtype: str = "e4m3",
     ) -> None:
         super().__init__()
+        if weight_dtype not in ("e4m3", "e3m4"):
+            raise ValueError(f"Unsupported weight_dtype {weight_dtype!r}")
+        # "e3m4": checkpoint weight bytes hold fp8_e3m4 codes (amax/30) in the
+        # float8_e4m3fn container; only the sm120_fp8_e3m4 kernels decode them.
+        self.weight_dtype = weight_dtype
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
         # model_loader from ModelConfig. Default False off the DSV4 path.
         self.is_fp4_experts = is_fp4_experts
@@ -773,6 +780,13 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.use_npu_block_fp8:
             # G-B consumes checkpoint-layout E4M3 weights and FP32 scales.
             return
+        if getattr(self.quant_config, "weight_dtype", "e4m3") == "e3m4":
+            # The checkpoint (FP8_PB_WO_E3M4) declares these bytes as fp8_e3m4
+            # codes. Tag the tensor itself, not the layer, because consumers
+            # receive the weight: the e3m4 kernels are the only correct readers.
+            # Untagged weights stay e4m3, and never tag True -- an
+            # online-quantized weight already owns that value.
+            layer.weight.e4m3_only = False
         use_deepgemm_runner = (
             getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
             is deepgemm_w8a8_block_fp8_linear_with_fallback
@@ -1437,6 +1451,22 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale=layer.weight_scale_inv,
                     bias=bias,
                 )
+            # Code format is a property of the weight, not of the runner: a
+            # declared-e3m4 weight must be intercepted before any e4m3 kernel
+            # (AMX, DeepGEMM, Triton, FlashInfer, CUTLASS all mis-read it).
+            e3_input, e3_input_scale = (
+                (x[0], x[1]) if isinstance(x, tuple) else (x, None)
+            )
+            e3_out = e3m4_block_fp8_linear(
+                input=e3_input,
+                weight=layer.weight,
+                block_size=self.weight_block_size,
+                weight_scale=layer.weight_scale_inv,
+                input_scale=e3_input_scale,
+                bias=bias,
+            )
+            if e3_out is not None:
+                return e3_out
 
             if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
