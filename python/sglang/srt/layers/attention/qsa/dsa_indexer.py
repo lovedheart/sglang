@@ -7,9 +7,17 @@ primitive.  A tokenwise profile has ``compress_ratio = 1`` and
 ``block_topk = budget = 2048``; it never consumes the compressed-only MQA
 inputs (``get_prefill_mqa_inputs``/``get_decode_mqa_inputs``).
 
-Only the BF16 torch reference compute is ported.  The qsa_0511 FP8
-(deep_gemm) and TileLang MQA fast paths are deliberately out of scope here:
-requesting them fails loudly instead of silently degrading.
+The BF16 torch reference compute (``torch_dsa_weighted_mqa_logits``) is the
+correctness oracle.  Under ``SGLANG_QSA_USE_FP8_INDEXER`` the scoring
+fast paths are wired to DeepGEMM: fp8_mqa_logits for packed prefill and
+fp8_paged_mqa_logits for paged decode/verify.  For the compressed
+QSAIndexer (qsa_indexer.py) the flag covers the packed PREFILL only -- keys
+stay BF16 in the pool and are cast to fp8 at the scoring call site, while
+decode keeps the TileLang paged BF16 path (the SM120 paged FP8 kernel needs
+block_kv 64, impossible on ratio-shrunken compressed pages, and a gathered
+fp8 decode is far slower than BF16 paged scoring).
+The TileLang MQA fast path remains out of scope: requesting it fails loudly
+instead of silently degrading.
 """
 
 from __future__ import annotations
@@ -98,11 +106,23 @@ class QwenDSAIndexer(MultiPlatformOp):
             raise ValueError(
                 f"tokenwise QSA requires page_size = 64, got {page_size}"
             )
-        if envs.SGLANG_QWEN_DSA_USE_FP8_INDEXER.get():
-            raise NotImplementedError(
-                "The FP8 tokenwise indexer path (qsa_0511 deep_gemm) is not "
-                "ported to this tree; unset SGLANG_QWEN_DSA_USE_FP8_INDEXER "
-                "to use the BF16 reference path"
+        self.use_fp8_indexer = envs.SGLANG_QSA_USE_FP8_INDEXER.get()
+        if self.use_fp8_indexer:
+            # DeepGEMM fast path for both scoring modes: packed prefill via
+            # fp8_mqa_logits, paged modes (decode/verify) via
+            # fp8_paged_mqa_logits over the fused page layout.
+            try:
+                import deep_gemm  # noqa: F401
+            except ImportError as exc:  # fail loudly, never degrade
+                raise RuntimeError(
+                    "SGLANG_QSA_USE_FP8_INDEXER requires the DeepGEMM "
+                    f"package (with SM120 MQA logits): {exc}"
+                ) from exc
+            logger.info(
+                "QwenDSAIndexer layer %s: FP8 indexer enabled "
+                "(DeepGEMM fp8_mqa_logits prefill + fp8_paged_mqa_logits "
+                "decode).",
+                layer_id,
             )
         self.qsa_profile = profile
         self.layer_id = int(layer_id)
@@ -285,7 +305,6 @@ class QwenDSAIndexer(MultiPlatformOp):
         """Per-query-row top-k over ``[0, row_len)`` for paged modes."""
 
         pool = indexer_metadata.token_to_kv_pool
-        index_k = pool.get_dsa_index_k_buffer(self.layer_id)
         sequence_lengths = indexer_metadata.sequence_lengths.to(torch.int32)
         table = indexer_metadata.token_slot_table
         rows, max_len = table.shape
@@ -298,6 +317,54 @@ class QwenDSAIndexer(MultiPlatformOp):
         output = torch.full(
             (rows, self.token_topk), -1, dtype=torch.int32, device=q.device
         )
+        if getattr(self, "use_fp8_indexer", False):
+            import deep_gemm
+
+            # Slot page contiguity (page_size 64, paged allocator) makes
+            # page j of a row  slot(table[r, j * 64]) // 64; the fused fp8
+            # page layout written by QwenDSATokenToKVPool matches the
+            # DeepGEMM paged kernel.  Rows past each context length hold
+            # stale pages; the kernel masks them via context_lens.
+            fused_kv = pool.get_dsa_index_paged(self.layer_id)
+            context_lens_1d = sequence_lengths.clamp(min=0, max=max_len)
+            context_lens = context_lens_1d.unsqueeze(1).contiguous()  # [rows, next_n=1]
+            block_table = (table[:, :: self.page_size] // self.page_size).to(
+                torch.int32
+            ).contiguous()
+            scale_heads = max(self.index_n_heads, 32)
+            q_fp8 = q.contiguous().to(torch.float8_e4m3fn)
+            weights = w.float() / self.score_scale
+            if q_fp8.shape[1] < scale_heads:
+                q_fp8 = torch.nn.functional.pad(
+                    q_fp8, (0, 0, 0, scale_heads - q_fp8.shape[1])
+                )
+                weights = torch.nn.functional.pad(
+                    weights, (0, scale_heads - weights.shape[1])
+                )
+            logits = deep_gemm.fp8_paged_mqa_logits(
+                q_fp8.view(rows, 1, scale_heads, self.index_head_dim),
+                fused_kv,
+                weights,
+                context_lens,
+                block_table,
+                deep_gemm.get_paged_mqa_logits_metadata(
+                    context_lens,
+                    self.page_size,
+                    deep_gemm.get_num_sms(),
+                ),
+                max_len,
+                clean_logits=False,
+            )
+            selected = qsa_fast_topk(
+                logits.view(rows, -1),
+                torch.zeros_like(context_lens_1d),
+                context_lens_1d,
+                topk=self.token_topk,
+            )
+            output.copy_(selected)
+            return output
+
+        index_k = pool.get_dsa_index_k_buffer(self.layer_id)
         row_chunk = _qsa_prefill_row_chunk_size(
             rows, max_len, self.index_n_heads
         )
@@ -308,12 +375,17 @@ class QwenDSAIndexer(MultiPlatformOp):
             # gathers stay in range and fast_topk masks them out by length.
             k_chunk = index_k.index_select(0, table_long[row_start:row_end].reshape(-1))
             k_chunk = k_chunk.reshape(row_end - row_start, max_len, 1, -1)
-            logits = torch_dsa_weighted_mqa_logits(
-                q[row_start:row_end],
-                w[row_start:row_end],
-                k_chunk,
-                self.score_scale,
-            )
+            # Hot-path scoring: run the dot in the cache dtype (bf16 tensor
+            # cores, fp32 accumulate) instead of materializing fp32 copies of
+            # the gathered K (a 4x byte-amplified copy per layer); top-k only
+            # consumes the fp32 ordering.  The bit-exact fp32 form is the
+            # torch_dsa_weighted_mqa_logits reference, CI-covered separately.
+            scores = torch.relu(
+                torch.einsum("mhd,mkhd->mkh", q[row_start:row_end], k_chunk)
+            ).float()
+            logits = (scores * w[row_start:row_end].float().unsqueeze(1)).sum(
+                dim=-1
+            ) / self.score_scale
             lengths = sequence_lengths[row_start:row_end]
             selected = qsa_fast_topk(
                 logits,
@@ -334,7 +406,6 @@ class QwenDSAIndexer(MultiPlatformOp):
         """Packed per-sequence top-k with causal windows for extend modes."""
 
         pool = indexer_metadata.token_to_kv_pool
-        index_k = pool.get_dsa_index_k_buffer(self.layer_id)
         sequence_lengths = indexer_metadata.sequence_lengths.to(torch.int32)
         table = indexer_metadata.token_slot_table
         query_sequence_ids = indexer_metadata.token_to_batch_idx.long()
@@ -345,6 +416,62 @@ class QwenDSAIndexer(MultiPlatformOp):
         output = torch.full(
             (rows, self.token_topk), -1, dtype=torch.int32, device=q.device
         )
+        if getattr(self, "use_fp8_indexer", False):
+            import deep_gemm
+
+            scale_heads = max(self.index_n_heads, 32)
+            for sequence_id in range(sequence_lengths.numel()):
+                seq_len = int(sequence_lengths[sequence_id].item())
+                row_mask = query_sequence_ids == sequence_id
+                if seq_len <= 0 or not bool(row_mask.any()):
+                    continue
+                row_indices = row_mask.nonzero(as_tuple=True)[0]
+                slots = table[sequence_id, :seq_len].long()
+                k_fp8 = pool.get_dsa_index_k_fp8(self.layer_id, slots)
+                k_scale = torch.ones(seq_len, dtype=torch.float32, device=q.device)
+                row_chunk = _qsa_prefill_row_chunk_size(
+                    row_indices.numel(), seq_len, self.index_n_heads
+                )
+                for chunk_start in range(0, row_indices.numel(), row_chunk):
+                    chunk_rows = row_indices[chunk_start : chunk_start + row_chunk]
+                    row_ends = row_ends_all.index_select(0, chunk_rows)
+                    q_fp8 = (
+                        q.index_select(0, chunk_rows)
+                        .contiguous()
+                        .to(torch.float8_e4m3fn)
+                    )
+                    weights = (
+                        w.index_select(0, chunk_rows).float() / self.score_scale
+                    )
+                    # DeepGEMM scores with ReLU-dot + per-head weights, the
+                    # same formula as torch_dsa_weighted_mqa_logits with the
+                    # 1/sqrt(d) folded into `weights` above.  It requires a
+                    # power-of-two head count >= 8, so pad to at least 32.
+                    if q_fp8.shape[1] < scale_heads:
+                        q_fp8 = torch.nn.functional.pad(
+                            q_fp8, (0, 0, 0, scale_heads - q_fp8.shape[1])
+                        )
+                        weights = torch.nn.functional.pad(
+                            weights, (0, scale_heads - weights.shape[1])
+                        )
+                    logits = deep_gemm.fp8_mqa_logits(
+                        q_fp8,
+                        (k_fp8, k_scale),
+                        weights,
+                        torch.zeros_like(row_ends),
+                        row_ends,
+                        clean_logits=False,
+                    )
+                    selected = qsa_fast_topk(
+                        logits,
+                        torch.zeros_like(row_ends),
+                        row_ends,
+                        topk=self.token_topk,
+                    )
+                    output[chunk_rows] = selected
+            return output
+
+        index_k = pool.get_dsa_index_k_buffer(self.layer_id)
         for sequence_id in range(sequence_lengths.numel()):
             seq_len = int(sequence_lengths[sequence_id].item())
             row_mask = query_sequence_ids == sequence_id
