@@ -52,7 +52,7 @@ from sglang.srt.utils import (
     is_xpu,
     offloader,
 )
-from sglang.srt.utils.common import print_warning_once, torch_release
+from sglang.srt.utils.common import print_info_once, print_warning_once, torch_release
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -1377,6 +1377,116 @@ def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
     return output.view(*output_shape)
 
 
+def uses_e3m4_weight(weight: torch.Tensor) -> bool:
+    """True when the checkpoint declared this weight's bytes as fp8_e3m4 codes.
+
+    e3m4 (bias 3, max 30) shares the float8_e4m3fn container with e4m3, so only
+    the producer's declaration can tell them apart. Weights that were not
+    declared e3m4 -- untagged block-FP8 and online-quantized ones, which tag
+    themselves ``e4m3_only=True`` -- are e4m3.
+    """
+    return hasattr(weight, "e4m3_only") and not weight.e4m3_only
+
+
+def _e3m4_block_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    out_shape: List[int],
+) -> Optional[torch.Tensor]:
+    """SM120 e3m4-weight block-fp8 linear, or None if it does not qualify."""
+    from sglang.kernels.ops.gemm.sm120_fp8_e3m4 import (
+        sm120_fp8_e3m4_gemv,
+        sm120_fp8_e3m4_gemm,
+        use_sm120_fp8_e3m4_gemv,
+        use_sm120_fp8_e3m4_gemm,
+    )
+
+    n, k = weight.shape
+    if input.dtype == torch.float8_e4m3fn:
+        # Pre-quantized activation rows (quant-once path); the cutlass kernel
+        # tolerates column-major scales, the e3m4 kernels index row-major.
+        input_2d = input.view(-1, input.shape[-1])
+        assert input_scale is not None
+        xq, xs = input_2d, input_scale.contiguous()
+    else:
+        input_2d = input.view(-1, input.shape[-1])
+        xq, xs = sglang_per_token_group_quant_fp8_row_padded(input_2d, 128)
+    m = xq.shape[0]
+    wsc = weight_scale.contiguous()
+    if use_sm120_fp8_e3m4_gemv(m, n, k):
+        print_info_once(
+            f"[fp8_e3m4] GEMV kernel enabled: weights are e3m4 codes "
+            f"(block-128 scales); first call shape m=1 n={n} k={k}"
+        )
+        result = (
+            sm120_fp8_e3m4_gemv(xq[0], weight, xs[0].contiguous(), wsc)
+            .unsqueeze(0)
+            .view(1, -1)
+        )
+    elif use_sm120_fp8_e3m4_gemm(m, n, k):
+        print_info_once(
+            f"[fp8_e3m4] GEMM (patched-QMMA cubin) kernel enabled: weights "
+            f"are e3m4 codes (block-128 scales); first call shape "
+            f"m={m} n={n} k={k}"
+        )
+        result = sm120_fp8_e3m4_gemm(xq, weight, xs.contiguous(), wsc)
+        if result.shape[0] != input_2d.shape[0]:
+            result = result[: input_2d.shape[0]]
+    else:
+        return None
+    if bias is not None:
+        result = result + bias
+    return result.to(dtype=torch.bfloat16).view(out_shape)
+
+
+def e3m4_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Block-FP8 linear for e3m4-declared weights; None for every other weight.
+
+    Backend-independent: the e3m4 code format is a property of the weight bytes,
+    not of the GEMM runner, so callers that would otherwise pick DeepGEMM,
+    Triton or FlashInfer must consult this first. A declared weight that no
+    e3m4 kernel can serve raises instead of falling through -- every e4m3
+    kernel reads those bytes as e4m3 and returns garbage without erroring.
+    """
+    if not uses_e3m4_weight(weight):
+        return None
+    if weight.ndim != 2 or list(block_size) != [128, 128]:
+        raise RuntimeError(
+            "FP8_PB_WO_E3M4 weights are laid out as 128x128 blocks over a 2-D "
+            f"[N, K] tensor, got shape {tuple(weight.shape)} with block_size "
+            f"{list(block_size)}. The sm120_fp8_e3m4 kernels cannot decode them, "
+            "and an e4m3 kernel would read the bytes as e4m3 and return garbage."
+        )
+    result = _e3m4_block_linear(
+        input,
+        weight,
+        weight_scale,
+        input_scale=input_scale,
+        bias=bias,
+        out_shape=list(input.shape[:-1]) + [weight.shape[0]],
+    )
+    if result is None:
+        raise RuntimeError(
+            "FP8_PB_WO_E3M4 weights require the sm120_fp8_e3m4 kernels, but no "
+            f"path qualified for (m={list(input.shape[:-1])}, "
+            f"n={weight.shape[0]}, k={weight.shape[1]}); they need SM120/SM121, "
+            "k%128==0, and n%8==0 (n%64==0 up to m=64; or the M=1 GEMV "
+            "limits). These weights cannot be run through an e4m3 block-FP8 "
+            "kernel."
+        )
+    return result
+
+
 def cutlass_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1387,6 +1497,15 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
 ) -> torch.Tensor:
     # TODO: add more robust shape check here
     shape_supported = weight.shape[0] % 128 == 0 and weight.shape[1] % 128 == 0
+
+    # Weights the checkpoint declared e3m4 (FP8_PB_WO_E3M4) decode only through
+    # the sm120 e3m4 kernels; activations stay e4m3 (pre-quantized with
+    # input_scale, or quantized on the fly by the caller below).
+    e3_out = e3m4_block_fp8_linear(
+        input, weight, block_size, weight_scale, input_scale=input_scale, bias=bias
+    )
+    if e3_out is not None:
+        return e3_out
 
     if input_scale is not None:
         # Pre-quantized activation (SGLANG_OPT_MOE_QUANT_ONCE): ``input`` is

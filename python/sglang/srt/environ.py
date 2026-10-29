@@ -295,6 +295,12 @@ class Envs:
     #        group at offset (r * k), improving multi-rank I/O concurrency while
     #        keeping access relatively ordered.
     SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
+    # Legacy fallback for fp8_e3m4 block-FP8 builds that predate the
+    # FP8_PB_WO_E3M4 algo: declares every block-FP8 layer of the checkpoint as
+    # e3m4 codes (amax/30), routed through the sm120 e3m4 kernels (see
+    # kernels/ops/gemm/sm120_fp8_e3m4.py). Declared checkpoints need nothing
+    # here; setting it for a plain e4m3 checkpoint produces garbage output.
+    SGLANG_USE_E3M4_KERNELS = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
     # instead of gathering DP tokens for a global-TP lookup.

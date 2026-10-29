@@ -100,6 +100,7 @@ def quantize_linear_to_fp8_block128(linear: torch.nn.Module) -> bool:
     scales = blocks.abs().amax(dim=(1, 3), keepdim=True).clamp_min(1e-12) / FP8_E4M3_MAX
     quantized = (blocks / scales).to(torch.float8_e4m3fn).reshape(n, k)
     linear.weight = torch.nn.Parameter(quantized, requires_grad=False)
+    linear.weight.e4m3_only = True  # online-quantized e4m3, not an e3m4 checkpoint
     linear.register_buffer(
         "weight_block_scale",
         scales.view(n // FP8_BLOCK, k // FP8_BLOCK).contiguous(),

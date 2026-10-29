@@ -74,6 +74,7 @@ def quantize_lm_head_to_fp8_block128(lm_head: ParallelLMHead) -> bool:
     scales = blocks.abs().amax(dim=(1, 3), keepdim=True).clamp_min(1e-12) / FP8_E4M3_MAX
     quantized = (blocks / scales).to(torch.float8_e4m3fn).reshape(n, k)
     lm_head.weight = torch.nn.Parameter(quantized, requires_grad=False)
+    lm_head.weight.e4m3_only = True  # online-quantized e4m3, not an e3m4 checkpoint
     lm_head.register_buffer(
         "weight_block_scale",
         scales.view(n // FP8_LM_HEAD_BLOCK, k // FP8_LM_HEAD_BLOCK).contiguous(),
