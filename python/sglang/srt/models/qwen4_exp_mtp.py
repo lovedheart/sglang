@@ -97,6 +97,27 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         self.lm_head = nvfp4_head
         logger.info("draft runner uses a private NVFP4 W4A16 lm_head")
 
+    def load_weights(self, weights, is_mtp: bool = False):
+        loaded = super().load_weights(weights, is_mtp=is_mtp)
+        # One-shot swap after load (never lazy), mirroring the target-side
+        # fp8 shared-expert hook. Draft-path quant error feeds proposal
+        # accept-length directly, so it is a separate opt-in on top of the
+        # target flag.
+        features = get_exec().features
+        if features.enable_fp8_shared_expert and features.enable_fp8_shared_expert_mtp:
+            from sglang.srt.layers.fp8_shared_expert import (
+                quantize_shared_experts_fp8_block128,
+            )
+
+            n = quantize_shared_experts_fp8_block128(self.model)
+            if n:
+                logger.info(
+                    "Quantized %d draft (MTP) shared-expert projections to "
+                    "FP8 e4m3 with 128x128 block scales",
+                    n,
+                )
+        return loaded
+
     def _init_pre_fc_norms(self, config: PretrainedConfig) -> None:
         self.pre_fc_norm_embedding = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
