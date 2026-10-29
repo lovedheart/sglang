@@ -385,9 +385,13 @@ class TestReplaySSMFoldPleCommit(CustomTestCase):
         target_worker = MagicMock()
         target_worker.model_runner.model = MagicMock()
         req_pool = target_worker.model_runner.req_to_token_pool
-        req_pool.mamba_pool.replayssm_spec_fold = True
-        req_pool.mamba_pool.replayssm_is_kda = False
-        req_pool.mamba_pool.replayssm_cache_base = None
+        # Upstream moved the mamba pool lookup onto the KV layer router.
+        mamba_pool = (
+            target_worker.model_runner.token_to_kv_pool.layer_router.part_view.return_value
+        )
+        mamba_pool.replayssm_spec_fold = True
+        mamba_pool.replayssm_is_kda = False
+        mamba_pool.replayssm_cache_base = None
         req_pool.get_mamba_indices.return_value = dst_indices
         req_pool.translate_mamba_indices.side_effect = lambda x: x
         req_pool.short_conv_pool.conv_state = None
@@ -414,7 +418,7 @@ class TestReplaySSMFoldPleCommit(CustomTestCase):
                 return_value={"some": "config"},
             ),
             patch(
-                "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold."
+                "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold."
                 "commit_gdn_replayssm_fold_after_verify"
             ) as fold,
         ):
