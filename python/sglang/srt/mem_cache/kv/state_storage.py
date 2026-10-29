@@ -185,6 +185,11 @@ class StateStorage:
             table.mamba_ping_pong_track_buffer_size - n
         )
         req.kv.mamba_prev_track_seqlen = None
+        # Freshly recycled from the shared pool; these slots are never zeroed
+        # on free, so stage a deferred forward-stream clear (see
+        # _collect_deferred_mamba_cow_and_clear). Without it a skipped
+        # boundary write would donate the previous owner's state to the tree.
+        req.kv.mamba_ping_pong_needs_clear = True
         req.kv.mamba_next_track_idx = 0
         req.kv.mamba_last_track_idx = (
             0
