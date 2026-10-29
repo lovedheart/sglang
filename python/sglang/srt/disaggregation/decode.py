@@ -418,7 +418,6 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.state.slots.clear()
 
 
-
 @dataclass
 class DecodeRequest:
     req: Req
