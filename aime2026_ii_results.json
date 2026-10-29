@@ -1,0 +1,272 @@
+{
+ "1": {
+  "problem": 1,
+  "pred": 178,
+  "correct": true,
+  "completion_tokens": 2536,
+  "elapsed_s": 18.8,
+  "finish": "stop",
+  "spec_at_start": {
+   "sglang:spec_accept_length": 3.6,
+   "sglang:spec_accept_rate": 0.8666666666666667,
+   "sglang:spec_verify_calls_total": 152480.0
+  },
+  "spec_at_end": {
+   "sglang:spec_accept_length": 2.805,
+   "sglang:spec_accept_rate": 0.6016666666666667,
+   "sglang:spec_verify_calls_total": 153452.0
+  }
+ },
+ "2": {
+  "problem": 2,
+  "pred": 243,
+  "correct": true,
+  "completion_tokens": 32768,
+  "elapsed_s": 176.2,
+  "finish": "length",
+  "spec_at_start": {
+   "sglang:spec_accept_length": 3.6,
+   "sglang:spec_accept_rate": 0.8666666666666667,
+   "sglang:spec_verify_calls_total": 152480.0
+  },
+  "spec_at_end": {
+   "sglang:spec_accept_length": 2.7,
+   "sglang:spec_accept_rate": 0.5666666666666667,
+   "sglang:spec_verify_calls_total": 169740.0
+  }
+ },
+ "3": {
+  "problem": 3,
+  "pred": 503,
+  "correct": true,
+  "completion_tokens": 32768,
+  "elapsed_s": 177.1,
+  "finish": "length",
+  "spec_at_start": {
+   "sglang:spec_accept_length": 3.6,
+   "sglang:spec_accept_rate": 0.8666666666666667,
+   "sglang:spec_verify_calls_total": 152480.0
+  },
+  "spec_at_end": {
+   "sglang:spec_accept_length": 2.825,
+   "sglang:spec_accept_rate": 0.6083333333333333,
+   "sglang:spec_verify_calls_total": 182635.0
+  }
+ },
+ "4": {
+  "problem": 4,
+  "pred": 279,
+  "correct": true,
+  "completion_tokens": 5798,
+  "elapsed_s": 36.7,
+  "finish": "stop",
+  "spec_at_start": {
+   "sglang:spec_accept_length": 3.6,
+   "sglang:spec_accept_rate": 0.8666666666666667,
+   "sglang:spec_verify_calls_total": 152480.0
+  },
+  "spec_at_end": {
+   "sglang:spec_accept_length": 2.775,
+   "sglang:spec_accept_rate": 0.5916666666666667,
+   "sglang:spec_verify_calls_total": 156925.0
+  }
+ },
+ "5": {
+  "problem": 5,
+  "pred": 190,
+  "correct": true,
+  "completion_tokens": 2944,
+  "elapsed_s": 20.6,
+  "finish": "stop",
+  "spec_at_start": {
+   "sglang:spec_accept_length": 3.6,
+   "sglang:spec_accept_rate": 0.8666666666666667,
+   "sglang:spec_verify_calls_total": 152480.0
+  },
+  "spec_at_end": {
+   "sglang:spec_accept_length": 2.785,
+   "sglang:spec_accept_rate": 0.595,
+   "sglang:spec_verify_calls_total": 154505.0
+  }
+ },
+ "6": {
+  "problem": 6,
+  "pred": 50,
+  "correct": true,
+  "completion_tokens": 15976,
+  "elapsed_s": 106.3,
+  "finish": "stop",
+  "spec_at_start": {
+   "sglang:spec_accept_length": 2.825,
+   "sglang:spec_accept_rate": 0.6083333333333333,
+   "sglang:spec_verify_calls_total": 182635.0
+  },
+  "spec_at_end": {
+   "sglang:spec_accept_length": 2.74375,
+   "sglang:spec_accept_rate": 0.58125,
+   "sglang:spec_verify_calls_total": 190375.0
+  }
+ },
+ "7": {
+  "problem": 7,
+  "pred": 754,
+  "correct": true,
+  "completion_tokens": 4415,
+  "elapsed_s": 30.1,
+  "finish": "stop",
+  "spec_at_start": {
+   "sglang:spec_accept_length": 2.825,
+   "sglang:spec_accept_rate": 0.6083333333333333,
+   "sglang:spec_verify_calls_total": 182635.0
+  },
+  "spec_at_end": {
+   "sglang:spec_accept_length": 3.035,
+   "sglang:spec_accept_rate": 0.6783333333333333,
+   "sglang:spec_verify_calls_total": 184183.0
+  }
+ },
+ "8": {
+  "problem": 8,
+  "pred": 245,
+  "correct": true,
+  "completion_tokens": 25318,
+  "elapsed_s": 151.9,
+  "finish": "stop",
+  "spec_at_start": {
+   "sglang:spec_accept_length": 2.825,
+   "sglang:spec_accept_rate": 0.6083333333333333,
+   "sglang:spec_verify_calls_total": 182635.0
+  },
+  "spec_at_end": {
+   "sglang:spec_accept_length": 2.8583333333333334,
+   "sglang:spec_accept_rate": 0.6194444444444445,
+   "sglang:spec_verify_calls_total": 199648.0
+  }
+ },
+ "9": {
+  "problem": 9,
+  "pred": 669,
+  "correct": true,
+  "completion_tokens": 32768,
+  "elapsed_s": 184.2,
+  "finish": "length",
+  "spec_at_start": {
+   "sglang:spec_accept_length": 2.825,
+   "sglang:spec_accept_rate": 0.6083333333333333,
+   "sglang:spec_verify_calls_total": 182635.0
+  },
+  "spec_at_end": {
+   "sglang:spec_accept_length": 2.4875,
+   "sglang:spec_accept_rate": 0.49583333333333335,
+   "sglang:spec_verify_calls_total": 211401.0
+  }
+ },
+ "10": {
+  "problem": 10,
+  "pred": 340,
+  "correct": true,
+  "completion_tokens": 31838,
+  "elapsed_s": 188.6,
+  "finish": "stop",
+  "spec_at_start": {
+   "sglang:spec_accept_length": 2.825,
+   "sglang:spec_accept_rate": 0.6083333333333333,
+   "sglang:spec_verify_calls_total": 182635.0
+  },
+  "spec_at_end": {
+   "sglang:spec_accept_length": 3.7,
+   "sglang:spec_accept_rate": 0.9,
+   "sglang:spec_verify_calls_total": 223551.0
+  }
+ },
+ "11": {
+  "problem": 11,
+  "pred": 132,
+  "correct": true,
+  "completion_tokens": 25301,
+  "elapsed_s": 182.2,
+  "finish": "stop",
+  "spec_at_start": {
+   "sglang:spec_accept_length": 3.7,
+   "sglang:spec_accept_rate": 0.9,
+   "sglang:spec_verify_calls_total": 223551.0
+  },
+  "spec_at_end": {
+   "sglang:spec_accept_length": 2.95,
+   "sglang:spec_accept_rate": 0.65,
+   "sglang:spec_verify_calls_total": 240476.0
+  }
+ },
+ "12": {
+  "problem": 12,
+  "pred": 223,
+  "correct": true,
+  "completion_tokens": 19196,
+  "elapsed_s": 141.8,
+  "finish": "stop",
+  "spec_at_start": {
+   "sglang:spec_accept_length": 3.7,
+   "sglang:spec_accept_rate": 0.9,
+   "sglang:spec_verify_calls_total": 223551.0
+  },
+  "spec_at_end": {
+   "sglang:spec_accept_length": 2.855,
+   "sglang:spec_accept_rate": 0.6183333333333333,
+   "sglang:spec_verify_calls_total": 230795.0
+  }
+ },
+ "13": {
+  "problem": 13,
+  "pred": 7,
+  "correct": false,
+  "completion_tokens": 32768,
+  "elapsed_s": 238.4,
+  "finish": "length",
+  "spec_at_start": {
+   "sglang:spec_accept_length": 3.7,
+   "sglang:spec_accept_rate": 0.9,
+   "sglang:spec_verify_calls_total": 223551.0
+  },
+  "spec_at_end": {
+   "sglang:spec_accept_length": 2.425,
+   "sglang:spec_accept_rate": 0.475,
+   "sglang:spec_verify_calls_total": 279428.0
+  }
+ },
+ "14": {
+  "problem": 14,
+  "pred": 9,
+  "correct": false,
+  "completion_tokens": 32768,
+  "elapsed_s": 219.9,
+  "finish": "length",
+  "spec_at_start": {
+   "sglang:spec_accept_length": 3.7,
+   "sglang:spec_accept_rate": 0.9,
+   "sglang:spec_verify_calls_total": 223551.0
+  },
+  "spec_at_end": {
+   "sglang:spec_accept_length": 2.408333333333333,
+   "sglang:spec_accept_rate": 0.46944444444444444,
+   "sglang:spec_verify_calls_total": 252703.0
+  }
+ },
+ "15": {
+  "problem": 15,
+  "pred": 393,
+  "correct": true,
+  "completion_tokens": 32768,
+  "elapsed_s": 229.1,
+  "finish": "length",
+  "spec_at_start": {
+   "sglang:spec_accept_length": 3.7,
+   "sglang:spec_accept_rate": 0.9,
+   "sglang:spec_verify_calls_total": 223551.0
+  },
+  "spec_at_end": {
+   "sglang:spec_accept_length": 2.55,
+   "sglang:spec_accept_rate": 0.5166666666666667,
+   "sglang:spec_verify_calls_total": 265637.0
+  }
+ }
+}
