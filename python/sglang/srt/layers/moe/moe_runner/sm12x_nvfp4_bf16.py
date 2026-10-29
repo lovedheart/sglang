@@ -8,10 +8,16 @@ quantization), which is the numerics a W4A16 checkpoint is calibrated for.
 Token counts are rounded up to a bounded bucket ladder (bounded
 kernel-compile set); token counts above
 ``SGLANG_SM12X_W4A16_MOE_MAX_TOKENS`` run unpadded at their exact size.
+
+With ``SGLANG_SM12X_W4A4_PREFILL_MIN_TOKENS`` set, batches at or above that
+token count instead run flashinfer's ``moe_nvfp4_w4a4`` sibling kernel on the
+same weights (NVFP4-quantized activations, faster for prefill).
 """
 
 from __future__ import annotations
 
+import logging
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -34,6 +40,8 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class Sm12xNvfp4W4A16MoeQuantInfo(MoeQuantInfo):
@@ -47,12 +55,19 @@ class Sm12xNvfp4W4A16MoeQuantInfo(MoeQuantInfo):
     ``w2_gs`` instead -- see ``_sm12x_global_scales``.
     """
 
-    w13: torch.Tensor  # uint8 [E, 2I, H/2]
+    w13: torch.Tensor  # uint8 [E, 2I, H/2], [gate; up] rows
     w13_sf: torch.Tensor  # e4m3/uint8 [E, pad128(2I), pad4(H/16)], 128x4 swizzled
     w13_gs: torch.Tensor  # fp32 [E]
     w2: torch.Tensor  # uint8 [E, H, I/2]
     w2_sf: torch.Tensor  # e4m3/uint8 [E, pad128(H), pad4(I/16)]
     w2_gs: torch.Tensor  # fp32 [E]
+    # Optional W4A4 prefill arm (flashinfer moe_nvfp4_w4a4, sibling of the
+    # vendored W4A16 kernel reading the same canonical weights). When set,
+    # batches with at least SGLANG_SM12X_W4A4_PREFILL_MIN_TOKENS tokens
+    # quantize activations to NVFP4 using these quantization multipliers
+    # (1 / input_scale); see _prepare_sm12x_w4a16_weights for their derivation.
+    a13_gs: torch.Tensor | None = None
+    a2_gs: torch.Tensor | None = None
 
 
 # Scratch buffers are keyed by (bucket tokens, hidden, inter, N13, experts,
@@ -62,23 +77,119 @@ class Sm12xNvfp4W4A16MoeQuantInfo(MoeQuantInfo):
 # safe under CUDA-graph replay); it must not be shared by two *concurrent*
 # launches, which per-layer sequential execution guarantees.
 _WORKSPACE_CACHE: dict[tuple, list[torch.Tensor]] = {}
+# One flat scratch arena for all W4A4 buckets (workspace bytes scale linearly
+# with the token count, so buckets carved out of one max-size buffer replace
+# the per-bucket ladder; views are 256B-aligned so TMA descriptors stay legal,
+# and the arena is allocated once and never resized, so captured graphs keep
+# valid addresses).
+_ARENA_ALIGN = 256
+_ARENA_SLACK = 1 << 20
+_W4A4_ARENAS: dict[torch.device, list] = {}  # device -> [uint8 buffer, next offset]
+
+
+def _ws_bytes(shapes) -> int:
+    return sum(
+        (math.prod(s) * d.itemsize + _ARENA_ALIGN - 1) // _ARENA_ALIGN * _ARENA_ALIGN
+        for s, d in shapes
+    )
+
+
+def _w4a4_upper_tokens(bucket: int) -> int | None:
+    """Upper bound on token counts the W4A4 arm can request (prefill batches
+    dominate; above the bucket-ladder cap sizes round up to powers of two)."""
+    try:
+        from sglang.srt.server_args import get_server_args
+
+        t = int(get_server_args().max_prefill_tokens or 0)
+    except (ImportError, RuntimeError, TypeError, ValueError):
+        return None
+    t = max(t, int(envs.SGLANG_SM12X_W4A16_MOE_MAX_TOKENS.get()))
+    return max(t, 1 << (bucket - 1).bit_length())
+
+
+def _w4a4_workspace(
+    bucket: int,
+    h: int,
+    i: int,
+    n13: int,
+    e: int,
+    topk: int,
+    device: torch.device,
+) -> list[torch.Tensor]:
+    """Per-bucket W4A4 workspace views carved from the shared arena."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_nvfp4_w4a4 import (
+        allocate_workspace,
+    )
+
+    shapes = None
+    try:
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_nvfp4_w4a4 import (
+            _entry,
+        )
+
+        _, shapes, _ = _entry(bucket, h, i, n13, e, topk, torch.device(device))
+    except (ImportError, AttributeError, TypeError, RuntimeError) as exc:
+        logger.debug("W4A4 arena disabled (%s); per-bucket workspace", exc)
+    if shapes is not None:
+        need = _ws_bytes(shapes)
+        arena = _W4A4_ARENAS.get(device)
+        if arena is None:
+            upper = _w4a4_upper_tokens(bucket)
+            if upper is not None and upper >= bucket:
+                cap = _ws_bytes(_entry(upper, h, i, n13, e, topk, torch.device(device))[1])
+                if cap >= need:
+                    arena = [
+                        torch.empty(cap + _ARENA_SLACK, dtype=torch.uint8, device=device),
+                        0,
+                    ]
+                    _W4A4_ARENAS[device] = arena
+        if arena is not None and arena[0].numel() - arena[1] >= need:
+            off = arena[1]
+            ws = []
+            for shape, dtype in shapes:
+                n = math.prod(shape)
+                nbytes = (n * dtype.itemsize + _ARENA_ALIGN - 1) // _ARENA_ALIGN * _ARENA_ALIGN
+                view = arena[0][off : off + n * dtype.itemsize].view(dtype)
+                ws.append(view.view(tuple(shape)))
+                off += nbytes
+            arena[1] = off
+            return ws
+    return allocate_workspace(
+        num_tokens=bucket,
+        hidden_size=h,
+        intermediate_size=i,
+        num_experts=e,
+        top_k=topk,
+        is_gated=n13 == 2 * i,
+        device=device,
+    )
 
 
 def _workspace(
-    bucket: int, h: int, i: int, n13: int, e: int, topk: int, device: torch.device
+    bucket: int,
+    h: int,
+    i: int,
+    n13: int,
+    e: int,
+    topk: int,
+    device: torch.device,
+    w4a4: bool = False,
 ) -> list[torch.Tensor]:
-    key = (bucket, h, i, n13, e, topk, device)
+    key = (bucket, h, i, n13, e, topk, device, w4a4)
     ws = _WORKSPACE_CACHE.get(key)
     if ws is None:
-        ws = allocate_workspace(
-            num_tokens=bucket,
-            hidden_size=h,
-            intermediate_size=i,
-            num_experts=e,
-            top_k=topk,
-            is_gated=n13 == 2 * i,
-            device=device,
-        )
+        if w4a4:
+            ws = _w4a4_workspace(bucket, h, i, n13, e, topk, device)
+        else:
+            ws = allocate_workspace(
+                num_tokens=bucket,
+                hidden_size=h,
+                intermediate_size=i,
+                num_experts=e,
+                top_k=topk,
+                is_gated=n13 == 2 * i,
+                device=device,
+            )
         _WORKSPACE_CACHE[key] = ws
     return ws
 
@@ -130,6 +241,8 @@ def _pad_rows(x: torch.Tensor, rows: int, dtype: torch.dtype, pad_value: float):
     return out
 
 
+
+
 @register_fused_func("none", "sm12x_nvfp4_bf16")
 def fused_experts_none_to_sm12x_nvfp4_bf16(
     dispatch_output: StandardDispatchOutput,
@@ -171,6 +284,12 @@ def fused_experts_none_to_sm12x_nvfp4_bf16(
     topk = topk_ids.shape[1]
     max_tokens = max(1, envs.SGLANG_SM12X_W4A16_MOE_MAX_TOKENS.get())
 
+    w4a4_min = envs.SGLANG_SM12X_W4A4_PREFILL_MIN_TOKENS.get()
+    # Large batches (typically prefill chunks) go through the W4A4 sibling
+    # kernel, ~1.4x faster than W4A16 here, at the cost of quantizing
+    # activations to NVFP4.
+    use_w4a4 = w4a4_min > 0 and quant_info.a13_gs is not None and t >= w4a4_min
+
     if t > max_tokens:
         # Above the ladder cap (e.g. an oversized prefill chunk): run at the
         # exact token count rather than padding further.
@@ -189,18 +308,40 @@ def fused_experts_none_to_sm12x_nvfp4_bf16(
     # Out rows past ``t`` (padding slots) are never written: routing slots
     # with an out-of-range expert id are skipped by the kernel.
     out = torch.empty((bucket, h), dtype=torch.bfloat16, device=hidden.device)
-    workspace = _workspace(bucket, h, i, n13, e, topk, hidden.device)
-    run_moe_w4a16(
-        x,
-        ids,
-        weights,
-        quant_info.w13,
-        quant_info.w13_sf,
-        quant_info.w13_gs,
-        quant_info.w2,
-        quant_info.w2_sf,
-        quant_info.w2_gs,
-        out,
-        workspace=workspace,
-    )
+    if use_w4a4:
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_nvfp4_w4a4 import (
+            run_moe_w4a4,
+        )
+
+        workspace = _workspace(bucket, h, i, n13, e, topk, hidden.device, w4a4=True)
+        run_moe_w4a4(
+            x,
+            ids,
+            weights,
+            quant_info.w13,
+            quant_info.w13_sf,
+            quant_info.w13_gs,
+            quant_info.w2,
+            quant_info.w2_sf,
+            quant_info.w2_gs,
+            quant_info.a13_gs,
+            quant_info.a2_gs,
+            out,
+            workspace=workspace,
+        )
+    else:
+        workspace = _workspace(bucket, h, i, n13, e, topk, hidden.device)
+        run_moe_w4a16(
+            x,
+            ids,
+            weights,
+            quant_info.w13,
+            quant_info.w13_sf,
+            quant_info.w13_gs,
+            quant_info.w2,
+            quant_info.w2_sf,
+            quant_info.w2_gs,
+            out,
+            workspace=workspace,
+        )
     return StandardCombineInput(hidden_states=out[:t])

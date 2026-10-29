@@ -300,6 +300,10 @@ class QwenSparseAttnBackend(AttentionBackend):
     needs_cpu_seq_lens: bool = False
     _kv_shard_pool: Optional[PageInterleaveKVPoolMixin] = None
 
+    # Class-level default so backends built without __init__ (unit tests use
+    # __new__) still take the unquantized read path.
+    kv_cache_quant_method = None
+
     def __init__(self, runner=None) -> None:
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
