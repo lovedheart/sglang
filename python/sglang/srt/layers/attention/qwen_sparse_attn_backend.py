@@ -16,6 +16,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
@@ -38,6 +39,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_kv_extraction_gathered_rows_triton,
+    qwen_sparse_kv_gather_dequant_fp4_triton,
     qwen_sparse_valid_counts_triton,
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
@@ -253,6 +255,21 @@ class QwenSparseAttnBackend(AttentionBackend):
         # byte-identical pre-FP4 read path.
         self.kv_cache_quant_method = None
         self._fp4_attn_dtype = torch.bfloat16
+        self._fused_fp4_gather = False
+        # Feed fp8 scratch to the paged decode kernel instead of widening KV to
+        # the query dtype first (see SGLANG_QSA_ATTN_FP8).  The dtype is resolved
+        # per call from the KV buffer; this only records that the operator asked.
+        self._attn_fp8_requested = bool(envs.SGLANG_QSA_ATTN_FP8.get())
+        # SGLANG_QSA_ATTN_FP4 (or FP8 on an NVFP4 pool) takes the native
+        # FP4-KV decode path where the kernel supports it (xqa on SM12x): the
+        # fused gather then copies packed nibbles + scale factors through and
+        # the kernel dequantizes in registers, which is exactly the bf16-scratch
+        # result -- no requant drift at all.  Resolved once the quant method is
+        # known below.  When unsupported, FP4 alone stays on bf16 scratch while
+        # FP8 alone falls back to the e4m3-requant scratch.
+        self._attn_fp4_requested = bool(envs.SGLANG_QSA_ATTN_FP4.get())
+        self._native_fp4_decode = False
+        self._fp4_gs_host = {}
         get_quant_method = getattr(
             self.token_to_kv_pool, "get_kv_cache_quant_method", None
         )
@@ -265,6 +282,15 @@ class QwenSparseAttnBackend(AttentionBackend):
                     self._check_kv_attention_access(phase, access)
                     if access.attention_kv_dtype is not None:
                         self._fp4_attn_dtype = access.attention_kv_dtype
+                self._fused_fp4_gather = bool(
+                    envs.SGLANG_QSA_FUSED_FP4_GATHER.get()
+                    and getattr(quant_method, "name", "") == "nvfp4"
+                )
+                self._native_fp4_decode = bool(
+                    self._fused_fp4_gather
+                    and (self._attn_fp4_requested or self._attn_fp8_requested)
+                    and torch.cuda.get_device_capability()[0] == 12
+                )
         self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
         self._cuda_graph_metadata: Dict[
             Tuple[ForwardMode, int], QwenSparseAttnMetadata
@@ -340,6 +366,51 @@ class QwenSparseAttnBackend(AttentionBackend):
             layer_id,
             dtype=self._fp4_attn_dtype,
         )
+
+    @staticmethod
+    def _attn_scratch_dtype(
+        requested: bool,
+        query_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        *,
+        fused_fp4: bool,
+        gathered_rows: bool,
+    ) -> torch.dtype:
+        """Pick the dtype of the packed decode scratch (bf16 by default).
+
+        fp8 is only safe where every value that reaches the scratch is exactly
+        representable or has been fully dequantized first:
+
+        * an fp8_e4m3 pool read straight by the gatherer (``gathered_rows``
+          False) -- the copy is bitwise, only the kernel sees fp8;
+        * the fused NVFP4 gatherer, which dequantizes in registers and casts to
+          the scratch dtype (one extra saturating rounding).
+
+        A non-fused FP4 gather hands in an already-dequantized bf16 buffer, and
+        a query dtype other than bf16 has no bf16-q/fp8-KV kernel path, so both
+        stay bf16.
+        """
+        if not requested or query_dtype != torch.bfloat16:
+            return query_dtype
+        if fused_fp4:
+            return torch.float8_e4m3fn
+        if not gathered_rows and kv_dtype == torch.float8_e4m3fn:
+            return torch.float8_e4m3fn
+        return query_dtype
+
+    @staticmethod
+    def _widen_kv_for_kernel(rows: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Return gathered KV rows in the sparse-prefill kernel's input dtype.
+
+        The chunk-prefill kernel casts the gathered K/V tiles to the query dtype
+        before ``tl.dot`` (Triton rejects an fp8 right-hand side), so an fp8
+        pool's rows can be handed over as they are: fp8_e4m3 -> bf16 widens
+        exactly, and skipping the host-side cast drops a full-context bf16
+        materialization per layer.  Anything else still converts eagerly.
+        """
+        if rows.dtype == dtype or rows.dtype == torch.float8_e4m3fn:
+            return rows
+        return rows.to(dtype)
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -686,6 +757,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "mis-mapped to requests"
             )
         speculative_paged = self._is_speculative_paged_mode(forward_batch.forward_mode)
+        # Packed length of the compressed-K slab; set where the lengths are
+        # already on the host so the per-layer gather skips its own readback.
+        compressed_capacity = None
         prefill_sequence_lengths_cpu = None
         if speculative_paged:
             logical_positions = forward_batch.positions
@@ -714,8 +788,19 @@ class QwenSparseAttnBackend(AttentionBackend):
             sequence_lengths = forward_batch.seq_lens.to(torch.int32)
             batch_size = sequence_lengths.numel()
             if forward_batch.seq_lens_cpu is not None:
-                max_length = int(forward_batch.seq_lens_cpu[:batch_size].max())
+                host_lengths = forward_batch.seq_lens_cpu[:batch_size]
+                max_length = int(host_lengths.max())
+                # Exact packed compressed-K length, summed on the host from
+                # the same lengths the device tensor carries, so the
+                # per-layer gather needs no length readback of its own.
+                compressed_capacity = int(
+                    torch.div(
+                        host_lengths, self.compress_ratio, rounding_mode="floor"
+                    ).sum()
+                )
             else:
+                # gpu_only batches (no host-side lengths); the serving path
+                # never lands here.
                 max_length = int(sequence_lengths.max())
             row_req_pool_indices = forward_batch.req_pool_indices[:batch_size]
             token_slot_table = self.req_to_token[
@@ -846,6 +931,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 self._can_defer_block_expansion(forward_batch.forward_mode)
                 and decode_logical_positions is not None
             ),
+            compressed_capacity=compressed_capacity,
             prefill_sequence_lengths_cpu=prefill_sequence_lengths_cpu,
         )
         return QwenSparseAttnMetadata(
@@ -1621,50 +1707,93 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         # Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
+        req_to_token = self.req_to_token_pool.req_to_token
+        num_sequences = len(sequence_lens)
+        total_context = sum(sequence_lens)
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         if self.kv_cache_quant_method is not None:
-            # Quantized pools cannot be element-indexed; gather the
-            # full-context slots in one shot and dequantize only those rows.
-            # The gathered rows are already in the packed (per-sequence cat)
-            # order that pack_qsa_prefill_kv produces for plain pools.
-            req_to_token = self.req_to_token_pool.req_to_token
-            if is_in_breakable_cuda_graph():
-                # Reuse the prepared slot table to avoid a D2H sync per layer
-                # on replay.
-                req_to_token = self._resolve_metadata(forward_batch).token_slot_table
-                req_indices: object = range(len(sequence_lens))
+            # Quantized pools cannot be element-indexed by the pack kernel;
+            # build the flat slot index (sequence b owns
+            # [cu_k[b], cu_k[b] + len[b])) and dequantize only the gathered
+            # rows. The row order matches the packed layout that
+            # pack_qsa_prefill_kv produces for plain pools.
+            if envs.SGLANG_QSA_VECTOR_PREFILL_GATHER.get():
+                if num_sequences == 1:
+                    # A single sequence is already a contiguous row of the
+                    # table, so the slice is a view and no index math is
+                    # needed at all.
+                    all_slots = req_to_token[
+                        forward_batch.req_pool_indices[0], :total_context
+                    ]
+                elif total_context:
+                    row_ids = torch.repeat_interleave(
+                        torch.arange(num_sequences, dtype=torch.int32, device=q.device),
+                        sequence_lens_tensor,
+                        output_size=total_context,
+                    )
+                    columns = torch.arange(
+                        total_context, dtype=torch.int32, device=q.device
+                    ) - cu_seqlens_k[:-1].index_select(0, row_ids)
+                    req_rows = forward_batch.req_pool_indices.index_select(0, row_ids)
+                    all_slots = req_to_token[req_rows.long(), columns.long()]
+                else:
+                    all_slots = req_to_token.new_empty((0,))
             else:
-                req_indices = forward_batch.req_pool_indices.tolist()
-            all_slots = torch.cat(
-                [
-                    req_to_token[req_indices[i], : sequence_lens[i]].long()
-                    for i in range(len(sequence_lens))
-                ]
-            )
+                if is_in_breakable_cuda_graph():
+                    # Reuse the prepared slot table to avoid a D2H sync per
+                    # layer on replay.
+                    req_to_token = self._resolve_metadata(
+                        forward_batch
+                    ).token_slot_table
+                    all_slots = torch.cat(
+                        [
+                            req_to_token[i, : sequence_lens[i]].long()
+                            for i in range(num_sequences)
+                        ]
+                    )
+                else:
+                    req_indices = forward_batch.req_pool_indices.tolist()
+                    all_slots = torch.cat(
+                        [
+                            req_to_token[req_indices[i], : sequence_lens[i]].long()
+                            for i in range(num_sequences)
+                        ]
+                    )
             packed_k, packed_v = self._gather_kv_fp4(layer.layer_id, all_slots)
         else:
+            k_buffer = pool.layer_router.read(layer.layer_id).key()
+            v_buffer = pool.layer_router.read(layer.layer_id).value()
+            # An fp8_e4m3 pool packs losslessly (implicit scale 1.0) and the
+            # kernel widens the tiles itself, so only widen for other dtypes.
             packed_k, packed_v = pack_qsa_prefill_kv(
-                k=pool.layer_router.read(layer.layer_id).key(),
-                v=pool.layer_router.read(layer.layer_id).value(),
+                k=k_buffer,
+                v=v_buffer,
                 req_to_token=self.req_to_token_pool.req_to_token,
                 req_indices=forward_batch.req_pool_indices,
                 cu_k=cu_seqlens_k,
-                total_k=sum(sequence_lens),
+                total_k=total_context,
                 max_k=max(sequence_lens, default=1),
-                output_dtype=q.dtype,
+                output_dtype=None
+                if k_buffer.dtype == torch.float8_e4m3fn
+                else q.dtype,
             )
+        # fp8 KV buffers carry implicit scale 1.0, so the kernel can widen
+        # the gathered rows itself (it casts both K/V tiles to the query
+        # dtype before tl.dot); passing fp8 straight through skips a
+        # full-context bf16 materialization per layer bit-identically.
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
-            packed_k,
-            packed_v,
+            self._widen_kv_for_kernel(packed_k, q.dtype),
+            self._widen_kv_for_kernel(packed_v, q.dtype),
             topk_indices,
             cu_seqlens_q,
             cu_seqlens_k,
             sequence_lens_tensor,
             layer.scaling,
+            max_q=max(extend_lens, default=1),
         )
         return self._pad_extend_output(output, num_output_rows)
 
@@ -1874,6 +2003,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.compress_ratio if self._uses_block_indices(topk_indices) else 1
         )
         topk = topk * compress_ratio + compress_ratio - 1
+        fused_fp4 = gathered_rows and self._fused_fp4_gather
         page = _TRTLLM_SPARSE_PAGE_SIZE
         pages_per_row = (topk + page - 1) // page
         stride = pages_per_row * page
@@ -1889,18 +2019,41 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch, pages_per_row, page, device
         )
         capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
-        # TRTLLM-gen takes BF16 q with FP8-E4M3 KV, so an FP8 pool stays FP8 here;
-        # validated on SM10x only, SM120 keeps the BF16 scratch.
-        packed_dtype = (
+        # Upstream default: TRTLLM-gen takes BF16 q with FP8-E4M3 KV, so an FP8
+        # pool stays FP8 on SM10x; SM120 keeps the BF16 scratch.  With
+        # SGLANG_QSA_ATTN_FP8 the helper decides: for an fp8 pool the gather is
+        # then a bitwise copy and only the kernel sees fp8 (bf16-q/fp8-KV
+        # transform on trtllm-gen, dequant-on-load in xqa), and the fused FP4
+        # gather additionally requantizes its register-dequantized rows to
+        # e4m3 (SGLANG_QSA_ATTN_FP4 upgrades that case to the lossless native
+        # FP4-KV path where supported, overriding this).  The legacy
+        # (non-fused) FP4 path and the FA2-varlen fallback always keep bf16
+        # scratch.
+        scratch_dtype = (
             k_buffer.dtype
-            if k_buffer.dtype == torch.float8_e4m3fn and is_sm100_supported()
-            else q.dtype
+            if not self._attn_fp8_requested
+            and k_buffer.dtype == torch.float8_e4m3fn
+            and is_sm100_supported()
+            else self._attn_scratch_dtype(
+                self._attn_fp8_requested,
+                q.dtype,
+                k_buffer.dtype,
+                fused_fp4=fused_fp4,
+                gathered_rows=gathered_rows,
+            )
         )
+        native_fp4 = (
+            fused_fp4
+            and self._native_fp4_decode
+            and q.dtype == torch.bfloat16
+        )
+        if native_fp4:
+            scratch_dtype = torch.uint8
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
             k_buffer.shape[1],
-            k_buffer.shape[2],
-            packed_dtype,
+            k_buffer.shape[2] // 2 if native_fp4 else k_buffer.shape[2],
+            scratch_dtype,
             k_buffer.device,
         )
         if new_kv is not None:
@@ -1931,6 +2084,58 @@ class QwenSparseAttnBackend(AttentionBackend):
                 ),
                 # trtllm_decode reads each row only up to valid_counts.
                 visible_page_size=page,
+            )
+        elif fused_fp4:
+            # Fused gather + dequant + strided pack: reads the packed FP4 pool
+            # directly and dequantizes into the scratch in one launch.  The
+            # gathered_rows/quantized flags below are set for the legacy path
+            # only, so the buffers they name are never materialized here.
+            k_fp4, v_fp4, k_sf, v_sf = self.token_to_kv_pool.get_raw_kv_buffer(
+                layer.layer_id
+            )
+            if k_sf.dtype == torch.float8_e4m3fn:
+                k_sf = k_sf.view(torch.uint8)
+                v_sf = v_sf.view(torch.uint8)
+            method = self.kv_cache_quant_method
+            if native_fp4:
+                # Native FP4 decode: packed scratch plus an SF scratch laid out
+                # like the KV scratch (page-major rows, tail dim dim/16), so
+                # the static arange block table addresses it unchanged; the
+                # global scales fold into the bmm scales at the call below.
+                packed_ksf, packed_vsf = self._get_fa2_scratch(
+                    max(capacity_rows, batch) * stride,
+                    k_sf.shape[1],
+                    k_sf.shape[2],
+                    torch.uint8,
+                    k_buffer.device,
+                )
+            else:
+                packed_ksf = packed_vsf = None
+            qwen_sparse_kv_gather_dequant_fp4_triton(
+                k_fp4.view(torch.uint8),
+                v_fp4.view(torch.uint8),
+                k_sf,
+                v_sf,
+                method.k_scales_gpu[layer.layer_id : layer.layer_id + 1],
+                method.v_scales_gpu[layer.layer_id : layer.layer_id + 1],
+                self.req_to_token_pool.req_to_token,
+                (
+                    metadata.row_req_pool_indices
+                    if metadata.row_req_pool_indices is not None
+                    else forward_batch.req_pool_indices
+                ),
+                topk_indices,
+                sequence_lens,
+                cu_strided,
+                packed_k,
+                packed_v,
+                batch,
+                topk,
+                k_fp4.shape[1],
+                k_fp4.shape[2] * 2,
+                zero_fill_cols=stride,
+                out_k_sf=packed_ksf,
+                out_v_sf=packed_vsf,
             )
         elif gathered_rows:
             qwen_sparse_kv_extraction_gathered_rows_triton(
@@ -1968,16 +2173,37 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         num_kv_heads = k_buffer.shape[1]
         head_dim = k_buffer.shape[2]
-        kc = (
-            packed_k[: batch * stride]
-            .view(-1, page, num_kv_heads, head_dim)
-            .permute(0, 2, 1, 3)
-        )
-        vc = (
-            packed_v[: batch * stride]
-            .view(-1, page, num_kv_heads, head_dim)
-            .permute(0, 2, 1, 3)
-        )
+        kv_rows = packed_k[: batch * stride]
+        kv_rows_v = packed_v[: batch * stride]
+        if native_fp4:
+            # Packed nibble pages; head_dim is reported in bytes here, the
+            # kernel unpacks 2 fp4 per byte (QK == VO assumed).
+            kc = kv_rows.view(-1, page, num_kv_heads, head_dim // 2).permute(0, 2, 1, 3)
+            vc = kv_rows_v.view(-1, page, num_kv_heads, head_dim // 2).permute(
+                0, 2, 1, 3
+            )
+            kv_cache_sf = (
+                packed_ksf[: batch * stride]
+                .view(-1, page, num_kv_heads, head_dim // 16)
+                .permute(0, 2, 1, 3)
+                .view(torch.float8_e4m3fn),
+                packed_vsf[: batch * stride]
+                .view(-1, page, num_kv_heads, head_dim // 16)
+                .permute(0, 2, 1, 3)
+                .view(torch.float8_e4m3fn),
+            )
+            # The kernel applies only the per-block SFs; fold the pool's global
+            # scales into the bmm scales (graph-safe fp32 tensor views).
+            method = self.kv_cache_quant_method
+            bmm1 = layer.scaling * method.k_scales_gpu[
+                layer.layer_id : layer.layer_id + 1
+            ]
+            bmm2 = method.v_scales_gpu[layer.layer_id : layer.layer_id + 1]
+        else:
+            kc = kv_rows.view(-1, page, num_kv_heads, head_dim).permute(0, 2, 1, 3)
+            vc = kv_rows_v.view(-1, page, num_kv_heads, head_dim).permute(0, 2, 1, 3)
+            kv_cache_sf = None
+            bmm1, bmm2 = layer.scaling, 1.0
         if self._trtllm_workspace is None:
             self._trtllm_workspace = torch.zeros(
                 128 * 1024 * 1024, dtype=torch.uint8, device=device
@@ -2001,9 +2227,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             block_tables=block_tables,
             seq_lens=valid_counts,
             max_seq_len=stride,
-            bmm1_scale=layer.scaling,
-            bmm2_scale=1.0,
-            multi_ctas_kv_counter_buffer=self._trtllm_counters[key],
+           bmm1_scale=bmm1,
+            bmm2_scale=bmm2,
+            **({"kv_cache_sf": kv_cache_sf} if native_fp4 else {}),
         )
         return output.reshape(q.shape[0], -1)
 
@@ -2082,9 +2308,20 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         topk_indices = topk_indices.to(torch.int32).contiguous()
         if quantized:
-            k_buffer, v_buffer = self._gather_topk_rows_fp4(
-                layer, forward_batch, metadata, topk_indices
-            )
+            if self._fused_fp4_gather:
+                # The fused kernel reads the packed pool directly; the buffers
+                # below only carry shape/device metadata for the packers.
+                k_fp4 = pool.get_raw_kv_buffer(layer.layer_id)[0]
+                k_buffer = torch.empty(
+                    (0, k_fp4.shape[1], k_fp4.shape[2] * 2),
+                    dtype=self._fp4_attn_dtype,
+                    device=k_fp4.device,
+                )
+                v_buffer = k_buffer
+            else:
+                k_buffer, v_buffer = self._gather_topk_rows_fp4(
+                    layer, forward_batch, metadata, topk_indices
+                )
         else:
             k_buffer = pool.get_key_buffer(layer.layer_id)
             v_buffer = pool.get_value_buffer(layer.layer_id)
@@ -2134,7 +2371,36 @@ class QwenSparseAttnBackend(AttentionBackend):
             q.dtype,
             k_buffer.device,
         )
-        if quantized:
+        if quantized and self._fused_fp4_gather:
+            k_fp4, v_fp4, k_sf, v_sf = pool.get_raw_kv_buffer(layer.layer_id)
+            if k_sf.dtype == torch.float8_e4m3fn:
+                k_sf = k_sf.view(torch.uint8)
+                v_sf = v_sf.view(torch.uint8)
+            method = self.kv_cache_quant_method
+            qwen_sparse_kv_gather_dequant_fp4_triton(
+                k_fp4.view(torch.uint8),
+                v_fp4.view(torch.uint8),
+                k_sf,
+                v_sf,
+                method.k_scales_gpu[layer.layer_id : layer.layer_id + 1],
+                method.v_scales_gpu[layer.layer_id : layer.layer_id + 1],
+                self.req_to_token_pool.req_to_token,
+                (
+                    metadata.row_req_pool_indices
+                    if metadata.row_req_pool_indices is not None
+                    else forward_batch.req_pool_indices
+                ),
+                topk_indices,
+                sequence_lens,
+                cu_seqlens_k,
+                packed_k,
+                packed_v,
+                batch,
+                topk,
+                k_fp4.shape[1],
+                k_fp4.shape[2] * 2,
+            )
+        elif quantized:
             qwen_sparse_kv_extraction_gathered_rows_triton(
                 k_buffer,
                 v_buffer,

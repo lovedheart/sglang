@@ -1,0 +1,188 @@
+% !TeX program = xelatex
+\documentclass[12pt,a4paper]{ctexart}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage[margin=2.6cm]{geometry}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{tikz}
+
+\newtheoremstyle{ding}{4pt}{4pt}{\normalfont}{}{\bfseries}。{ }{}
+\theoremstyle{ding}
+\newtheorem{lemma}{引理}[section]
+\newtheorem{satz}[lemma]{定理}
+\newtheorem{kor}[lemma]{推论}
+\theoremstyle{definition}
+\newtheorem{defn}{定义}
+\newtheorem{bem}[lemma]{注}
+\renewcommand{\proofname}{\bfseries 证明}
+
+\newcommand{\R}{\mathbb{R}}
+\renewcommand{\int}{\operatorname{int}}
+\ctexset{section={name={第,、},number=\chinese{section},format=\Large\bfseries}}
+\ctexset{subsection={name={（,）},number=\chinese{subsection},format=\bfseries}}
+
+\title{\bfseries 德国联邦数学竞赛 2026 第二轮 · 第四题\\[4pt] 解答报告}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-3.4em}
+
+\section*{题目}
+设 $f$ 是平面 $\R^{2}$ 到自身的一个映射，满足
+\begin{enumerate}[label=(\arabic*),leftmargin=2.8em]
+  \item 不存在两个不同的点 $P\neq Q$ 使 $f(P)=f(Q)$（即 $f$ 为单射）；
+  \item $f$ 把平面的每个矩形 $R$ 恰好映成一个矩形 $R'$：像集 $\{f(P):P\in R\}$ 等于 $R'$ 的全部点集。
+\end{enumerate}
+依题意与提示：每个矩形都有正面积，且矩形连同其边界与全部内部点（闭矩形）；矩形边的方向不限（允许斜放，正方形是特殊矩形）。\\[2pt]
+\textbf{试探究：}\ (a) $f$ 是否必把每个正方形映成正方形？\ (b) 平面的每个点是否都是某个点的像（即 $f$ 是否满射）？
+
+\section*{结论}
+\begin{center}
+\fbox{\parbox{0.92\textwidth}{\centering\linespread{1.15}\selectfont
+两问答案均为\textbf{是}。事实上可证明更强的结论：$f$ 必为\textbf{相似变换}
+\[
+f(X)=\alpha\,U X+b,\qquad \alpha>0,\ U\ \text{为正交矩阵},\ b\in\R^{2},
+\]
+即 $f$ 由"旋转/反射 + 整体伸缩 + 平移"复合而成。}}
+\end{center}
+
+\section{约定与两个基本观察}
+全文固定一组直角坐标轴；"水平（竖直）方向"指平行于坐标轴的方向。"矩形"指闭的、正面积的矩形（方向不限）。$f$ 恒满足 (1)(2)。
+
+\subsection*{观察 1（像矩形是真矩形；真包含被保持）}
+由 (2)，每个矩形的像都是矩形，故都有正面积、都有内点。若矩形 $A\subsetneq B$，则必有 $f(A)\subsetneq f(B)$：否则取 $P\in B\setminus A$，$f(P)\in f(B)=f(A)$，与单射性 (1) 矛盾。
+
+\subsection*{观察 2（"切割"传递到像）}
+设直线 $\ell$ 平行于矩形 $T$ 的一组边，把 $T$ 分成两个矩形 $T_1,T_2$（公共边 $s=T_1\cap T_2=T\cap\ell$）。因为 $T=T_1\cup T_2$，所以
+\[
+f(T)=f(T_1)\cup f(T_2),\qquad f(T_1)\cap f(T_2)=f(s);
+\]
+第二式：若 $Z\in f(T_1)\cap f(T_2)$，则 $Z=f(P)=f(Q)$，$P\in T_1,Q\in T_2$，由 (1) 得 $P=Q\in s$。两个内部不相交的闭矩形之并仍是矩形 $f(T)$，只可能\emph{沿一条公共边}贴合（若只交于一点、或沿错开的部分边，并集的边界会出现凹角，不是矩形）。于是：
+\begin{quote}
+$(*)$ $f(s)$ 是矩形 $f(T_1)$ 与 $f(T_2)$ 的一条公共边；特别地 $f(s)$ 是一条线段，平行于 $f(T)$ 的一组边，且把 $f(T)$ 分成两个矩形 $f(T_1),f(T_2)$。
+\end{quote}
+换言之：\textbf{平行于边的直线对矩形的切割，被 $f$ 变成对像矩形的平行切割；切割线段的像是像矩形的完整边}。下文一切推理都从 $(*)$ 出发。
+
+\section{矩形内部的网格结构与乘积形式}
+以下取定一个大矩形 $R$（第 3 节再让它扩大覆盖平面）。称 $\int(R)$ 内水平（竖直）直线与 $R$ 的交为 $R$ 的水平（竖直）\textbf{弦}。若一条弦同时是某个内接矩形 $T\subset R$ 沿切割方向的一刀，则由 $(*)$，其像既像 $f(T)$ 的完整边，又（对 $T$ 在 $R$ 中的切割反复使用 $(*)$）平行于 $f(R)$ 的边。
+
+\begin{lemma}[弦的像与方向类]\label{lem:chord}
+\begin{enumerate}[label=(\roman*)]
+  \item 每条水平（竖直）弦的像都是 $f(R)$ 的一条完整弦，方向平行于 $f(R)$ 的一组对边；
+  \item 所有水平弦的像同向，所有竖直弦的像同向，且这两个方向互相垂直（是 $f(R)$ 的两组不同边方向）。
+\end{enumerate}
+\end{lemma}
+\begin{proof}
+(i) 设 $c$ 是水平弦。取两条水平线夹住 $c$，使 $c$ 恰为带形矩形 $T\subset R$ 的水平中位线。$T$ 由 $R$ 经两条平行于边的直线切出，由 $(*)$，$f(T)$ 是 $f(R)$ 内两条平行弦之间的"带"，边方向即 $f(R)$ 的边方向。再对 $T$ 沿 $c$ 用 $(*)$：$f(c)$ 是 $f(T)$ 的一条边，且是横贯 $f(T)$ 的完整弦，故平行于 $f(R)$ 的一组边。
+
+(ii) 任取两条水平弦 $c\parallel c'$，各为带形矩形 $T,T'$ 的中位线；取同时包含 $T,T'$ 的更宽带形 $V\subset R$（由两条水平线切出）。$f(T),f(T')$ 均是 $f(V)$ 内由平行切割得到的子带，其切割方向一致（都是 $f(V)$ 的一组边方向），故 $f(c)\parallel f(c')$。竖直弦同理。
+
+设 $R$ 的水平、竖直中位线为 $m,n$，交于中心 $o$。若 $f(m)\parallel f(n)$，因两者共点 $f(o)$ 便共线。$m,n$ 把 $R$ 分成四个小矩形 $S_1,S_2,S_3,S_4$（$S_1,S_2$ 左右排列，分界线为 $m$）。$(*)$ 给出 $f(S_1),f(S_2)$ 沿公共边 $f(m)$ 拼成 $f(R)$ 的一半……严格地说 $f(m)$ 是 $f(S_1)$ 与 $f(S_2)$ 的公共边，$f(R)=f(S_1\cup S_2)\cup f(S_3\cup S_4)$。若 $f(m),f(n)$ 共线 $L$：$f(S_3)$ 有正面积（观察 1），其点分布在直线 $L$ 的某一侧或跨 $L$；但 $f(S_3)\subset f(S_3\cup S_4)$，而 $f(S_3\cup S_4)$ 与 $f(S_1),f(S_2)$ 的内部都不相交（由 (1)：原像内部不相交）。同时 $f(R)=f(S_1)\cup f(S_2)$ 已整条铺满 $L$ 两侧：$f(S_3\cup S_4)$ 位于其内，$f(S_3)$ 的每个点必落入 $f(S_1)$ 或 $f(S_2)$；$f(S_3)$ 有内点，而 $f(S_3)$ 是矩形，内点非 $L$ 上的点即落在某侧内部——与 $f(S_1)$ 或 $f(S_2)$ 内部相交，违背 (1)。故 $f(m)$ 与 $f(n)$ 方向不同；二者都平行于 $f(R)$ 的边，不同向即垂直。
+\end{proof}
+
+\begin{lemma}[乘积形式]\label{lem:prod}
+（适当选取坐标，可能交换两个坐标）存在严格单调函数 $\phi_1,\phi_2$，使得在 $\int(R)$ 上
+\[
+f(x,y)=\bigl(\phi_1(x),\ \phi_2(y)\bigr),
+\]
+且任一水平（竖直）线段之像为水平（竖直）线段，像的长度只依赖于原线段的长度（与位置无关）。
+\end{lemma}
+\begin{proof}
+任取 $P=(x,y)\in\int(R)$，$P$ 是过它的水平弦 $c$ 与竖直弦 $d$ 的唯一交点。由引理 \ref{lem:chord}，$f(c),f(d)$ 是 $f(R)$ 内两个不同方向的完整弦，恰交于一点，而 $f(P)$ 同属二者，故
+\[
+f(P)=f(c)\cap f(d).\tag{1}
+\]
+把 $f(R)$ 经刚体运动调整为边平行于坐标轴。水平弦 $c$ 的像所在直线是水平线，记其纵坐标为 $\phi_2(y)$；由 (1)，$\pi_2\bigl(f(x,y)\bigr)=\phi_2(y)$ 只依赖 $y$。同理 $\pi_1\bigl(f(x,y)\bigr)=\phi_1(x)$ 只依赖 $x$（若水平、竖直方向类在像中互换，交换坐标记号即回到同一形式）。
+
+$\phi_1$ 严格单调：设 $x<x'$。以这两条竖直线为边界的竖直带 $B\subset R$ 由两次竖直切割切出，由 $(*)$，$f(B)$ 是 $f(R)$ 内两平行（竖直方向类）弦之间的带，其两边界正是这两条竖直弦的像；带正宽度，故 $\phi_1(x)\neq\phi_1(x')$；对介于中间的带再用同一论证得保序性。$\phi_2$ 同理。
+
+线段像长：设 $[x_1,x_2]\times\{y\}\subset\int(R)$。它是水平弦 $c_y$ 内被两条竖直弦截出的部分，其像为 $f(c_y)$ 内位于两条竖直像弦之间的一段，即 $\{\phi_2(y)\}\times[\phi_1(x_1),\phi_1(x_2)]$，长 $\phi_1(x_2)-\phi_1(x_1)$。竖直线段同理。
+\end{proof}
+
+\begin{lemma}[增量函数]\label{lem:Delta}
+令 $\Delta(h):=\phi_1(x+h)-\phi_1(x)$（$h>0$，$[x,x+h]$ 落在 $R$ 内；引理 \ref{lem:prod} 保证与 $x,y$ 无关）。则 $\Delta$ 是"长 $h$ 的水平线段的像长"，满足
+\[
+\Delta(s+t)=\Delta(s)+\Delta(t),
+\]
+且严格单调，故 $\Delta(h)=\alpha h$（$\alpha>0$），从而 $\phi_1(x)=\alpha x+c_1$；同理 $\phi_2(y)=\beta y+c_2$（$\beta>0$）。
+\end{lemma}
+\begin{proof}
+可加性：在同一水平弦上取 $[x,x+s+t]$，以 $x+s$ 处的竖直弦一刀切开，其像恰把像线段分成相接的两段（$(*)$：切开处像为公共端点；不重叠否则内部相交违背单射），像长相加即 $\Delta(s+t)=\Delta(s)+\Delta(t)$。
+
+单调：$h_1<h_2$ 时同弦上线段 $[x,x+h_1]\subsetneq[x,x+h_2]$，由观察 1 像真包含，故 $\Delta(h_1)<\Delta(h_2)$。
+
+单调解 Cauchy 方程得 $\Delta(h)=\alpha h$，$\alpha=\Delta(1)>0$。于是对一切使 $[x,x+h]\subset\int(R)$ 的 $h$：$\phi_1(x+h)-\phi_1(x)=\alpha h$。固定 $x_0$，对任意 $x$ 反复（或按比例）使用即得 $\phi_1(x)=\phi_1(x_0)+\alpha(x-x_0)=:\alpha x+c_1$。$\phi_2$ 同理。
+\end{proof}
+
+\section{$f$ 是仿射映射}
+\begin{satz}[结构定理]\label{satz:aff}
+存在实数 $\alpha,\beta\neq0$、$c_1,c_2$ 与 $\varepsilon\in\{0,1\}$，使在全平面
+\[
+f(x,y)=\begin{cases}(\alpha x+c_1,\ \beta y+c_2),&\varepsilon=0,\\[2pt]
+(\alpha y+c_1,\ \beta x+c_2),&\varepsilon=1,\end{cases}
+\]
+即 $f$ 是仿射映射，线性部分可逆。
+\end{satz}
+\begin{proof}
+引理 \ref{lem:Delta} 在取定的 $R$ 的内部给出该形式。令 $R$ 取遍一列递扩的同心正方形覆盖平面：任一 $R_n$ 内部都按引理 \ref{lem:Delta} 有参数 $(\alpha_n,\beta_n,c_n,\varepsilon_n)$。相邻 $R_n$ 之交含开正方形，在其上两种表达式同为 $f$，故 $\alpha_n,\beta_n$ 相同且 $\varepsilon_n$ 相同（开集上相等的仿射式系数必相同；$\varepsilon$ 由引理 \ref{lem:chord}(ii) 的方向类论证在连通区域内一致）。于是全平面同一个仿射映射；线性部分 $\operatorname{diag}(\alpha,\beta)$（或副对角形式）可逆。
+\end{proof}
+
+\begin{bem}
+至此只用到"轴平行矩形"的像为矩形。若题设只对轴平行矩形成立，$f(x,y)=(2x,y)$ 便满足 (1)(2) 却把正方形映成长方形——所以\textbf{斜放的矩形}（尤其斜正方形）是本题真正的约束来源，见下节。
+\end{bem}
+
+\section{斜正方形的检验：$\alpha^2=\beta^2$，$f$ 为相似变换}
+\begin{satz}\label{sat:sim}
+必有 $\alpha^{2}=\beta^{2}$。于是
+\[
+f(X)=\alpha_0\,U X+b,\qquad \alpha_0>0,\ U\ \text{为正交矩阵},
+\]
+$f$ 是相似变换。
+\end{satz}
+\begin{proof}
+取"菱形"正方形 $D=\{(x,y):|x|+|y|\le1\}$，顶点 $(\pm1,0),(0,\pm1)$，边与坐标轴成 $45^\circ$。$D$ 是题设意义下的（斜放）矩形，故 $f(D)$ 必是矩形。由定理 \ref{satz:aff}，$f$ 仿射；仿射映射把平行四边形映为平行四边形，$f(D)$ 是以
+\[
+u=f(1,0)-f(0,1),\qquad v=f(1,0)-f(0,-1)
+\]
+为相邻两边的平行四边形。取 $\varepsilon=0$ 的写法：$u=(\alpha,-\beta)$，$v=(\alpha,\beta)$（$\varepsilon=1$ 情形只是 $\alpha,\beta$ 位置互换，论证相同）。平行四边形为矩形 $\iff$ 邻边垂直：
+\[
+u\cdot v=\alpha^{2}-\beta^{2}=0 .
+\]
+故 $\alpha^2=\beta^2$，记 $|\alpha|=|\beta|=:\alpha_0>0$。此时线性部分为 $\alpha_0 U$，其中 $U$ 为对角或副对角、每行每列恰含一个 $\pm1$ 的符号矩阵，故 $U$ 正交：$f$ 是"正交变换 + 伸缩 $\alpha_0$ + 平移"，即相似变换。
+\end{proof}
+
+\begin{kor}[问题 (a)]\label{kor:a}
+$f$ 把每个正方形映成正方形。\textbf{答：是。}
+\end{kor}
+\begin{proof}
+相似变换保角并把一切线段放大同一比例 $\alpha_0$：正方形的像仍是四边等长、邻边垂直的平行四边形，即正方形。
+\end{proof}
+
+\begin{kor}[问题 (b)]\label{kor:b}
+$f$ 是满射：平面的每个点都是某点的像。\textbf{答：是。}
+\end{kor}
+\begin{proof}
+线性部分 $\alpha_0 U$ 可逆：对任意目标点 $Y$，取 $X=\alpha_0^{-1}U^{-1}(Y-b)$，则 $f(X)=Y$。
+\end{proof}
+
+\section{结论}
+\begin{enumerate}
+  \item \textbf{(a) 是}——每个正方形必被 $f$ 映成正方形（推论 \ref{kor:a}）；
+  \item \textbf{(b) 是}——$f$ 必为满射（推论 \ref{kor:b}）。
+\end{enumerate}
+完整的刻画：满足 (1)(2) 的映射恰为相似变换 $X\mapsto\alpha UX+b$（$\alpha>0$，$U$ 正交）；反之相似变换显然满足 (1)(2)，故这一刻画是准确的。
+
+\bigskip
+\begin{center}
+\begin{tikzpicture}[scale=1.15]
+\filldraw[draw=black,fill=blue!8] (-3.2,0) -- (-2.2,1) -- (-1.2,0) -- (-2.2,-1) -- cycle;
+\node at (-2.2,1.45) {\small 原像中的斜正方形 $D$};
+\filldraw[draw=black,fill=red!8] (1.0,-0.8) rectangle (3.6,0.8);
+\node at (2.3,1.2) {\small $f(D)$ 必须是矩形 $\Rightarrow\alpha^2=\beta^2$};
+\draw[->,thick] (-0.6,0) -- node[above]{\footnotesize $f$} (0.6,0);
+\end{tikzpicture}
+\end{center}
+
+\end{document}

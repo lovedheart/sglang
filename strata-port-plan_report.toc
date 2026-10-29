@@ -1,0 +1,10 @@
+\contentsline {section}{\numberline {1}移植总览}{2}{section.1}%
+\contentsline {subsection}{\numberline {1.1}四机制与 Lsglang 现状差距}{2}{subsection.1.1}%
+\contentsline {subsection}{\numberline {1.2}一个决定移植成本的发现}{2}{subsection.1.2}%
+\contentsline {section}{\numberline {2}四机制：Strata 实现与移植落点}{2}{section.2}%
+\contentsline {subsection}{\numberline {2.1}M1：在线计时替代静态阈值}{2}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}M2：显存热专家槽位缓存}{3}{subsection.2.2}%
+\contentsline {subsection}{\numberline {2.3}M3：Prefill 层间专家预取双缓冲}{3}{subsection.2.3}%
+\contentsline {subsection}{\numberline {2.4}M4：decode 三路流水}{4}{subsection.2.4}%
+\contentsline {section}{\numberline {3}风险清单（全部经源码核实）}{4}{section.3}%
+\contentsline {section}{\numberline {4}分阶段实施与验收}{6}{section.4}%

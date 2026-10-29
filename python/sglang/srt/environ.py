@@ -310,10 +310,35 @@ class Envs:
         False, deprecated_name="SGLANG_QWEN_DSA_USE_FP8_INDEXER"
     )
     SGLANG_QSA_USE_FP4_INDEXER = EnvBool(False)
+    # Fuse the QSA FP4 decode gather (row index_selects + whole-row dequant
+    # materialization + packed-scratch repack) into one Triton kernel that reads
+    # the packed pool directly; 0 keeps the multi-kernel legacy path.
+    SGLANG_QSA_FUSED_FP4_GATHER = EnvBool(True)
+    # Build the QSA chunk-prefill context with one vectorized slot gather and
+    # hand it to the kernel directly; 0 restores the per-sequence slice/cat
+    # loop (a gather plus a full-context copy per sequence, plus two host
+    # synchronizations per layer).
+    SGLANG_QSA_VECTOR_PREFILL_GATHER = EnvBool(True)
     # Sort the QSA top-k block selection into a deterministic order (the CUDA
     # top-k kernels emit slots in atomic order; sparse attention merges in
     # list order, making logits run-dependent).  0 keeps the raw order.
     SGLANG_QSA_SORT_TOPK = EnvBool(True)
+    # Feed the QSA sparse-attention paged decode kernel fp8 scratch instead of
+    # widening KV to the query dtype first.  On an fp8_e4m3 pool the cast to
+    # bf16 is exact (scale 1.0), so this only switches the kernel to its
+    # bf16-q/fp8-KV path (trtllm-gen transform / xqa fp8) and halves the
+    # scratch traffic.  On an NVFP4 pool (fused gather only) the gather
+    # requantizes the dequantized rows to e4m3 -- an extra rounding on top of
+    # the FP4 storage, so it is opt-in.  Unset keeps the bf16 KV path
+    # everywhere.  See SGLANG_QSA_ATTN_FP4 for the lossless native FP4 path.
+    SGLANG_QSA_ATTN_FP8 = EnvBool(False)
+    # Take the native FP4-KV path in the QSA sparse-decode kernel on an NVFP4
+    # pool (fused gather only): packed nibbles + scale factors are copied
+    # through and dequantized in registers, bitwise-equal to the bf16 scratch
+    # for pow-of-two group scales (<=0.7% otherwise).  Requires an SM12x GPU
+    # (xqa); elsewhere FP4 alone stays on the bf16 path, while FP8 alone still
+    # selects the e4m3-requant scratch.  SGLANG_QSA_ATTN_FP8 also implies it.
+    SGLANG_QSA_ATTN_FP4 = EnvBool(False)
     # Route decode-size HC mix through the persistent Triton kernel; 0 falls
     # back to the plain-torch mix without full deterministic inference.
     SGLANG_HC_MIX_TRITON = EnvBool(True)
