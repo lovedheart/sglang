@@ -53,6 +53,14 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Give the NEXTN/EAGLE draft runner its own NVFP4 W4A16 copy of the LM head (SM120 only, ignored elsewhere), cutting draft-step head traffic ~2x. Draft logits feed proposals only; greedy target verification keeps outputs unchanged.",
     ] = False
+    enable_fp8_shared_expert: A[
+        bool,
+        "Store the main model's shared-expert gate_up/down weights in FP8 e4m3 with 128x128 block scales at load time (SM120 only, ignored elsewhere), routing the skinny decode-time projections off cuBLAS wmma onto the sm120 fp8 path. The MTP draft shared expert stays BF16 unless --enable-fp8-shared-expert-mtp.",
+    ] = False
+    enable_fp8_shared_expert_mtp: A[
+        bool,
+        "Also quantize the NEXTN MTP draft layer's shared expert to FP8 b128. Draft-path error feeds proposal accept-length directly, so it is a separate opt-in; has no effect unless --enable-fp8-shared-expert is also set.",
+    ] = False
     enable_tf32_matmul: A[
         Optional[bool],
         Arg(

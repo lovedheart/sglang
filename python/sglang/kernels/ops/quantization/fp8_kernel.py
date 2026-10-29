@@ -574,7 +574,10 @@ def sglang_per_token_group_quant_fp8_row_padded(
     ``row_alignment`` makes the wrapper's pad_tensor() short-circuit (pad_rows
     == 0), removing 2x fill + 2x cat kernels per GEMM. Rows in [m, m_pad) are
     zero-filled to match the legacy pad_tensor contract so the padded GEMM is
-    bit-exact; the caller still slices the GEMM output back to m.
+    bit-exact; the caller still slices the GEMM output back to m. On CUDA the
+    tail zeros are written by the quant kernel itself in the same launch (the
+    outputs are passed whole and the input's row count selects the padded
+    path), so no separate zero_() fills are issued.
     """
     assert x.dim() == 2, "row-padded quant expects a 2D input"
     assert x.shape[-1] % group_size == 0, (
@@ -602,10 +605,15 @@ def sglang_per_token_group_quant_fp8_row_padded(
         (k // group_size, m_pad), device=x.device, dtype=torch.float32
     ).transpose(0, 1)
     if m > 0:
+        # On CUDA the outputs go in whole: the JIT kernel sees output rows >
+        # input rows, quantizes the real rows, and writes exact zeros to the
+        # tail in the same launch. Other backends get the sliced views plus
+        # the explicit tail fills below.
+        fused_tail = not _is_musa
         _run_per_token_group_quant_8bit_kernel(
             x,
-            x_q[:m],
-            x_s[:m],
+            x_q if fused_tail else x_q[:m],
+            x_s if fused_tail else x_s[:m],
             group_size,
             eps,
             fp8_min,
@@ -614,9 +622,10 @@ def sglang_per_token_group_quant_fp8_row_padded(
             fuse_silu_and_mul=False,
             masked_m=None,
         )
-    if m_pad != m:
-        # Tail rows feed the cutlass GEMM's padded region; zero them so the padded
-        # GEMM stays bit-exact with the legacy pad_tensor path (torch.empty is garbage).
+    if m_pad != m and _is_musa:
+        # Tail rows feed the cutlass GEMM's padded region and must be exact
+        # zeros (torch.empty is garbage). The CUDA fold kernel above already
+        # wrote them; only the MUSA fallback still fills explicitly.
         x_q[m:].zero_()
         x_s[m:].zero_()
     return x_q, x_s

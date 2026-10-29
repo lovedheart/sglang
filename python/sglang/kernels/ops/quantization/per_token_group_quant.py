@@ -68,12 +68,17 @@ def _jit_module(
     assert not (masked_layout and sorted_layout)
     layout = "masked" if masked_layout else ("sorted" if sorted_layout else "flat")
     launcher = f"PerTokenGroupQuant{layout.capitalize()}Kernel"
+    wrappers = [("per_token_group_quant", f"{launcher}<{trait_args}>::run")]
+    if layout == "flat":
+        # Extra entry on the same instantiation: quantize a shorter input into
+        # a row-padded output, zeroing the tail rows in the same launch.
+        wrappers.append(("per_token_group_quant_padded", f"{launcher}<{trait_args}>::run_padded"))
     return load_jit(
         "per_token_group_quant",
         *trait_args,
         layout,
         cuda_files=["gemm/per_token_group_quant.cuh"],
-        cuda_wrappers=[("per_token_group_quant", f"{launcher}<{trait_args}>::run")],
+        cuda_wrappers=wrappers,
         extra_cuda_cflags=get_activation_cuda_cflags()
         if dense
         else ["--use_fast_math"],
@@ -148,7 +153,17 @@ def _per_token_group_quant_custom_op(
             num_valid_tokens,
         )
     else:
-        module.per_token_group_quant(input, output_q, output_s)
+        if output_q.shape[0] != input.shape[-2]:
+            # Row-padded flat call (see sglang_per_token_group_quant_fp8_row_
+            # padded): the outputs have more rows than the input; the kernel
+            # quantizes the real rows and writes exact zeros to the tail in
+            # one launch. The legacy run() would reject the shape mismatch.
+            assert not fuse_silu_and_mul, "padded rows are only supported for plain quantization"
+            module.per_token_group_quant_padded(
+                input, output_q, output_s, int(input.shape[-2])
+            )
+        else:
+            module.per_token_group_quant(input, output_q, output_s)
 
 
 def _allocate_outputs(
