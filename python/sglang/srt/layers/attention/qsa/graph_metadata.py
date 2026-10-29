@@ -117,12 +117,14 @@ def _qsa_graph_row_metadata_kernel(
     else:
         seq_len = tl.load(row_seq_lens_ptr + row).to(tl.int32)
         req = tl.load(row_req_pool_ptr + row).to(tl.int64)
+    # Defined for every row (the page-table gather below bounds itself by it),
+    # not just the rows whose metadata this program also writes.
+    compressed = seq_len // RATIO
     token_row = req * req_to_token_row_stride
     if tl.program_id(1) == 0:
         current = tl.maximum(seq_len - 1, 0)
         last_loc = tl.load(req_to_token_ptr + token_row + current).to(tl.int32)
 
-        compressed = seq_len // RATIO
         tl.store(compressed_lens_ptr + row, compressed)
 
         # The page-aligned allocator keeps each compression group inside one page,
@@ -256,7 +258,9 @@ def _qsa_draft_graph_metadata_kernel(
     num_padding,
     MAX_PAGES: tl.constexpr,
     RATIO: tl.constexpr,
+    STRIDE: tl.constexpr,
     FULL_PAGE: tl.constexpr,
+    COMPRESSED_PAGE: tl.constexpr,
 ):
     for step in tl.static_range(len(buffers)):
         if tl.program_id(2) == step:
@@ -274,7 +278,9 @@ def _qsa_draft_graph_metadata_kernel(
                 row_stride,
                 MAX_PAGES,
                 RATIO,
+                STRIDE,
                 FULL_PAGE,
+                COMPRESSED_PAGE,
                 128,
                 seq_lens,
                 req_pool,
@@ -309,11 +315,20 @@ def prepare_draft_graph_metadata(metadata, req_to_token, pool):
         metadata[0].indexer_metadata.graph_compressed_page_table.shape[1],
         pool.qsa_compress_ratio,
         pool.qsa_compressed_page_size * pool.qsa_compress_ratio,
+        pool.qsa_compressed_page_size,
     )
 
 
 def launch_draft_graph_metadata(args, seq_lens, req_pool_indices, bs, num_padding):
-    buffers, req_to_token, row_stride, max_pages, ratio, full_page = args
+    (
+        buffers,
+        req_to_token,
+        row_stride,
+        max_pages,
+        ratio,
+        full_page,
+        compressed_page,
+    ) = args
     if bs == 0:
         return
     _qsa_draft_graph_metadata_kernel[(bs, triton.cdiv(max_pages, 128), len(buffers))](
@@ -326,6 +341,8 @@ def launch_draft_graph_metadata(args, seq_lens, req_pool_indices, bs, num_paddin
         max(0, min(int(num_padding or 0), bs)),
         max_pages,
         ratio,
+        qsa_ring_stride(ratio),
         full_page,
+        compressed_page,
         num_warps=1,
     )
