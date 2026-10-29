@@ -41,6 +41,8 @@ def _jit_hc_combine_module(
         cuda_wrappers=[
             ("hc_combine", f"HcCombineKernel<{args}>::run"),
             ("hc_combine_split", f"HcCombineSplitKernel<{args}>::run"),
+            ("hc_combine_fold", f"HcCombineKernel<{args}>::run_fold"),
+            ("hc_combine_split_fold", f"HcCombineSplitKernel<{args}>::run_fold"),
         ],
     )
 
@@ -132,4 +134,54 @@ def hc_combine_split(
     partials = _get_partials(hc_count, r.device, rows)[:rows]
     module = _jit_hc_combine_module(hc_count, hidden_size, residual.dtype)
     module.hc_combine_split(y, r, n, inject_weight, out, partials)
+    return out.reshape(residual.shape)
+
+
+def hc_combine_fold(
+    block_output: torch.Tensor,
+    residual: torch.Tensor,
+    norm_g: torch.Tensor,
+    inject_weight_fold: torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Norm-folded hc_combine: inject reads raw `residual` scaled by `norm_g`.
+
+    Mirrors the mix-side folding in ``GatedResidual``; `inject_weight_fold`
+    must already carry the (1 + norm_weight) factor.
+    """
+    y = block_output.reshape(-1, hidden_size)
+    r = residual.reshape(-1, hc_count * hidden_size)
+    g = norm_g.reshape(-1, hc_count)
+    if out is None:
+        out = torch.empty_like(r)
+    else:
+        out = out.reshape(-1, hc_count * hidden_size)
+
+    module = _jit_hc_combine_module(hc_count, hidden_size, residual.dtype)
+    module.hc_combine_fold(y, r, g, inject_weight_fold, out)
+    return out.reshape(residual.shape)
+
+
+def hc_combine_split_fold(
+    block_output: torch.Tensor,
+    residual: torch.Tensor,
+    norm_g: torch.Tensor,
+    inject_weight_fold: torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    y = block_output.reshape(-1, hidden_size)
+    r = residual.reshape(-1, hc_count * hidden_size)
+    g = norm_g.reshape(-1, hc_count)
+    if out is None:
+        out = torch.empty_like(r)
+    else:
+        out = out.reshape(-1, hc_count * hidden_size)
+    rows = r.shape[0]
+    partials = _get_partials(hc_count, r.device, rows)[:rows]
+    module = _jit_hc_combine_module(hc_count, hidden_size, residual.dtype)
+    module.hc_combine_split_fold(y, r, g, inject_weight_fold, out, partials)
     return out.reshape(residual.shape)
