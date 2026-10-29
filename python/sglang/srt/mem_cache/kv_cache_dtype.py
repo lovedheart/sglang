@@ -122,6 +122,27 @@ def configure_kv_cache_dtype(
         # "auto" is the tag for an unquantized pool; backends gate descale on it.
         kv_cache_dtype_str = "auto"
 
+    # FP4 packed KV needs gather-dequant or native-FP4 attention wiring that
+    # draft backends (NEXTN/EAGLE MTP included) do not carry, and the draft
+    # pool is a sliver of the target's: an FP4 target cache must not drag the
+    # draft pool into FP4. An explicit draft dtype still wins.
+    _fp4_kv_storage = getattr(torch, "float4_e2m1fn_x2", None)
+    if (
+        is_draft_worker
+        and speculative_draft_kv_cache_dtype is None
+        and _fp4_kv_storage is not None
+        and kv_cache_dtype == _fp4_kv_storage
+    ):
+        logger.info(
+            "Speculative draft: overriding KV cache dtype %s -> %s "
+            "(FP4 draft KV is not supported; the draft pool stays at the "
+            "model dtype under an FP4 target cache).",
+            kv_cache_dtype,
+            model_dtype,
+        )
+        kv_cache_dtype = model_dtype
+        kv_cache_dtype_str = "auto"
+
     # INT8 only exists as the packed DSA record. A draft with any other layout
     # would cast its K/V to INT8 without scales, so it gets its own
     # compute-dtype KV.
