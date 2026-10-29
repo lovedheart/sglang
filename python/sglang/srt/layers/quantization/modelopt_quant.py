@@ -801,6 +801,11 @@ class ModelOptNvFp4EmbeddingMethod(QuantizeMethodBase):
 # Qwen3.8-Flash-Next checkpoints label the same tensor layout (fp8 weight +
 # per-block ``weight_scale_inv``) ``FP8_BLOCK_SCALES``; keep it as an alias.
 _BLOCK_FP8_ALGOS = ("FP8_PB_WO", "FP8_BLOCK_SCALES")
+# Same block-FP8 tensor layout, but the weight bytes are fp8_e3m4 codes
+# (bias 3, max 30, scale = amax/30). Decodes only through the sm120 e3m4
+# kernels; if they are unavailable the run fails loudly instead of misreading
+# the weights as e4m3.
+E3M4_BLOCK_FP8_ALGO = "FP8_PB_WO_E3M4"
 
 
 class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
@@ -908,7 +913,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         block_sizes = {
             int(layer_info.get("group_size", 128))
             for layer_info in quantized_layers.values()
-            if layer_info.get("quant_algo", "").upper() in _BLOCK_FP8_ALGOS
+            if layer_info.get("quant_algo", "").upper()
+            in (*_BLOCK_FP8_ALGOS, E3M4_BLOCK_FP8_ALGO)
         }
         if len(block_sizes) > 1:
             raise ValueError(
@@ -916,6 +922,51 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 f"use one group_size, got {sorted(block_sizes)}."
             )
         block_size = next(iter(block_sizes), 128)
+        n_e3m4 = 0
+        n_block = 0
+        for layer_info in quantized_layers.values():
+            algo = layer_info.get("quant_algo", "").upper()
+            if algo == E3M4_BLOCK_FP8_ALGO:
+                n_e3m4 += 1
+                n_block += 1
+            elif algo in _BLOCK_FP8_ALGOS:
+                n_block += 1
+        if n_e3m4 and n_block > n_e3m4:
+            raise ValueError(
+                "MIXED_PRECISION checkpoint mixes e4m3 and e3m4 block-FP8 "
+                "layers; the single block-FP8 config cannot serve both."
+            )
+        # SGLANG_USE_E3M4_KERNELS is the legacy escape hatch for e3m4 builds
+        # that predate the FP8_PB_WO_E3M4 algo. Declaring it here, at config
+        # level, keeps it from overriding the per-tensor e4m3_only tag that
+        # online-quantized weights (lm_head, shared expert) carry: those are not
+        # part of this block-FP8 group.
+        legacy_e3m4 = bool(
+            not n_e3m4 and n_block and envs.SGLANG_USE_E3M4_KERNELS.get()
+        )
+        block_weight_dtype = "e3m4" if (n_e3m4 or legacy_e3m4) else "e4m3"
+        if n_e3m4:
+            logger.info(
+                "*** FP8_E3M4 checkpoint: %d block-FP8 layers declare %s "
+                "(block %dx%d, weight bytes = e3m4 codes, scale = amax/30); "
+                "their linears route to the sm120_fp8_e3m4 kernels. ***",
+                n_e3m4,
+                E3M4_BLOCK_FP8_ALGO,
+                block_size,
+                block_size,
+            )
+        elif legacy_e3m4:
+            logger.warning(
+                "*** SGLANG_USE_E3M4_KERNELS=1 declares this checkpoint's %d "
+                "block-FP8 layers (%dx%d blocks) as fp8_e3m4 codes, although "
+                "they label %s. Set it only for pre-%s builds: e4m3 bytes "
+                "decoded as e3m4 produce garbage output. ***",
+                n_block,
+                block_size,
+                block_size,
+                " / ".join(_BLOCK_FP8_ALGOS),
+                E3M4_BLOCK_FP8_ALGO,
+            )
 
         packed_modules_mapping = config.get("packed_modules_mapping")
         fp8_config = ModelOptFp8Config(
@@ -934,11 +985,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         # Block-FP8 (FP8_PB_WO / FP8_BLOCK_SCALES): fp8 weight with a per-block
         # weight_scale_inv; the block size comes from the checkpoint's
         # group_size (128 by default). One config serves Linear and FusedMoE.
+        # FP8_PB_WO_E3M4 declares the same layout with e3m4 weight codes.
         fp8_block_config = Fp8Config(
             is_checkpoint_fp8_serialized=True,
             activation_scheme="dynamic",
             weight_block_size=[block_size, block_size],
             packed_modules_mapping=packed_modules_mapping,
+            weight_dtype=block_weight_dtype,
         )
         nvfp4_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,
@@ -1052,7 +1105,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
-            if quant_algo in _BLOCK_FP8_ALGOS:
+            if quant_algo in _BLOCK_FP8_ALGOS or quant_algo == E3M4_BLOCK_FP8_ALGO:
                 return Fp8LinearMethod(self.fp8_block_config)
             if quant_algo == "MXFP8":
                 return Fp8LinearMethod(self.mxfp8_config)
@@ -1085,6 +1138,12 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return Fp8MoEMethod(self.mxfp8_config)
             if quant_algo in _BLOCK_FP8_ALGOS:
                 return Fp8MoEMethod(self.fp8_block_config)
+            if quant_algo == E3M4_BLOCK_FP8_ALGO:
+                raise ValueError(
+                    f"{prefix}: {E3M4_BLOCK_FP8_ALGO} is only supported for "
+                    "block-FP8 Linear layers; the sm120 e3m4 kernels have no "
+                    "FusedMoE path."
+                )
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
