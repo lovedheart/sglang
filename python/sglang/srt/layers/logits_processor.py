@@ -49,6 +49,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.fp8_lm_head import fp8_blockwise_lm_head_apply
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
     LogprobStage,
@@ -1212,50 +1213,56 @@ class LogitsProcessor(nn.Module):
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
-            if out is not None and out.shape != (
-                hidden_states.shape[0],
-                lm_head.weight.shape[0],
-            ):
-                out = None
-            use_mm_out_dtype = (
-                hidden_states.is_cuda
-                and hidden_states.dtype == lm_head.weight.dtype
-                and hidden_states.dtype in (torch.float16, torch.bfloat16)
-            )
-            # A shared FP32 buffer must not change the lm_head's output precision.
-            # Keep the same rounding as the unbuffered path unless FP32 is enabled.
-            if use_mm_out_dtype and (
-                self.use_fp32_lm_head or self.use_fp32_lm_head_output
-            ):
-                logits = torch.mm(
-                    hidden_states,
-                    lm_head.weight.T,
-                    out_dtype=torch.float32,
-                    out=out,
-                )
-            elif self.use_fp32_lm_head:
-                logits = torch.matmul(
-                    hidden_states.to(torch.float32),
-                    lm_head.weight.to(torch.float32).T,
-                )
-            elif use_intel_amx_backend(lm_head):
-                logits = torch.ops.sgl_kernel.weight_packed_linear(
-                    hidden_states.to(lm_head.weight.dtype),
-                    lm_head.weight,
-                    None,  # bias
-                    True,  # is_vnni
-                )
-            elif self.rl_on_policy_target is not None:
-                # Due to tie-weight, we may not be able to change lm_head's weight dtype
-                logits = torch.matmul(
-                    hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
+            if lm_head.weight.dtype == torch.float8_e4m3fn:
+                # Load-time block-quantized head (--enable-fp8-lm-head, SM120)
+                logits = fp8_blockwise_lm_head_apply(
+                    lm_head, hidden_states, bias=embedding_bias
                 )
             elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                if out is not None and out.shape != (
+                    hidden_states.shape[0],
+                    lm_head.weight.shape[0],
+                ):
+                    out = None
+                use_mm_out_dtype = (
+                    hidden_states.is_cuda
+                    and hidden_states.dtype == lm_head.weight.dtype
+                    and hidden_states.dtype in (torch.float16, torch.bfloat16)
                 )
+                # A shared FP32 buffer must not change the lm_head's output precision.
+                # Keep the same rounding as the unbuffered path unless FP32 is enabled.
+                if use_mm_out_dtype and (
+                    self.use_fp32_lm_head or self.use_fp32_lm_head_output
+                ):
+                    logits = torch.mm(
+                        hidden_states,
+                        lm_head.weight.T,
+                        out_dtype=torch.float32,
+                        out=out,
+                    )
+                elif self.use_fp32_lm_head:
+                    logits = torch.matmul(
+                        hidden_states.to(torch.float32),
+                        lm_head.weight.to(torch.float32).T,
+                    )
+                elif use_intel_amx_backend(lm_head):
+                    logits = torch.ops.sgl_kernel.weight_packed_linear(
+                        hidden_states.to(lm_head.weight.dtype),
+                        lm_head.weight,
+                        None,  # bias
+                        True,  # is_vnni
+                    )
+                elif self.rl_on_policy_target is not None:
+                    # Due to tie-weight, we may not be able to change lm_head's weight dtype
+                    logits = torch.matmul(
+                        hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
+                    )
+                else:
+                    logits = torch.matmul(
+                        hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                    )
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
