@@ -11,7 +11,10 @@ from typing import Optional, Tuple
 import msgspec
 import torch
 
-from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
+from sglang.srt.layers.attention.qsa.kernel import (
+    gather_qsa_compressed_keys,
+    qsa_fast_topk,
+)
 
 
 def build_qsa_row_ranges(
@@ -147,26 +150,6 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         if isinstance(lengths, torch.Tensor):
             return int(lengths.max()) // self.compress_ratio
         return max(int(length) for length in lengths) // self.compress_ratio
-    def _packed_compressed_locs(
-        self, sequence_id: int, sequence_length: int
-    ) -> torch.Tensor:
-        """Compressed-slot rows of one sequence's complete blocks.
-
-        DSV4-style addressing: a group's compressed slot is its first raw
-        slot // ratio (the page-aligned allocator keeps the group contiguous
-        in one page), read straight off the request's token-slot row.
-        """
-
-        complete_blocks = int(sequence_length) // self.compress_ratio
-        if complete_blocks == 0:
-            return self.token_slot_table.new_empty((0,), dtype=torch.long)
-        return (
-            self.token_slot_table[
-                sequence_id,
-                : complete_blocks * self.compress_ratio : self.compress_ratio,
-            ].long()
-            // self.compress_ratio
-        )
 
     def get_prefill_mqa_inputs(
         self,
@@ -184,65 +167,19 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         ratio = self.compress_ratio
         compressed_buffer = pool.get_qsa_compressed_k_buffer(layer_id)
         sequence_lengths = self.sequence_lengths.to(torch.int32)
-        if self.compressed_capacity is None:
-            parts = []
-            sequence_lengths_list = self.prefill_sequence_lengths_cpu
-            if sequence_lengths_list is None:
-                sequence_lengths_list = sequence_lengths.tolist()
-            for sequence_id in range(len(sequence_lengths_list)):
-                compressed_locs = self._packed_compressed_locs(
-                    sequence_id, sequence_lengths_list[sequence_id]
-                )
-                if compressed_locs.numel() == 0:
-                    continue
-                parts.append(compressed_buffer.index_select(0, compressed_locs))
-            compressed_keys = (
-                torch.cat(parts, dim=0)
-                if parts
-                else compressed_buffer.new_empty(
-                    (0, pool.qsa_index_kv_heads, pool.qsa_index_head_dim)
-                )
-            )
-        else:
-            # Same rows, same order, one launch and no host round-trip:
-            # the packed compressed slots are enumerated by the cumulative
-            # complete-block offsets of the sequence rows.  ``repeat_interleave``
-            # cannot take an upper-bound output_size (it must equal the sum of
-            # the repeats), so the owning row of each packed entry comes from
-            # a search over the block-end prefix sums instead.
-            total_blocks = int(self.compressed_capacity)
-            if total_blocks:
-                device = sequence_lengths.device
-                complete_blocks = torch.div(
-                    sequence_lengths, ratio, rounding_mode="floor"
-                ).to(torch.int64)
-                block_ends = complete_blocks.cumsum(0)
-                # Host and device must agree on the packed length; assert on
-                # device so a stale host sum fails loudly without a sync.
-                torch._assert_async(block_ends[-1] == total_blocks)
-                entries = torch.arange(total_blocks, device=device, dtype=torch.int64)
-                # right=True puts an entry past the final block end on row
-                # ``num_rows``; clamping keeps such a lane (only reachable if
-                # the host count is stale, which the assert above reports)
-                # inside the table instead of gathering off its end.
-                sequence_ids = torch.searchsorted(
-                    block_ends, entries, right=True
-                ).clamp(max=sequence_lengths.numel() - 1)
-                block_offsets = (
-                    entries
-                    - (block_ends - complete_blocks).index_select(0, sequence_ids)
-                ) * ratio
-                # DSV4-style addressing: a group's compressed slot is its
-                # first raw slot // ratio (the page-aligned allocator keeps
-                # the group contiguous in one page).
-                compressed_locs = (
-                    self.token_slot_table[sequence_ids, block_offsets].long() // ratio
-                )
-                compressed_keys = compressed_buffer.index_select(0, compressed_locs)
-            else:
-                compressed_keys = compressed_buffer.new_empty(
-                    (0, pool.qsa_index_kv_heads, pool.qsa_index_head_dim)
-                )
+        sequence_lengths_list = self.prefill_sequence_lengths_cpu
+        if sequence_lengths_list is None:
+            sequence_lengths_list = sequence_lengths.tolist()
+        complete_blocks = [int(length) // ratio for length in sequence_lengths_list]
+        # DSV4-style addressing (a group's compressed slot is its first raw
+        # slot // ratio, page-aligned) is baked into the single-launch gather
+        # kernel.  ``compressed_capacity`` is the host-precomputed packed
+        # length, so the gather needs no device readback of its own.
+        total_blocks = (
+            int(self.compressed_capacity)
+            if self.compressed_capacity is not None
+            else sum(complete_blocks)
+        )
         if query_sequence_ids is None:
             query_sequence_ids = self.token_to_batch_idx
         num_valid_tokens = query_sequence_ids.numel()
@@ -252,11 +189,26 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
                 f"positions={positions.numel()}, mapping={num_valid_tokens}"
             )
         positions = positions[:num_valid_tokens]
-        row_starts, row_ends, _ = build_qsa_row_ranges(
+        row_starts, row_ends, compressed_cu_seqlens = build_qsa_row_ranges(
             sequence_lengths,
             positions.to(sequence_lengths.device),
             query_sequence_ids.to(sequence_lengths.device),
             self.compress_ratio,
+        )
+        if self.compressed_capacity is not None:
+            # Host and device must agree on the packed length; assert on
+            # device so a stale host count fails loudly without a sync.
+            torch._assert_async(
+                compressed_cu_seqlens[-1].to(torch.int64)
+                == int(self.compressed_capacity)
+            )
+        compressed_keys = gather_qsa_compressed_keys(
+            compressed_buffer,
+            self.token_slot_table,
+            compressed_cu_seqlens,
+            total_blocks,
+            max(complete_blocks, default=0),
+            ratio,
         )
         return compressed_keys, row_starts, row_ends, sequence_lengths
 

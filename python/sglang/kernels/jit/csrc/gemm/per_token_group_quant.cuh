@@ -206,6 +206,15 @@ struct MaskedQuantKernelParams {
   uint32_t masked_m_stride;  // 1 (int32) or 2 (int64)
 };
 
+// Flat schedule over a row-padded output: rows in [num_valid_tokens, num_tokens)
+// never read the (shorter) input; the kernel writes an all-zero fp8 row and zero
+// scales for them in the same launch, replacing the tail zero_() fills the
+// row_padded wrapper used to issue after quantizing the real rows.
+struct PaddedQuantKernelParams {
+  QuantKernelParams base;
+  uint32_t num_valid_tokens;  // <= base.num_tokens
+};
+
 struct SortedQuantKernelParams {
   QuantKernelParams base;
   // Sorted, block-padded MoE layout (moe_align_block_size output): a row at or
@@ -225,6 +234,29 @@ SGL_DEVICE const QuantKernelParams& base_params(const QuantKernelParams& params)
 
 SGL_DEVICE const QuantKernelParams& base_params(const SortedQuantKernelParams& params) {
   return params.base;
+}
+
+SGL_DEVICE const QuantKernelParams& base_params(const PaddedQuantKernelParams& params) {
+  return params.base;
+}
+
+// Tail-row writer for the row-padded flat schedule: fills one (token, group)
+// tile of the output with exact zeros (fp8 0x00 vector stores + scale 0.0),
+// mirroring the store addressing of QuantTrait::run without reading the
+// (shorter) input. Subwarp-uniform and duplicate-safe, like every store site.
+template <typename Trait>
+SGL_DEVICE void write_zero_group(
+    const QuantKernelParams& params,
+    const uint32_t token_idx,
+    const uint32_t group_idx,
+    const uint32_t lane_id) {
+  using namespace device;
+  using Q = typename Trait::QuantType;
+  using Q2 = typename detail::WeightTrait<Q>::packed2_t;
+  AlignedVector<Q2, Trait::kVecSize / 2> out;
+  out.fill(Q2{});
+  out.store(params.output.get<Q>(0, token_idx) + group_idx * Trait::kGroupSize, lane_id);
+  params.scale.store<Trait::kUe8m0, Trait::kRowMajor, Trait::kAligned>(0, token_idx, group_idx, detail::scale_t<Trait::kUe8m0>{});
 }
 
 }  // namespace detail
@@ -433,10 +465,15 @@ struct QuantTrait {
 // ---------------------------------------------------------------------------
 // Flat schedule: one subwarp (kNumLanes) per group over a linear grid. With
 // kSortedRows, rows are in the sorted MoE layout and padding rows are skipped.
+// With kPadRows, num_tokens counts the padded output rows while the input has
+// only num_valid_tokens; tail rows are written as zeros instead of read.
 // ---------------------------------------------------------------------------
-template <typename Trait, bool kUsePDL, bool kSortedRows = false>
+template <typename Trait, bool kUsePDL, bool kSortedRows = false, bool kPadRows = false>
 __global__ __launch_bounds__(Trait::kBlockSize) void per_token_group_quant_flat_kernel(
-    const __grid_constant__ std::conditional_t<kSortedRows, SortedQuantKernelParams, QuantKernelParams> kernel_params) {
+    const __grid_constant__ std::conditional_t<
+        kSortedRows,
+        SortedQuantKernelParams,
+        std::conditional_t<kPadRows, PaddedQuantKernelParams, QuantKernelParams>> kernel_params) {
   using namespace device;
   const QuantKernelParams& params = detail::base_params(kernel_params);
   constexpr uint32_t kNumLanes = Trait::kNumLanes;
@@ -453,7 +490,19 @@ __global__ __launch_bounds__(Trait::kBlockSize) void per_token_group_quant_flat_
   const auto token_idx = work_id / num_groups;
   const auto group_idx = work_id % num_groups;
   PDLWaitPrimary<kUsePDL>();
-  if constexpr (kSortedRows) {
+  if constexpr (kPadRows) {
+    // The grid covers the padded rows; the tail is a pure zero write and the
+    // real rows take the identical math of the plain flat path. A warp can
+    // straddle the boundary row (kWorkPerWarp rows per warp), so the branch
+    // may diverge -- the tail arm only stores zeros, never reads the input.
+    if (token_idx >= kernel_params.num_valid_tokens) {
+      detail::write_zero_group<Trait>(params, token_idx, group_idx, lane_id);
+    } else {
+      Trait::run(params, 0, token_idx, group_idx, lane_id);
+    }
+    PDLTriggerSecondary<kUsePDL>();
+    return;
+  } else if constexpr (kSortedRows) {
     // run() reduces across the whole warp, so only warps whose rows are all
     // padding exit; a mixed warp also quantizes its padding rows (never read).
     // The host checks sorted_token_ids covers every row, so both loads issue together.
@@ -510,7 +559,7 @@ struct QuantHostContext {
   DLDevice device;
 };
 
-template <typename Trait, bool kMasked>
+template <typename Trait, bool kMasked, bool kPadRows = false>
 QuantHostContext<Trait> build_quant_context( //
     const tvm::ffi::TensorView& input,
     const tvm::ffi::TensorView& output_q,
@@ -528,7 +577,16 @@ QuantHostContext<Trait> build_quant_context( //
   auto H = SymbolicSize{"hidden_size"};
   auto G = SymbolicSize{"num_scale_groups"};
 
-  if constexpr (kMasked) {
+  if constexpr (kPadRows) {
+    // Row-padded flat contract: N binds to the padded OUTPUT rows; the input
+    // has its own (smaller) row count, never indexed past by the kernel.
+    auto T_valid = SymbolicSize{"num_valid_tokens"};
+    TensorMatcher({T_valid, -1}).with_strides({-1, 1}).with_dtype<T>().with_device(device).verify(input);
+    TensorMatcher({N, H}).with_strides({-1, 1}).with_dtype<Q>().with_device(device).verify(output_q);
+    TensorMatcher({N, G}).with_strides({-1, -1}).with_dtype<S>().with_device(device).verify(output_s);
+    CHECK_HOST(T_valid.unwrap() <= N.unwrap())
+        << "num_valid_tokens must not exceed the padded output rows: " << T_valid.unwrap() << " > " << N.unwrap();
+  } else if constexpr (kMasked) {
     TensorMatcher({E, N, -1}).with_strides({-1, -1, 1}).with_dtype<T>().with_device(device).verify(input);
     TensorMatcher({E, N, H}).with_strides({-1, -1, 1}).with_dtype<Q>().with_device(device).verify(output_q);
     TensorMatcher({E, N, G}).with_strides({-1, -1, -1}).with_dtype<S>().with_device(device).verify(output_s);
@@ -613,7 +671,7 @@ QuantHostContext<Trait> build_quant_context( //
   };
 }
 
-template <typename Trait, bool kUsePDL, bool kSortedRows, typename Params>
+template <typename Trait, bool kUsePDL, bool kSortedRows, bool kPadRows, typename Params>
 void launch_flat_kernel(const QuantHostContext<Trait>& ctx, const Params& params) {
   using namespace host;
   const auto& p = ctx.params;
@@ -621,7 +679,7 @@ void launch_flat_kernel(const QuantHostContext<Trait>& ctx, const Params& params
   if (total_threads == 0) return;
   const uint32_t num_blocks = div_ceil(total_threads, int64_t{Trait::kBlockSize});
   LaunchKernel(num_blocks, Trait::kBlockSize, ctx.device)
-      .config({.use_pdl = kUsePDL})(per_token_group_quant_flat_kernel<Trait, kUsePDL, kSortedRows>, params);
+      .config({.use_pdl = kUsePDL})(per_token_group_quant_flat_kernel<Trait, kUsePDL, kSortedRows, kPadRows>, params);
 }
 
 template <
@@ -640,7 +698,24 @@ struct PerTokenGroupQuantFlatKernel {
 
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
     const auto ctx = build_quant_context<Trait, /*kMasked=*/false>(input, output_q, output_s);
-    launch_flat_kernel<Trait, kUsePDL, /*kSortedRows=*/false>(ctx, ctx.params);
+    launch_flat_kernel<Trait, kUsePDL, /*kSortedRows=*/false, /*kPadRows=*/false>(ctx, ctx.params);
+  }
+
+  /// \brief Flat quant over a row-padded output: input has num_valid_tokens
+  /// rows, output_q/output_s have the (larger) padded row count. Padded tail
+  /// rows are written as exact zeros in this same launch, so the caller never
+  /// issues separate tail fills. Real rows are bit-identical to run().
+  static void run_padded(
+      tvm::ffi::TensorView input,
+      tvm::ffi::TensorView output_q,
+      tvm::ffi::TensorView output_s,
+      int64_t num_valid_tokens) {
+    using namespace host;
+    CHECK_HOST(0 <= num_valid_tokens && num_valid_tokens <= std::numeric_limits<int32_t>::max())
+        << "num_valid_tokens out of range: " << num_valid_tokens;
+    const auto ctx = build_quant_context<Trait, /*kMasked=*/false, /*kPadRows=*/true>(input, output_q, output_s);
+    const auto params = PaddedQuantKernelParams{ctx.params, static_cast<uint32_t>(num_valid_tokens)};
+    launch_flat_kernel<Trait, kUsePDL, /*kSortedRows=*/false, /*kPadRows=*/true>(ctx, params);
   }
 };
 
@@ -680,7 +755,7 @@ struct PerTokenGroupQuantSortedKernel {
         static_cast<const int32_t*>(num_tokens_post_padded.data_ptr()),
         static_cast<uint32_t>(num_valid_tokens),
     };
-    launch_flat_kernel<Trait, kUsePDL, /*kSortedRows=*/true>(ctx, params);
+    launch_flat_kernel<Trait, kUsePDL, /*kSortedRows=*/true, /*kPadRows=*/false>(ctx, params);
   }
 };
 

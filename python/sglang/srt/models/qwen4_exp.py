@@ -41,6 +41,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.fp8_lm_head import quantize_lm_head_to_fp8_block128
+from sglang.srt.layers.fp8_shared_expert import (
+    quantize_shared_experts_fp8_block128,
+)
 from sglang.srt.layers.hyperconnection import (
     GatedResidual,
     GroupedGemmaRMSNorm,
@@ -2692,6 +2695,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 module.finalize_fused_in_proj()
 
         self._maybe_quantize_lm_head_fp8_blockwise()
+        if get_exec().features.enable_fp8_shared_expert:
+            n = quantize_shared_experts_fp8_block128(self)
+            if n:
+                logger.info(
+                    "Quantized %d shared-expert projections to FP8 e4m3 with "
+                    "128x128 block scales",
+                    n,
+                )
 
         return loaded_params
 
