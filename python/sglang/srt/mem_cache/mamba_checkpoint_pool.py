@@ -197,6 +197,7 @@ class MambaCheckpointPool:
         conv_dtype: torch.dtype,
         device: str,
         temporal_dtype: Optional[torch.dtype] = None,
+        side_states: Optional[List[tuple]] = None,
     ):
         self.num_slots = num_slots
         self.device = device
@@ -223,6 +224,20 @@ class MambaCheckpointPool:
             )
             for shape in conv_shapes
         ]
+        # PLE side states (short-conv window rows, n-gram context rows) are
+        # slot-indexed in the active pool; donating frees that slot, so mirror
+        # their rows here, slot-for-slot, verbatim (already fp8/int/whatever
+        # the side pool stores them in -- no requantization).
+        # side_states entries: (active_tensor, slot_dim); mirrors are built
+        # with this pool's slot count on the same device.
+        self.sides = []
+        for src, slot_dim in side_states or []:
+            if src is None:
+                continue
+            shape = list(src.shape)
+            shape[slot_dim] = num_slots + 1
+            mirror = torch.zeros(shape, dtype=src.dtype, device=src.device)
+            self.sides.append((mirror, src, slot_dim))
         self.allocator = MambaSlotAllocator(size=num_slots, device=device)
 
     # ---- lifecycle (delegates to the embedded allocator) ----
@@ -250,6 +265,8 @@ class MambaCheckpointPool:
         self.temporal.store_from_pool(cache.temporal, active_slots, ckpt_slots)
         for i, c in enumerate(self.conv):
             c[:, ckpt_slots] = cache.conv[i][:, active_slots]
+        for mirror, src, dim in self.sides:
+            mirror.index_copy_(dim, ckpt_slots, src.index_select(dim, active_slots))
 
     def load_to_active(self, active_mamba_pool, ckpt_slots, active_slots) -> None:
         """Dequantize temporal + copy conv from checkpoint slots into the active pool
@@ -258,6 +275,8 @@ class MambaCheckpointPool:
         self.temporal.copy_to_pool(cache.temporal, ckpt_slots, active_slots)
         for i, c in enumerate(self.conv):
             cache.conv[i][:, active_slots] = c[:, ckpt_slots].to(cache.conv[i].dtype)
+        for mirror, src, dim in self.sides:
+            src.index_copy_(dim, active_slots, mirror.index_select(dim, ckpt_slots))
 
     @staticmethod
     def estimate_mem_usage_bytes(
@@ -270,11 +289,12 @@ class MambaCheckpointPool:
         conv_shapes: List[tuple],
         conv_dtype: torch.dtype,
         temporal_dtype: torch.dtype,
+        side_states: Optional[List[tuple]] = None,
     ) -> dict:
         """Estimate the pool's HBM footprint (bytes) WITHOUT allocating, so a
         caller can check it against free memory before construction. Mirrors the
-        real layout: int8 qdata + per-(head,k) scale + bf16 conv windows, including
-        the reserved slot 0."""
+        real layout: int8 qdata + per-(head,k) scale + bf16 conv windows +
+        mirrored side-state rows, including the reserved slot 0."""
         slots = num_slots + 1  # slot 0 reserved (matches MambaSlotAllocator)
         scale_isz = torch.empty((), dtype=temporal_dtype).element_size()
         conv_isz = torch.empty((), dtype=conv_dtype).element_size()
@@ -286,16 +306,29 @@ class MambaCheckpointPool:
             for s in shape:
                 n *= int(s)
             conv += num_layers * slots * n * conv_isz
+        # mirror rows match the source tensors' dtype verbatim (no requantization)
+        sides = 0
+        for src, slot_dim in side_states or []:
+            if src is None:
+                continue
+            shape = list(src.shape)
+            shape[slot_dim] = slots
+            n = 1
+            for s in shape:
+                n *= int(s)
+            sides += n * src.element_size()
         return {
             "qdata": qdata,
             "scale": scale,
             "conv": conv,
-            "total": qdata + scale + conv,
+            "sides": sides,
+            "total": qdata + scale + conv + sides,
         }
 
     def mem_usage_bytes(self) -> int:
         conv_bytes = sum(c.numel() * c.element_size() for c in self.conv)
-        return self.temporal.mem_usage_bytes() + conv_bytes
+        side_bytes = sum(m.numel() * m.element_size() for m, _, _ in self.sides)
+        return self.temporal.mem_usage_bytes() + conv_bytes + side_bytes
 
 
 def maybe_init_int8_mamba_checkpoint_pool(
@@ -304,6 +337,7 @@ def maybe_init_int8_mamba_checkpoint_pool(
     cache_params,
     mamba_layer_ids: List[int],
     device: str,
+    side_states: Optional[List[Optional[tuple]]] = None,
 ) -> Optional[MambaCheckpointPool]:
     """Build the optional int8 ``MambaCheckpointPool`` when
     ``--enable-int8-mamba-checkpoint`` is set (and a global server-args context
@@ -337,6 +371,7 @@ def maybe_init_int8_mamba_checkpoint_pool(
         conv_shapes=list(cache_params.shape.conv),
         conv_dtype=cache_params.dtype.conv,
         temporal_dtype=cache_params.dtype.temporal,
+        side_states=[t for t in side_states or [] if t is not None],
     )
 
     est = MambaCheckpointPool.estimate_mem_usage_bytes(**kwargs)
@@ -349,7 +384,9 @@ def maybe_init_int8_mamba_checkpoint_pool(
     logger.info(
         f"int8 mamba checkpoint pool: {ckpt_size} slots, "
         f"{est['total'] / GB:.2f}GB (qdata {est['qdata'] / GB:.2f} + scale "
-        f"{est['scale'] / GB:.2f} + conv {est['conv'] / GB:.2f}); active mamba "
+        f"{est['scale'] / GB:.2f} + conv {est['conv'] / GB:.2f}"
+        + (f" + sides {est['sides'] / GB:.2f}" if est["sides"] else "")
+        + f"); active mamba "
         f"pool {mamba_size} slots"
         + (f"; free HBM {free_bytes / GB:.2f}GB" if free_bytes is not None else "")
     )
