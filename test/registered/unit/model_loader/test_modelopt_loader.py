@@ -47,7 +47,7 @@ from sglang.srt.models.muse_glimmer import MuseGlimmerForConditionalGeneration
 from sglang.srt.models.nano_nemotron_vl import NemotronH_Omni_Reasoning_V3
 from sglang.srt.models.utils import WeightsMapper
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 # Note: PYTHONPATH=python should be set when running tests
 
@@ -155,6 +155,21 @@ class TestParseQuantHfConfig(CustomTestCase):
         ({"quant_algo": "MXFP8"}, "mxfp8"),
         ({"quant_algo": "FP4"}, "modelopt_fp4"),
         ({"quant_algo": "MIXED_PRECISION"}, "w4afp8"),
+        (
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.language_model.layers.0.mlp.experts": {
+                        "quant_algo": "W4A8_MXFP4_FP8",
+                        "group_size": 32,
+                    },
+                    "model.language_model.layers.0.self_attn.q_proj": {
+                        "quant_algo": "FP8_PB_WO",
+                    },
+                },
+            },
+            "modelopt_mixed",
+        ),
         ({"quant_method": "modelopt"}, "modelopt"),
     ]
 
@@ -461,6 +476,33 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
                 self.assertEqual(method.quant_config.weight_block_size, [128, 128])
                 self.assertEqual(method.quant_config.activation_scheme, "dynamic")
                 self.assertTrue(method.quant_config.is_checkpoint_fp8_serialized)
+
+    def test_w4a8_mxfp4_fp8_moe_dispatches_to_serialized_mxfp4(self):
+        # Qwen3.8-Flash-Next-MXFP4-FP8 keys its routed experts (and the MTP
+        # draft's) as W4A8_MXFP4_FP8: packed e2m1 + UE8M0 g32 scales, MXFP8
+        # activations at runtime. They load through Mxfp4MoEMethod.
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.language_model.layers.0.mlp.experts": {
+                        "quant_algo": "W4A8_MXFP4_FP8",
+                        "group_size": 32,
+                    },
+                },
+                "packed_modules_mapping": {},
+            }
+        )
+        # Type dispatch only needs a FusedMoE instance; publishing a default
+        # topology gives Mxfp4MoEMethod.__init__ its runtime-context reads.
+        layer = FusedMoE.__new__(FusedMoE)
+        with published_topology():
+            method = quant_config.get_quant_method(
+                layer, "model.layers.0.mlp.experts"
+            )
+        self.assertIsInstance(method, Mxfp4MoEMethod)
 
     def test_block_fp8_block_size_follows_checkpoint_group_size(self):
         method = self._block_fp8_moe_method("FP8_BLOCK_SCALES", group_size=64)
