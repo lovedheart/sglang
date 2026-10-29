@@ -351,6 +351,10 @@ class Envs:
     # Route decode-size HC mix through the persistent Triton kernel; 0 falls
     # back to the plain-torch mix without full deterministic inference.
     SGLANG_HC_MIX_TRITON = EnvBool(True)
+    # Fold the GatedResidual RMSNorm weight into the mix-down and inject
+    # projections (TileKernels-style), so the normed residual is never
+    # materialized; the per-branch rsqrt factors ride on the mix partials.
+    SGLANG_HC_NORM_FOLD = EnvBool(False)
     # --ple-offload-backend file: where the sparse, file-backed PLE table lives
     # (deterministic name, reused across restarts), whether prefill-sized
     # gathers hint the page cache first, and an escape hatch for the device
