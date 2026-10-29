@@ -843,6 +843,9 @@ def tilelang_qsa_mqa_decode(
             f"8/16/32/64 (64-row GEMM sub-page packing), got {page_size}"
         )
     if min_scored_len > 0:
+        # Bounded callers scan exactly [0, context_len) and the kernel
+        # writes that prefix in full, so columns past a row's context
+        # length are never read and the wide -inf fill is pure traffic.
         logits = torch.empty(
             (q.shape[0], max_model_len), dtype=torch.float32, device=q.device
         )
