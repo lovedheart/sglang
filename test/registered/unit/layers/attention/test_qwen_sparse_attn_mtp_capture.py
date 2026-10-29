@@ -59,9 +59,7 @@ class _Meta:
 def _reference_capture(state, topk_indices, meta, layer_id):
     """Pre-rewrite implementation, verbatim: is_last mask + nonzero anchors."""
     row_to_req = meta.get_token_to_batch_idx().long()
-    row_req_pool_indices = meta.req_pool_indices[
-        row_to_req[: topk_indices.shape[0]]
-    ]
+    row_req_pool_indices = meta.req_pool_indices[row_to_req[: topk_indices.shape[0]]]
     is_last = torch.ones_like(row_req_pool_indices, dtype=torch.bool)
     if row_req_pool_indices.numel() > 1:
         is_last[:-1] = row_req_pool_indices[:-1] != row_req_pool_indices[1:]
@@ -82,9 +80,7 @@ def _make_case(rng):
     req_pool_indices = torch.tensor(
         rng.sample(range(1, NUM_REQ), bs), dtype=torch.int64
     )
-    seqlens = torch.tensor(
-        [rng.randint(1, 4096) for _ in range(bs)], dtype=torch.int64
-    )
+    seqlens = torch.tensor([rng.randint(1, 4096) for _ in range(bs)], dtype=torch.int64)
     rows = t2b.numel()
     topk_rows = (
         rows if rng.random() < 0.8 else max(1, rows - rng.randint(0, rows - 1))
@@ -127,9 +123,7 @@ class TestQSAMTPCaptureBitIdentity(CustomTestCase):
             for layer_id in LAYER_IDS:
                 meta, topk = _make_case(rng)
                 _reference_capture(ref_state, topk, meta, layer_id)
-                backend.capture_mtp_sparse_indices(
-                    topk, _FB(), layer_id, metadata=meta
-                )
+                backend.capture_mtp_sparse_indices(topk, _FB(), layer_id, metadata=meta)
             # Trash row (num_requests) may legitimately differ between the
             # implementations; every real request row must be byte-equal.
             self.assertTrue(
@@ -172,9 +166,7 @@ class TestQSAMTPCaptureBitIdentity(CustomTestCase):
             got = QwenSparseAttnBackend._speculative_row_to_request(
                 fb, bs * rows_per_req
             )
-            want = torch.arange(bs, dtype=torch.long).repeat_interleave(
-                rows_per_req
-            )
+            want = torch.arange(bs, dtype=torch.long).repeat_interleave(rows_per_req)
             self.assertTrue(
                 torch.equal(got, want),
                 f"mapping mismatch for bs={bs} rows_per_req={rows_per_req}",
