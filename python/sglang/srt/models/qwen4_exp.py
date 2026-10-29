@@ -41,6 +41,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.fp8_lm_head import quantize_lm_head_to_fp8_block128
+from sglang.srt.layers.fp8_shared_expert import (
+    quantize_shared_experts_fp8_block128,
+)
 from sglang.srt.layers.hyperconnection import (
     GatedResidual,
     GroupedGemmaRMSNorm,
@@ -2440,12 +2443,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     )
                 )
 
-<<<<<<< HEAD
         # Print warning once per load_weights() call
         ple_warned_downcast = False
-=======
-        self._ple_downcast_warned = False
->>>>>>> f2790af045 ([ moe ] SM120: W4A8/W4A4 dispatch, b12x + sm12x backends, launch tuning)
 
         def load_qwen4_exp_ple_shard(name: str, loaded_weight: torch.Tensor) -> bool:
             nonlocal ple_warned_downcast
@@ -2496,13 +2495,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 emb.weight.dtype == torch.float8_e4m3fn
                 and loaded_weight.dtype != torch.float8_e4m3fn
             ):
-<<<<<<< HEAD
                 if not ple_warned_downcast:
                     ple_warned_downcast = True
-=======
-                if not self._ple_downcast_warned:
-                    self._ple_downcast_warned = True
->>>>>>> f2790af045 ([ moe ] SM120: W4A8/W4A4 dispatch, b12x + sm12x backends, launch tuning)
                     logger.warning(
                         "PLE checkpoint shards are %s but the embedding storage "
                         "is fp8 (ple_embedding_dtype / fp8 quant config); "
@@ -2727,6 +2721,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 module.finalize_fused_in_proj()
 
         self._maybe_quantize_lm_head_fp8_blockwise()
+        if get_exec().features.enable_fp8_shared_expert:
+            n = quantize_shared_experts_fp8_block128(self)
+            if n:
+                logger.info(
+                    "Quantized %d shared-expert projections to FP8 e4m3 with "
+                    "128x128 block scales",
+                    n,
+                )
 
         return loaded_params
 
