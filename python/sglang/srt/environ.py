@@ -369,6 +369,9 @@ class Envs:
     # Route decode-size HC mix through the persistent Triton kernel; 0 falls
     # back to the plain-torch mix without full deterministic inference.
     SGLANG_HC_MIX_TRITON = EnvBool(True)
+    # Route prefill-size (>16 rows) HC mix through MXFP8 W8A8 tl.dot_scaled
+    # GEMMs with on-the-fly activation quant; needs --enable-fp8-hc-mix.
+    SGLANG_HC_MIX_W8A8_PREFILL = EnvBool(True)
     # Fold the GatedResidual RMSNorm weight into the mix-down and inject
     # projections (TileKernels-style), so the normed residual is never
     # materialized; the per-branch rsqrt factors ride on the mix partials.
