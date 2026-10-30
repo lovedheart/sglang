@@ -49,6 +49,10 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Store the LM head weight in FP8 e4m3 with 128x128 block scales (SM120 only, ignored elsewhere), halving decode-time head memory traffic.",
     ] = False
+    enable_fp6_lm_head: A[
+        bool,
+        "Pack the LM head weight as FP6 e2m3 codes with 32x32 block FP32 scales at load time (SM120 only, ignored elsewhere) and serve it with the SIMT unpacking kernels: 477 MB vs 1.27 GB bf16, decode head ~254 us vs ~708 us. Takes no effect if --enable-fp8-lm-head also quantized the head.",
+    ] = False
     enable_nvfp4_draft_lm_head: A[
         bool,
         "Give the NEXTN/EAGLE draft runner its own NVFP4 W4A16 copy of the LM head (SM120 only, ignored elsewhere), cutting draft-step head traffic ~2x. Draft logits feed proposals only; greedy target verification keeps outputs unchanged.",
