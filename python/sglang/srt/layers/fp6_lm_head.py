@@ -53,8 +53,8 @@ def quantize_lm_head_to_fp6_b32(lm_head: ParallelLMHead) -> bool:
         return False
     if weight.dtype == torch.float8_e4m3fn:
         logger.warning(
-            "--enable-fp6-lm-head ignored: the lm head is already FP8 "
-            "blockwise-quantized (--enable-fp8-lm-head wins)"
+            "--lm-head-dtype fp6_e2m3 ignored: the lm head is already FP8 "
+            "blockwise-quantized (the fp8 formats win)"
         )
         return False
     if weight.dtype != torch.bfloat16:
@@ -65,7 +65,7 @@ def quantize_lm_head_to_fp6_b32(lm_head: ParallelLMHead) -> bool:
     n, k = weight.shape
     if not is_sm120_supported():
         logger.warning(
-            "--enable-fp6-lm-head is SM120-only; leaving the lm head in %s",
+            "--lm-head-dtype fp6_e2m3 is SM120-only; leaving the lm head in %s",
             weight.dtype,
         )
         return False
