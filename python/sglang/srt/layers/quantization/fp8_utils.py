@@ -1541,6 +1541,25 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
+    # Decode band: fold the group-128 activation quant into the sm120 warp
+    # GEMM (bit-identical; drops the per_token_group_quant launch and the
+    # fp8 activation round-trip). The predicate mirrors the warp-kernel
+    # eligibility, so non-qualifying shapes keep the two-kernel pipeline.
+    from sglang.kernels.ops.gemm.fp8_blockwise_gemm import (
+        sm120_fp8_blockwise_fused_act_supported,
+        sm120_fp8_blockwise_warp_fused_act,
+    )
+
+    if block_size[1] == 128 and sm120_fp8_blockwise_fused_act_supported(
+        input_2d, weight, weight_scale
+    ):
+        output = sm120_fp8_blockwise_warp_fused_act(
+            input_2d, weight, weight_scale, out_dtype=input_2d.dtype
+        )
+        if bias is not None:
+            output += bias
+        return output.to(dtype=input_2d.dtype).view(*output_shape)
+
     # Quantize into row-padded buffers so the sgl-kernel wrapper's per-call
     # pad_tensor() on mat_a / scales_a short-circuits (saves 2x fill + 2x cat
     # kernels per GEMM). weight_scale.T is left as a K-major view because the

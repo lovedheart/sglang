@@ -26,4 +26,12 @@ void fp8_blockwise_scaled_mm(
   fp8_blockwise_scaled_mm_sm120(out, mat_a, mat_b, scales_a, scales_b);
 }
 
+void sm120_fp8_blockwise_warp_fused_act(
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView x,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView weight_scale) {
+  fp8_blockwise_warp_fused_act_sm120(out, x, weight, weight_scale);
+}
+
 }  // namespace sglang

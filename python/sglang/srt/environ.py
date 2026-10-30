@@ -378,6 +378,11 @@ class Envs:
     # Route prefill-size (>16 rows) HC mix through MXFP8 W8A8 tl.dot_scaled
     # GEMMs with on-the-fly activation quant; needs --enable-fp8-hc-mix.
     SGLANG_HC_MIX_W8A8_PREFILL = EnvBool(True)
+    # Fuse the per-token-group e4m3 activation quant into the SM120 blockwise
+    # decode warp GEMM (bit-identical bytes/scales; the separate
+    # per_token_group_quant launch disappears). Band-gated to the shapes the
+    # warp kernel already wins on; False restores the two-kernel pipeline.
+    SGLANG_ENABLE_SM120_FUSED_ACT_QUANT = EnvBool(True)
     # Fold the GatedResidual RMSNorm weight into the mix-down and inject
     # projections (TileKernels-style), so the normed residual is never
     # materialized; the per-branch rsqrt factors ride on the mix partials.
