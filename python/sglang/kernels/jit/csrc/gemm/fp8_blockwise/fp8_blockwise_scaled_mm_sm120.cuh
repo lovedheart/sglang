@@ -26,6 +26,7 @@ limitations under the License.
 #include <cute/arch/copy_sm80.hpp>
 #include <cute/arch/mma_sm120.hpp>
 #include <cutlass/numeric_types.h>
+#include <cuda_fp8.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -358,6 +359,204 @@ sm120_fp8_decode_reduce(OutType* __restrict__ out, const float* __restrict__ tmp
       v += tmp[s * size + i];
     }
     out[i] = OutType(v);
+  }
+}
+
+/// \brief sm120_fp8_decode_warp with the per-token-group activation quant fused
+/// into the prologue: bf16/fp16 activations are loaded per 128-column group,
+/// reduced to an amax, converted to e4m3 in registers, and stored into the same
+/// swizzled smem tile the cp.async path writes, so the MMA/epilogue below are
+/// reused verbatim and the separate per_token_group_quant launch disappears.
+///
+/// Bit-exactness: the per-group math mirrors the flat device function in
+/// gemm/per_token_group_quant.cuh exactly -- amax as an fp32 max-abs (order
+/// insensitive), the stored dequant scale as amax_c * (1.f / 448.f), the
+/// quantization scale as __fdividef(448.f, amax_c) (the reference kernel
+/// builds `448.f / amax_c` with --use_fast_math), fp32 RNE multiply, and the
+/// unclamped satfinite RNE pair conversion (NaN stays NaN, as in the bf16
+/// reference path). Split-K partitioning and the reduce kernel are untouched,
+/// so outputs are bit-identical to the quant + warp + reduce pipeline.
+template <typename OutType, typename XType, int TM, int WN, int STAGES>
+__global__ void __launch_bounds__(32) sm120_fp8_decode_warp_fused(
+    float* __restrict__ tmp,
+    OutType* __restrict__ out,
+    const XType* __restrict__ x,
+    const uint8_t* __restrict__ b,
+    const float* __restrict__ sb,
+    int32_t m,
+    int32_t n,
+    int32_t k,
+    int32_t splits) {
+  static_assert(TM == 8 || TM == 16);
+  static_assert(WN == 16 || WN == 32);
+  extern __shared__ __align__(128) uint8_t storage[];
+  const int32_t warp = threadIdx.x / 32, lane = threadIdx.x % 32, row = lane / 4, col = lane % 4;
+  auto* mem = reinterpret_cast<uint8_t (*)[(TM + WN) * 128]>(storage + warp * STAGES * (TM + WN) * 128);
+  // Dequant scales for the group in flight, one float per tile row. The
+  // launcher starts exactly one warp per block and reserves this 64B tail
+  // after the staged tiles (128B-aligned -> safe for float stores).
+  float* xsc = reinterpret_cast<float*>(storage + STAGES * (TM + WN) * 128);
+  int32_t n0 = (blockIdx.x + warp) * WN, m0 = blockIdx.y * TM;
+  int32_t groups = k / 128, begin = groups * blockIdx.z / splits, end = groups * (blockIdx.z + 1) / splits;
+  // Apply both scales after each 128-element FP32 dot product.
+  float acc[WN / 16][TM / 8][4] = {};
+  // Weight rows keep the cp.async pipeline.
+  auto load_w = [&](int32_t g) {
+    int32_t stage = (g - begin) % STAGES;
+#pragma unroll
+    for (int v = lane; v < WN * 8; v += 32) {
+      int32_t r = v / 8, c = (v % 8) * 16;
+      cute::SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>::copy(
+          *reinterpret_cast<const cute::uint128_t*>(b + int64_t(n0 + r) * k + g * 128 + c),
+          *reinterpret_cast<cute::uint128_t*>(mem[stage] + r * 128 + (c ^ ((r % 8) * 16))),
+          true);
+    }
+    cute::cp_async_fence();
+  };
+  // Activation rows quantize in-register: 8 lanes split one 128-column group
+  // (16 bf16 each, two 16B loads), 4 rows per warp pass. Rows >= m store
+  // deterministic zero bytes (the old path fed cp.async ZFILL zeros).
+  const int32_t lr = lane & 7, rp = lane >> 3;
+  auto quant_x = [&](int32_t g) {
+    int32_t stage = (g - begin) % STAGES;
+    uint8_t* xt = mem[stage] + WN * 128;
+#pragma unroll
+    for (int pass = 0; pass < TM / 4; ++pass) {
+      const int32_t i = pass * 4 + rp;
+      const int32_t token = m0 + i;
+      const bool valid = token < m;
+      // Every lane must converge on the amax butterfly shuffle below, so rows
+      // past m load a clamped valid row instead of branching around it. The
+      // resulting garbage is confined to that row's 8-lane group and dropped
+      // by the `valid` predicates on the stores.
+      // k is a multiple of 128 columns, so every row start and group offset
+      // keeps the 16-byte alignment these loads need.
+      const XType* src = x + int64_t(valid ? token : 0) * k + g * 128 + lr * 16;
+      uint4 raw0 = *reinterpret_cast<const uint4*>(src);
+      uint4 raw1 = *reinterpret_cast<const uint4*>(src + 8);
+      const XType* h0 = reinterpret_cast<const XType*>(&raw0);
+      const XType* h1 = reinterpret_cast<const XType*>(&raw1);
+      float v[16];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        v[j] = float(h0[j]);
+      }
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        v[8 + j] = float(h1[j]);
+      }
+      float amax = fabsf(v[0]);
+#pragma unroll
+      for (int j = 1; j < 16; ++j) {
+        amax = fmaxf(amax, fabsf(v[j]));
+      }
+#pragma unroll
+      for (int off = 1; off < 8; off <<= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+      }
+      amax = fmaxf(amax, 1e-10f);
+      // Must match the reference quantizer bit-for-bit: per_token_group_quant
+      // _8bit_v2 computes `448.f / amax` under --use_fast_math, which lowers
+      // to div.approx.f32 (== __fdividef, ~2 ulp). A correctly-rounded
+      // division differs by an ulp for some amax and flips e4m3 midpoints.
+      const float qscale = __fdividef(448.0f, amax);
+      uint32_t packed[4] = {0, 0, 0, 0};
+      auto* bytes = reinterpret_cast<uint16_t*>(packed);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        // Same as the reference bf16 path: no clamp, satfinite RNE pair cvt.
+        const float2 pair = {v[2 * j] * qscale, v[2 * j + 1] * qscale};
+        bytes[j] = __nv_cvt_float2_to_fp8x2(pair, __NV_SATFINITE, __NV_E4M3);
+      }
+      if (!valid) {
+        // Invalid rows store deterministic zero bytes (the old path fed
+        // cp.async ZFILL zeros) so the MMA sees the same operands.
+        packed[0] = packed[1] = packed[2] = packed[3] = 0;
+      }
+      if (lr == 0) {
+        xsc[i] = valid ? amax * (1.0f / 448.0f) : 0.0f;
+      }
+      *reinterpret_cast<uint4*>(xt + int64_t(i) * 128 + ((lr ^ (((WN + i) & 7))) * 16)) =
+          *reinterpret_cast<const uint4*>(packed);
+    }
+  };
+  for (int s = 0; s < STAGES - 1; ++s) {
+    if (begin + s < end) {
+      load_w(begin + s);
+    }
+  }
+  for (int g = begin; g < end; ++g) {
+    if (g + STAGES - 1 < end) {
+      load_w(g + STAGES - 1);
+    }
+    quant_x(g);
+    if (g + STAGES - 1 < end) {
+      cute::cp_async_wait<STAGES - 1>();
+    } else {
+      cute::cp_async_wait<0>();
+    }
+    __syncwarp();
+    auto* w = mem[(g - begin) % STAGES];
+    auto* xa = w + WN * 128;
+    float part[WN / 16][TM / 8][4] = {};
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+      uint32_t br[TM / 8][2];
+#pragma unroll
+      for (int mm = 0; mm < TM / 8; ++mm) {
+        int32_t ar = mm * 8 + lane % 8, ac = kk * 32 + (lane / 8 % 2) * 16;
+        cute::SM75_U32x2_LDSM_N::copy(
+            *reinterpret_cast<const cute::uint128_t*>(xa + ar * 128 + (ac ^ ((ar % 8) * 16))), br[mm][0], br[mm][1]);
+      }
+#pragma unroll
+      for (int wn = 0; wn < WN / 16; ++wn) {
+        uint32_t ar[4];
+        int32_t wr = wn * 16 + lane % 16, wc = kk * 32 + (lane / 16) * 16;
+        cute::SM75_U32x4_LDSM_N::copy(
+            *reinterpret_cast<const cute::uint128_t*>(w + wr * 128 + (wc ^ ((wr % 8) * 16))),
+            ar[0],
+            ar[1],
+            ar[2],
+            ar[3]);
+#pragma unroll
+        for (int mm = 0; mm < TM / 8; ++mm) {
+          auto& p = part[wn][mm];
+          cute::SM120_16x8x32_TN<cutlass::float_e4m3_t, cutlass::float_e4m3_t, float>::fma(
+              p[0], p[1], p[2], p[3], ar[0], ar[1], ar[2], ar[3], br[mm][0], br[mm][1], p[0], p[1], p[2], p[3]);
+        }
+      }
+    }
+#pragma unroll
+    for (int wn = 0; wn < WN / 16; ++wn) {
+      float ws = sb[((n0 + wn * 16) / 128) * groups + g];
+#pragma unroll
+      for (int mm = 0; mm < TM / 8; ++mm) {
+        int32_t token = m0 + mm * 8 + col * 2;
+        float s0 = token < m ? ws * xsc[mm * 8 + col * 2] : 0, s1 = token + 1 < m ? ws * xsc[mm * 8 + col * 2 + 1] : 0;
+        acc[wn][mm][0] += part[wn][mm][0] * s0;
+        acc[wn][mm][1] += part[wn][mm][1] * s1;
+        acc[wn][mm][2] += part[wn][mm][2] * s0;
+        acc[wn][mm][3] += part[wn][mm][3] * s1;
+      }
+    }
+    __syncwarp();
+  }
+#pragma unroll
+  for (int wn = 0; wn < WN / 16; ++wn) {
+#pragma unroll
+    for (int mm = 0; mm < TM / 8; ++mm) {
+#pragma unroll
+      for (int v = 0; v < 4; ++v) {
+        int32_t token = m0 + mm * 8 + col * 2 + v % 2, output_col = n0 + wn * 16 + row + (v / 2) * 8;
+        if (token < m) {
+          if (splits == 1) {
+            out[int64_t(token) * n + output_col] = OutType(acc[wn][mm][v]);
+          } else {
+            tmp[(int64_t(blockIdx.z) * m + token) * n + output_col] = acc[wn][mm][v];
+          }
+        }
+      }
+    }
   }
 }
 }  // namespace detail
@@ -797,6 +996,92 @@ void launch_sm120_fp8_decode_warp(
   }
   host::LaunchKernel(host::div_ceil(output_size, int64_t(256)), 256, stream)(
       detail::sm120_fp8_decode_reduce<OutType>, static_cast<OutType*>(out.data_ptr()), partials, output_size, splits);
+}
+
+/// \brief Launch the fused activation-quantizing decode warp GEMM. Kept on the
+/// same TM/WN/splits policy as launch_sm120_fp8_decode_warp so the fused path
+/// inherits the per-shape tuning of the kernel it replaces.
+template <typename OutType, typename XType>
+void launch_sm120_fp8_decode_warp_fused(
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView x,
+    tvm::ffi::TensorView b,
+    tvm::ffi::TensorView scales_b,
+    cudaStream_t stream) {
+  const int32_t m = static_cast<int32_t>(x.size(0));
+  const int32_t k = static_cast<int32_t>(x.size(1));
+  const int32_t n = static_cast<int32_t>(b.size(0));
+  const bool pr_shape = n >= 4096 && k >= 4096;
+  const int32_t splits = (!pr_shape && m <= 8) ? 16 : 8;
+  const int tm = m <= 8 ? 8 : 16;
+  const int wn = (pr_shape && m <= 8) ? 16 : 32;
+  const int64_t output_size = int64_t(m) * n;
+  auto workspace = host::ffi::alloc_workspace_tensor(splits * output_size * sizeof(float), x.device());
+  auto* partials = static_cast<float*>(workspace.data_ptr());
+  auto launch = [&]<int TM, int WN>() {
+    constexpr int stages = 2;
+    // 64B tail = 16 float activation scales (widest TM), read by the epilogue.
+    constexpr int smem = stages * (TM + WN) * 128 + 16 * 4;
+    host::LaunchKernel(dim3(n / WN, 1, splits), 32, stream, smem)(
+        detail::sm120_fp8_decode_warp_fused<OutType, XType, TM, WN, stages>,
+        partials,
+        static_cast<OutType*>(out.data_ptr()),
+        static_cast<const XType*>(x.data_ptr()),
+        static_cast<const uint8_t*>(b.data_ptr()),
+        static_cast<const float*>(scales_b.data_ptr()),
+        m,
+        n,
+        k,
+        splits);
+  };
+  if (tm == 8 && wn == 16) {
+    launch.template operator()<8, 16>();
+  } else if (tm == 8) {
+    launch.template operator()<8, 32>();
+  } else if (wn == 16) {
+    launch.template operator()<16, 16>();
+  } else {
+    launch.template operator()<16, 32>();
+  }
+  host::LaunchKernel(host::div_ceil(output_size, int64_t(256)), 256, stream)(
+      detail::sm120_fp8_decode_reduce<OutType>, static_cast<OutType*>(out.data_ptr()), partials, output_size, splits);
+}
+
+/// \brief Entry for the decode GEMM that quantizes its bf16/fp16 activations
+/// in-kernel (no scales_a: the scales live in kernel-private smem). The band
+/// gate (m <= 16 + warp-kernel shapes + env kill-switch) lives in the Python
+/// dispatcher; these checks only catch wiring mistakes.
+inline void fp8_blockwise_warp_fused_act_sm120(
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView x,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView weight_scale) {
+  RuntimeCheck(x.device().device_type == kDLCUDA, "x must be a CUDA tensor");
+  RuntimeCheck(x.dim() == 2 && weight.dim() == 2, "x and weight must be 2D tensors");
+  RuntimeCheck(x.stride(1) == 1, "x must be a row major tensor");
+  RuntimeCheck(weight.stride(1) == 1, "weight must be a row major [n, k] tensor");
+  RuntimeCheck(
+      weight_scale.is_contiguous(), "weight_scale must be a contiguous [n / 128, k / 128] tensor");
+  RuntimeCheck(host::is_type<fp8_e4m3_t>(weight.dtype()), "weight must be Float8_e4m3fn");
+  RuntimeCheck(host::is_type<float>(weight_scale.dtype()), "weight_scale must be Float32");
+  const int32_t m = static_cast<int32_t>(x.size(0));
+  const int32_t k = static_cast<int32_t>(x.size(1));
+  const int32_t n = static_cast<int32_t>(weight.size(0));
+  RuntimeCheck(weight.size(1) == k, "weight and x inner dimensions must match");
+  RuntimeCheck(
+      weight_scale.size(0) == n / 128 && weight_scale.size(1) == k / 128,
+      "weight_scale must have shape [n / 128, k / 128]");
+  RuntimeCheck(out.size(0) == m && out.size(1) == n, "out has the wrong shape");
+  RuntimeCheck(m > 0 && m <= 16, "the fused decode path supports 1..16 tokens");
+  RuntimeCheck(k % 128 == 0 && n % 128 == 0, "block-128 scales require shapes divisible by 128");
+  const cudaStream_t stream = LaunchKernel::resolve_device(x.device());
+  if (host::is_type<bf16_t>(x.dtype()) && host::is_type<bf16_t>(out.dtype())) {
+    launch_sm120_fp8_decode_warp_fused<cutlass::bfloat16_t, cutlass::bfloat16_t>(out, x, weight, weight_scale, stream);
+  } else if (host::is_type<fp16_t>(x.dtype()) && host::is_type<fp16_t>(out.dtype())) {
+    launch_sm120_fp8_decode_warp_fused<cutlass::half_t, cutlass::half_t>(out, x, weight, weight_scale, stream);
+  } else {
+    Panic("x and out must both be BFloat16 or both Half");
+  }
 }
 
 // swapAB (tile N=32) beats the non-swap 128x128 path for M<=64 or M%4!=0
