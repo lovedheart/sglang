@@ -45,14 +45,18 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "If set, the LM head outputs (logits) are in FP32.",
     ] = False
-    enable_fp8_lm_head: A[
-        bool,
-        "Store the LM head weight in FP8 e4m3 with 128x128 block scales (SM120 only, ignored elsewhere), halving decode-time head memory traffic.",
-    ] = False
-    enable_fp6_lm_head: A[
-        bool,
-        "Pack the LM head weight as FP6 e2m3 codes with 32x32 block FP32 scales at load time (SM120 only, ignored elsewhere) and serve it with the SIMT unpacking kernels: 477 MB vs 1.27 GB bf16, decode head ~254 us vs ~708 us. Takes no effect if --enable-fp8-lm-head also quantized the head.",
-    ] = False
+    lm_head_dtype: A[
+        Literal["bf16", "fp8_e4m3", "fp8_e3m4", "fp6_e2m3"],
+        "Store the LM head weight in a compact blockwise format, picked at "
+        "load time (SM120 only, ignored elsewhere; the dense bf16 weight is "
+        "released). fp8_e4m3: FP8 e4m3 codes, 128x128 block scales, halves "
+        "head memory traffic. fp8_e3m4: e3m4 codes, 128x128 block scales "
+        "(~1.9x finer mantissa; flat ~340 us via the patched-QMMA kernels). "
+        "fp6_e2m3: FP6 e2m3 codes, 32x32 FP32 block scales, served by the "
+        "packed-stream SIMT/QMMA kernels (~250 us at M=1, ~280 us flat "
+        "through M=16; head 477 MB vs 1.27 GB bf16). Default bf16 leaves "
+        "the checkpoint's head format untouched.",
+    ] = "bf16"
     enable_nvfp4_draft_lm_head: A[
         bool,
         "Give the NEXTN/EAGLE draft runner its own NVFP4 W4A16 copy of the LM head (SM120 only, ignored elsewhere), cutting draft-step head traffic ~2x. Draft logits feed proposals only; greedy target verification keeps outputs unchanged.",
