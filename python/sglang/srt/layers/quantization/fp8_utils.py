@@ -1413,7 +1413,34 @@ def _e3m4_block_linear(
         xq, xs = input_2d, input_scale.contiguous()
     else:
         input_2d = input.view(-1, input.shape[-1])
-        xq, xs = sglang_per_token_group_quant_fp8_row_padded(input_2d, 128)
+        # The padded quant helper hands back column-major scales (cutlass
+        # convention); the e3m4 kernels index a_scale row-major, so taking it
+        # as-is would put a device copy in front of every decode GEMM (96/step
+        # here). Quantize into row-major padded buffers directly instead:
+        # same JIT kernel, bit-identical values, zero extra launches. The row
+        # padding is kept because the 16-row b16 tile loads full A tiles.
+        from sglang.kernels.ops.quantization.per_token_group_quant import (
+            per_token_group_quant,
+        )
+
+        m_true = input_2d.shape[0]
+        m_pad = (m_true + 3) // 4 * 4
+        xq = torch.empty(
+            (m_pad, input_2d.shape[1]),
+            dtype=torch.float8_e4m3fn,
+            device=input_2d.device,
+        )
+        xs = torch.empty(
+            (m_pad, input_2d.shape[1] // 128),
+            dtype=torch.float32,
+            device=input_2d.device,
+        )
+        # Handed the whole padded buffers, the JIT kernel quantizes the real
+        # rows and writes exact zeros to the tail rows of both outputs (the
+        # row_padded contract), so the padded GEMM stays bit-identical.
+        xq, xs = per_token_group_quant(
+            input_2d, xq, xs, group_size=128, scale_ue8m0=False
+        )
     m = xq.shape[0]
     wsc = weight_scale.contiguous()
     if use_sm120_fp8_e3m4_gemv(m, n, k):
