@@ -40,6 +40,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.fp6_lm_head import quantize_lm_head_to_fp6_b32
 from sglang.srt.layers.fp8_lm_head import quantize_lm_head_to_fp8_block128
 from sglang.srt.layers.fp8_shared_expert import (
     quantize_shared_experts_fp8_block128,
@@ -2695,6 +2696,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 module.finalize_fused_in_proj()
 
         self._maybe_quantize_lm_head_fp8_blockwise()
+        self._maybe_quantize_lm_head_fp6()
         if get_exec().features.enable_fp8_shared_expert:
             n = quantize_shared_experts_fp8_block128(self)
             if n:
@@ -2731,6 +2733,32 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             return
         if quantize_lm_head_to_fp8_block128(self.lm_head):
             logger.info("Quantized lm_head to FP8 e4m3 with 128x128 block scales")
+
+    def _maybe_quantize_lm_head_fp6(self) -> None:
+        # Same one-shot-at-load contract as the fp8 head. The packed head
+        # drops the bf16 weight, so it must not coexist with the NVFP4 draft
+        # head (built from the target's dense weight) or FP32 logits.
+        features = get_exec().features
+        if not features.enable_fp6_lm_head:
+            return
+        if not self.pp_group.is_last_rank or self.config.tie_word_embeddings:
+            return
+        if features.enable_nvfp4_draft_lm_head:
+            logger.warning(
+                "--enable-fp6-lm-head is not supported together with "
+                "--enable-nvfp4-draft-lm-head; keeping the BF16 head"
+            )
+            return
+        if features.enable_fp32_lm_head:
+            logger.warning(
+                "--enable-fp6-lm-head does not support FP32 logits; "
+                "keeping the BF16 head"
+            )
+            return
+        if quantize_lm_head_to_fp6_b32(self.lm_head):
+            logger.info(
+                "Quantized lm_head to FP6 e2m3 codes with 32x32 block FP32 scales"
+            )
 
     def precompile_kernels_after_loading(self) -> None:
         from sglang.srt.layers.quantization.unquant import precompile_splitk_tactics

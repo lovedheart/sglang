@@ -49,6 +49,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.fp6_lm_head import fp6_lm_head_apply
 from sglang.srt.layers.fp8_lm_head import fp8_blockwise_lm_head_apply
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
@@ -1211,6 +1212,11 @@ class LogitsProcessor(nn.Module):
             logits = lm_head(hidden_states)
         elif should_apply_lm_head_quant_method(lm_head, quant_method):
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
+        elif getattr(lm_head, "fp6_b32_packed", False):
+            # Load-time packed FP6-e2m3 head (--enable-fp6-lm-head, SM120).
+            # Checked before the weight branch: the packed head has no dense
+            # weight tensor.
+            logits = fp6_lm_head_apply(lm_head, hidden_states, bias=embedding_bias)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
             if lm_head.weight.dtype == torch.float8_e4m3fn:
