@@ -1382,27 +1382,22 @@ class LogitsProcessor(nn.Module):
         elif should_apply_lm_head_quant_method(lm_head, quant_method):
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif getattr(lm_head, "fp6_b32_packed", False):
-            # Load-time packed FP6-e2m3 head (--enable-fp6-lm-head, SM120).
+            # Load-time packed FP6-e2m3 head (--lm-head-dtype fp6_e2m3,
+            # SM120).
             # Checked before the weight branch: the packed head has no dense
             # weight tensor.
             logits = fp6_lm_head_apply(lm_head, hidden_states, bias=embedding_bias)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
             if lm_head.weight.dtype == torch.float8_e4m3fn:
-                # Load-time block-quantized head (--enable-fp8-lm-head, SM120)
+                # Load-time block-quantized head (--lm-head-dtype fp8_e4m3 /
+                # fp8_e3m4 via weight declaration, SM120)
                 logits = fp8_blockwise_lm_head_apply(
                     lm_head, hidden_states, bias=embedding_bias
                 )
             elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
             else:
-<<<<<<< HEAD
-                lhs = hidden_states.to(lm_head.weight.dtype)
-                if out is not None and out.dtype == lm_head.weight.dtype:
-                    logits = torch.matmul(lhs, lm_head.weight.T, out=out)
-                else:
-                    logits = torch.matmul(lhs, lm_head.weight.T)
-=======
                 if out is not None and out.shape != (
                     hidden_states.shape[0],
                     lm_head.weight.shape[0],
@@ -1445,7 +1440,6 @@ class LogitsProcessor(nn.Module):
                     logits = torch.matmul(
                         hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
                     )
->>>>>>> 32be73c706 (SM120: admit arch in fp8 indexer guard; flag-gated FP8 LM head)
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models

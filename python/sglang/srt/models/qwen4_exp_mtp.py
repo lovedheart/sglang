@@ -19,13 +19,8 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
-<<<<<<< HEAD
-from sglang.srt.runtime_context import get_model, get_parallel
-from sglang.srt.utils import is_npu
-=======
 from sglang.srt.runtime_context import get_exec, get_model, get_parallel
 from sglang.srt.utils import is_npu
->>>>>>> 33e6b28fe9 (QSA prefill retune; small-M split-K arm; NVFP4 W4A16 draft lm_head)
 
 logger = logging.getLogger(__name__)
 
