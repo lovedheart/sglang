@@ -12,8 +12,6 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from torch import nn
-
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
@@ -40,8 +38,6 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.fp6_lm_head import quantize_lm_head_to_fp6_b32
-from sglang.srt.layers.fp8_lm_head import quantize_lm_head_to_fp8_block128
 from sglang.srt.layers.fp8_shared_expert import (
     quantize_shared_experts_fp8_block128,
 )
@@ -60,6 +56,10 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.lm_head_quant import (
+    lm_head_block_size,
+    quantize_lm_head,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
@@ -113,6 +113,7 @@ from sglang.srt.runtime_context import (
     linear_attn_parallel_group,
 )
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
+from torch import nn
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
@@ -2695,8 +2696,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
 
-        self._maybe_quantize_lm_head_fp8_blockwise()
-        self._maybe_quantize_lm_head_fp6()
+        self._maybe_quantize_lm_head()
         if get_exec().features.enable_fp8_shared_expert:
             n = quantize_shared_experts_fp8_block128(self)
             if n:
@@ -2723,41 +2723,41 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         return loaded_params
 
-    def _maybe_quantize_lm_head_fp8_blockwise(self) -> None:
+    def _maybe_quantize_lm_head(self) -> None:
         # One-shot swap at load time, never lazy: the decode CUDA graphs must
         # capture the final head form. The NEXTN draft shares this module via
         # set_lm_head_from_target, so quantizing here covers both runners.
-        if not get_exec().features.enable_fp8_lm_head:
-            return
-        if not self.pp_group.is_last_rank or self.config.tie_word_embeddings:
-            return
-        if quantize_lm_head_to_fp8_block128(self.lm_head):
-            logger.info("Quantized lm_head to FP8 e4m3 with 128x128 block scales")
-
-    def _maybe_quantize_lm_head_fp6(self) -> None:
-        # Same one-shot-at-load contract as the fp8 head. The packed head
-        # drops the bf16 weight, so it must not coexist with the NVFP4 draft
-        # head (built from the target's dense weight) or FP32 logits.
         features = get_exec().features
-        if not features.enable_fp6_lm_head:
+        dtype = features.lm_head_dtype
+        if dtype == "bf16":
             return
         if not self.pp_group.is_last_rank or self.config.tie_word_embeddings:
             return
-        if features.enable_nvfp4_draft_lm_head:
+        # The packed formats own the lm_head apply path and cannot serve FP32
+        # logits. (The NVFP4 draft head copies the *dense* weight, so it is
+        # checked below only for formats that drop it.)
+        if features.enable_fp32_lm_head:
             logger.warning(
-                "--enable-fp6-lm-head is not supported together with "
+                "--lm-head-dtype %s does not support FP32 logits; keeping the "
+                "BF16 head",
+                dtype,
+            )
+            return
+        if dtype == "fp6_e2m3" and features.enable_nvfp4_draft_lm_head:
+            # fp6_e2m3 releases the dense weight the draft copy is built from;
+            # the fp8 formats keep an fp8 container the draft path ignores.
+            logger.warning(
+                "--lm-head-dtype fp6_e2m3 is not supported together with "
                 "--enable-nvfp4-draft-lm-head; keeping the BF16 head"
             )
             return
-        if features.enable_fp32_lm_head:
-            logger.warning(
-                "--enable-fp6-lm-head does not support FP32 logits; "
-                "keeping the BF16 head"
-            )
-            return
-        if quantize_lm_head_to_fp6_b32(self.lm_head):
+        if quantize_lm_head(self.lm_head, dtype):
+            blk = lm_head_block_size(dtype)
             logger.info(
-                "Quantized lm_head to FP6 e2m3 codes with 32x32 block FP32 scales"
+                "Quantized lm_head to %s codes with %dx%d block scales",
+                dtype,
+                blk,
+                blk,
             )
 
     def precompile_kernels_after_loading(self) -> None:

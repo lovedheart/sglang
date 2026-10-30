@@ -1213,14 +1213,16 @@ class LogitsProcessor(nn.Module):
         elif should_apply_lm_head_quant_method(lm_head, quant_method):
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif getattr(lm_head, "fp6_b32_packed", False):
-            # Load-time packed FP6-e2m3 head (--enable-fp6-lm-head, SM120).
+            # Load-time packed FP6-e2m3 head (--lm-head-dtype fp6_e2m3,
+            # SM120).
             # Checked before the weight branch: the packed head has no dense
             # weight tensor.
             logits = fp6_lm_head_apply(lm_head, hidden_states, bias=embedding_bias)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
             if lm_head.weight.dtype == torch.float8_e4m3fn:
-                # Load-time block-quantized head (--enable-fp8-lm-head, SM120)
+                # Load-time block-quantized head (--lm-head-dtype fp8_e4m3 /
+                # fp8_e3m4 via weight declaration, SM120)
                 logits = fp8_blockwise_lm_head_apply(
                     lm_head, hidden_states, bias=embedding_bias
                 )
