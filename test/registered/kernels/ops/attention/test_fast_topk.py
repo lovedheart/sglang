@@ -4,12 +4,8 @@ import torch
 from sglang.kernels.ops.attention.fast_topk import fast_topk
 from sglang.test.ci.ci_register import register_cuda_ci
 
-<<<<<<< HEAD
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
-=======
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
->>>>>>> 0511acd92d (QSA: compressed-K HiCache sidecar, fused NVFP4 sparse-decode, test ports)
 
 
 def _check_topk_values(score, lengths, indices, topk, row_starts):
