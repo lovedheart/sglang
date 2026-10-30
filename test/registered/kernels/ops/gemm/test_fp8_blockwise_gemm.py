@@ -135,5 +135,102 @@ def test_warp_arm_stability(M, N, K, out_dtype):
     assert torch.equal(out2.view(torch.uint16), first.view(torch.uint16))
 
 
+# The fused activation-quant kernel (SGLANG_ENABLE_SM120_FUSED_ACT_QUANT)
+# replaces quant + warp + reduce on the band below. It computes the same
+# e4m3 bytes, the same scale formula (amax_c * 1/448) and the same split-K
+# partials, so outputs must be bit-identical -- a tolerance test would not
+# catch a scale-math drift that only shows up on rare activations.
+@pytest.mark.skipif(
+    not is_sm120_supported(), reason="fp8_blockwise_scaled_mm requires SM120 (>= 12.0)"
+)
+@pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (1, 2560, 6144),
+        (5, 6144, 2560),
+        (8, 512, 2560),
+        (4, 4096, 4096),  # pr shape -> TM8/WN16 instantiation
+        (12, 2560, 4096),  # 9 <= m <= 16 narrow -> TM16/WN32
+    ],
+)
+def test_fused_act_quant_bit_identical(M, N, K):
+    from sglang.kernels.ops.gemm.fp8_blockwise_gemm import (
+        sm120_fp8_blockwise_fused_act_supported,
+        sm120_fp8_blockwise_warp_fused_act,
+    )
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8_row_padded,
+    )
+
+    device = "cuda"
+    torch.manual_seed(M * 7 + N + K)
+    x = (torch.randn(M, K, device=device, dtype=torch.float32) * 3).to(torch.bfloat16)
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    b = ((torch.rand(N, K, device=device) - 0.5) * 2 * fp8_max).to(torch.float8_e4m3fn)
+    scale_b = torch.exp2(
+        torch.randint(-4, 4, (N // 128, K // 128), device=device).float()
+    )
+    assert sm120_fp8_blockwise_fused_act_supported(x, b, scale_b)
+
+    def two_kernel():
+        xq, xs = sglang_per_token_group_quant_fp8_row_padded(x, 128)
+        return fp8_blockwise_scaled_mm(xq, b.t(), xs, scale_b.t(), torch.bfloat16)[:M]
+
+    ref = two_kernel()
+    out = sm120_fp8_blockwise_warp_fused_act(x, b, scale_b, torch.bfloat16)
+    assert torch.equal(out, ref)
+
+    # Serving runs this inside CUDA graphs: capture, replay, and compare
+    # against the eager fused result.
+    for _ in range(3):
+        sm120_fp8_blockwise_warp_fused_act(x, b, scale_b, torch.bfloat16)
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        sm120_fp8_blockwise_warp_fused_act(x, b, scale_b, torch.bfloat16)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = sm120_fp8_blockwise_warp_fused_act(x, b, scale_b, torch.bfloat16)
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, out)
+
+
+@pytest.mark.skipif(
+    not is_sm120_supported(), reason="fp8_blockwise_scaled_mm requires SM120 (>= 12.0)"
+)
+def test_fused_act_quant_gate_band():
+    from sglang.kernels.ops.gemm.fp8_blockwise_gemm import (
+        sm120_fp8_blockwise_fused_act_supported,
+    )
+    from sglang.srt.environ import envs
+
+    b = torch.zeros(2560, 2560, device="cuda", dtype=torch.float8_e4m3fn)
+    scale_b = torch.ones(20, 20, device="cuda", dtype=torch.float32)
+    x = torch.randn(4, 2560, device="cuda", dtype=torch.bfloat16)
+    assert sm120_fp8_blockwise_fused_act_supported(x, b, scale_b)
+    assert not sm120_fp8_blockwise_fused_act_supported(x[:0], b, scale_b)
+    # Above the decode band the two-kernel pipeline stays in charge.
+    assert not sm120_fp8_blockwise_fused_act_supported(
+        torch.randn(17, 2560, device="cuda", dtype=torch.bfloat16), b, scale_b
+    )
+    # K beyond the warp kernel's 8192 limit.
+    wide_b = torch.zeros(2560, 8320, device="cuda", dtype=torch.float8_e4m3fn)
+    wide_scale = torch.ones(20, 65, device="cuda", dtype=torch.float32)
+    assert not sm120_fp8_blockwise_fused_act_supported(
+        torch.randn(4, 8320, device="cuda", dtype=torch.bfloat16), wide_b, wide_scale
+    )
+    # Non-contiguous activations.
+    wide_x = torch.randn(4, 5120, device="cuda", dtype=torch.bfloat16)
+    assert not sm120_fp8_blockwise_fused_act_supported(
+        wide_x[:, :2560], b, scale_b
+    )
+    with envs.SGLANG_ENABLE_SM120_FUSED_ACT_QUANT.override(False):
+        assert not sm120_fp8_blockwise_fused_act_supported(x, b, scale_b)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
