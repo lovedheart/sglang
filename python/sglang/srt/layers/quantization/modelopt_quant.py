@@ -2866,6 +2866,50 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 ratio * _amax(getattr(layer, "w2_input_scale", None))
             )
 
+    def _prepare_sm12x_w4a8_weights(self, layer: torch.nn.Module) -> None:
+        """Prepare raw checkpoint FP4 weights for the SM12x W4A8 kernel.
+
+        Same packed FP4 payload as the W4A16 arm, but the Triton W4A8 kernel
+        indexes the block scales in the raw ``[E, rows, K/16]`` row-major
+        layout (it decodes FP4 + scale in registers, so no 128x4 swizzle) and
+        takes the gate and up global scales separately on GEMM1 — the kernel
+        applies them inside the activation, so ``w2_weight_scale_2`` stays the
+        raw GEMM2 scale (no gate/up ratio fold, unlike
+        ``_sm12x_global_scales``).
+        """
+        assert layer.moe_runner_config.is_gated, (
+            "sm12x_nvfp4_w4a8 requires a gated MLP (the kernel splits the W13 "
+            "rows into a gate and an up half)"
+        )
+        w13 = layer.w13_weight_scale_2.to(torch.float32)
+        if w13.dim() > 1 and w13.shape[-1] >= 2:
+            gate_gs = w13[..., 0]
+            up_gs = w13[..., 1]
+        else:
+            gate_gs = up_gs = w13.reshape(-1)
+        # A checkpoint that stores only one half's global scale (a zero gate
+        # entry) keeps the other half's, so the gate is not silently zeroed
+        # (same rule as _sm12x_global_scales).
+        gate_gs = torch.where(gate_gs > 0, gate_gs, up_gs)
+
+        def _expert_vec(t: torch.Tensor) -> torch.Tensor:
+            t = t.to(torch.float32).reshape(-1)
+            return t.expand(w13.shape[0]) if t.numel() == 1 else t
+
+        copy_or_rebind_param(
+            layer, "w13_weight_scale_2", torch.stack([gate_gs, up_gs], dim=1)
+        )
+        copy_or_rebind_param(
+            layer, "w2_weight_scale_2", _expert_vec(layer.w2_weight_scale_2)
+        )
+        # The kernel reads the unswizzled scales from w*_weight_scale, so free
+        # the swizzled placeholders that create_weights pre-allocated for the
+        # FlashInfer paths (~157 MB per layer).
+        if getattr(layer, "w13_blockscale_swizzled", None) is not None:
+            layer.w13_blockscale_swizzled = None
+        if getattr(layer, "w2_blockscale_swizzled", None) is not None:
+            layer.w2_blockscale_swizzled = None
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
@@ -2894,6 +2938,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         use_nvfp4_dispatch = _use_nvfp4_dispatch()
         if moe_runner_backend.is_sm12x_nvfp4_bf16():
             self._prepare_sm12x_w4a16_weights(layer)
+            return
+        if moe_runner_backend.is_sm12x_nvfp4_w4a8():
+            self._prepare_sm12x_w4a8_weights(layer)
             return
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
@@ -3306,6 +3353,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
             import sglang.srt.layers.moe.moe_runner.sm12x_nvfp4_bf16  # noqa: F401 – triggers @register_fused_func
 
+        if moe_runner_backend.is_sm12x_nvfp4_w4a8():
+            if get_device_capability()[0] != 12:
+                raise NotImplementedError(
+                    "--moe-runner-backend sm12x_nvfp4_w4a8 supports only "
+                    "SM120/SM121 (Blackwell GeForce / RTX PRO) GPUs."
+                )
+            import sglang.srt.layers.moe.moe_runner.sm12x_nvfp4_w4a8  # noqa: F401 – triggers @register_fused_func
+
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
 
@@ -3417,6 +3472,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w2_gs=layer.w2_weight_scale_2.data,
                 a13_gs=getattr(layer, "w4a4_a13_gs", None),
                 a2_gs=getattr(layer, "w4a4_a2_gs", None),
+            )
+            return self.runner.run(dispatch_output, quant_info)
+
+        if moe_runner_backend.is_sm12x_nvfp4_w4a8():
+            from sglang.srt.layers.moe.moe_runner.sm12x_nvfp4_w4a8 import (
+                Sm12xNvfp4W4A8MoeQuantInfo,
+            )
+
+            if getattr(layer, "expert_map", None) is not None:
+                raise NotImplementedError(
+                    "sm12x_nvfp4_w4a8 does not support expert-parallel "
+                    "expert_map remapping yet."
+                )
+            quant_info = Sm12xNvfp4W4A8MoeQuantInfo(
+                w13=layer.w13_weight.data,
+                w13_sf=layer.w13_weight_scale.data,
+                w13_gs=layer.w13_weight_scale_2.data,
+                w2=layer.w2_weight.data,
+                w2_sf=layer.w2_weight_scale.data,
+                w2_gs=layer.w2_weight_scale_2.data,
             )
             return self.runner.run(dispatch_output, quant_info)
 
