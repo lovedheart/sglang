@@ -588,5 +588,8 @@ POSITIONAL_FIELD_ORDER = (
     "shortest_prefill_boundary_decay_start_chunks",
     "shortest_prefill_budget_min_ratio",
     "shortest_prefill_budget_doubling_chunks",
+    "enable_qsa_kv_offload",
+    "qsa_kv_offload_host_size",
+    "qsa_kv_offload_hot_blocks",
 )
 # fmt: on
