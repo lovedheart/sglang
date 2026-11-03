@@ -1812,7 +1812,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             metadata = self._resolve_metadata(forward_batch)
             rows = offload.new_token_rows(
                 row_seq_lens=metadata.sequence_lengths,
-                row_req=self._row_requests(forward_batch=forward_batch, metadata=metadata),
+                row_req=self._row_requests(
+                    forward_batch=forward_batch, metadata=metadata
+                ),
             )
         else:
             rows = offload.extend_rows(forward_batch.out_cache_loc.numel())
@@ -2987,7 +2989,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             k_buffer=k_buffer,
             v_buffer=v_buffer,
             slot_table=self.req_to_token_pool.req_to_token,
-            row_requests=self._row_requests(forward_batch=forward_batch, metadata=metadata),
+            row_requests=self._row_requests(
+                forward_batch=forward_batch, metadata=metadata
+            ),
             sequence_lengths=metadata.sequence_lengths,
         )
 
