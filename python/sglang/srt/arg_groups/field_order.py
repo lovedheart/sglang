@@ -584,5 +584,8 @@ POSITIONAL_FIELD_ORDER = (
     "watermark_skip_first_ngram_calls",
     "cuda_graph_persistence",
     "cuda_graph_persistence_config",
+    "enable_qsa_kv_offload",
+    "qsa_kv_offload_host_size",
+    "qsa_kv_offload_hot_blocks",
 )
 # fmt: on
