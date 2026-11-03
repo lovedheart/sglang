@@ -593,5 +593,8 @@ POSITIONAL_FIELD_ORDER = (
     "inkling2_loop_num_passes",
     "inkling2_loop_share_cache",
     "inkling2_tool_call_author_name_mode",
+    "enable_qsa_kv_offload",
+    "qsa_kv_offload_host_size",
+    "qsa_kv_offload_hot_blocks",
 )
 # fmt: on
