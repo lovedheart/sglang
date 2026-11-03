@@ -574,5 +574,8 @@ POSITIONAL_FIELD_ORDER = (
     "disaggregation_max_top_logprobs_num",
     "shortest_prefill_aging_factor",
     "enable_token_space_processor",
+    "enable_qsa_kv_offload",
+    "qsa_kv_offload_host_size",
+    "qsa_kv_offload_hot_blocks",
 )
 # fmt: on
