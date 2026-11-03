@@ -1702,7 +1702,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         if mode.is_decode() or self._is_speculative_paged_mode(mode):
             metadata = self._resolve_metadata(forward_batch)
             rows = offload.new_token_rows(
-                metadata.sequence_lengths, self._row_requests(forward_batch, metadata)
+                row_seq_lens=metadata.sequence_lengths,
+                row_req=self._row_requests(forward_batch=forward_batch, metadata=metadata),
             )
         else:
             rows = offload.extend_rows(forward_batch.out_cache_loc.numel())
@@ -1713,15 +1714,17 @@ class QwenSparseAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
             offload.mirror(
-                layer_idx,
-                rows,
-                forward_batch.out_cache_loc,
-                pool.full_kv_pool.k_buffer[layer_idx],
-                pool.full_kv_pool.v_buffer[layer_idx],
+                layer_idx=layer_idx,
+                rows=rows,
+                loc=forward_batch.out_cache_loc,
+                pool_k=pool.full_kv_pool.k_buffer[layer_idx],
+                pool_v=pool.full_kv_pool.v_buffer[layer_idx],
             )
             return
         self.kv_layers.layer(layer.layer_id).store(layer, rows, k, v)
-        offload.write_through(layer_idx, rows, forward_batch.out_cache_loc)
+        offload.write_through(
+            layer_idx=layer_idx, rows=rows, loc=forward_batch.out_cache_loc
+        )
 
     def _gather_offloaded_context(
         self,
@@ -1750,7 +1753,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         pool = self.token_to_kv_pool
         offload = self._kv_offload
         layer_idx = pool._transfer_full_attention_id(layer.layer_id)
-        k, v = offload.gather_context(layer_idx, slots)
+        k, v = offload.gather_context(layer_idx=layer_idx, slots=slots)
         pool_k = pool.layer_router.read(layer.layer_id).key()
         pool_v = pool.layer_router.read(layer.layer_id).value()
         packed = (
@@ -1768,7 +1771,12 @@ class QwenSparseAttnBackend(AttentionBackend):
                 max_k=int(sequence_lens.max()),
                 output_dtype=output_dtype,
             )
-            offload.check("prefill context", layer_idx, packed, expected)
+            offload.check(
+                what="prefill context",
+                layer_idx=layer_idx,
+                actual=packed,
+                expected=expected,
+            )
         return packed
 
     def _forward_offloaded_attention(
@@ -1782,10 +1790,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         positions = self._expand_block_indices(topk_indices, metadata)
         num_rows, width = positions.shape
         rows = offload.resolve_rows(
-            layer_idx,
-            positions,
-            metadata.sequence_lengths,
-            self._row_requests(forward_batch, metadata),
+            layer_idx=layer_idx,
+            positions=positions,
+            row_seq_lens=metadata.sequence_lengths,
+            row_req=self._row_requests(forward_batch=forward_batch, metadata=metadata),
             rows_per_request=num_rows // forward_batch.batch_size,
         )
         # Valid positions lead each row, so column ids keep the packing order.
@@ -1804,16 +1812,27 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         if offload.verify:
             reference = self._pool_gather_source(
-                pool_k, pool_v, forward_batch, metadata
+                k_buffer=pool_k,
+                v_buffer=pool_v,
+                forward_batch=forward_batch,
+                metadata=metadata,
             )
             offload.check(
-                "decode gather",
-                layer_idx,
-                _pack_gathered_kv(source, indices),
-                _pack_gathered_kv(reference, positions.to(torch.int32).contiguous()),
+                what="decode gather",
+                layer_idx=layer_idx,
+                actual=_pack_gathered_kv(source=source, indices=indices),
+                expected=_pack_gathered_kv(
+                    source=reference,
+                    indices=positions.to(torch.int32).contiguous(),
+                ),
             )
         return self._forward_gathered_attention(
-            q, layer, forward_batch, metadata, indices, source
+            q=q,
+            layer=layer,
+            forward_batch=forward_batch,
+            metadata=metadata,
+            topk_indices=indices,
+            source=source,
         )
 
     @staticmethod
@@ -1938,7 +1957,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             metadata,
             indices.to(torch.int32).contiguous(),
             trtllm_decode,
-            self._pool_gather_source(kc, vc, forward_batch, metadata),
+            self._pool_gather_source(
+                k_buffer=kc, v_buffer=vc, forward_batch=forward_batch, metadata=metadata
+            ),
             new_kv=(k, v, loc, width),
         )
 
@@ -1967,7 +1988,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             if fused_output is not None:
                 return fused_output
-            self._store_kv(layer, forward_batch, k, v)
+            self._store_kv(layer=layer, forward_batch=forward_batch, k=k, v=v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
         num_valid_rows = topk_indices.shape[0]
@@ -2044,10 +2065,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         if self._kv_offload is not None:
             packed_k, packed_v = self._gather_offloaded_context(
-                layer,
-                forward_batch,
-                sequence_lens_tensor,
-                cu_seqlens_k,
+                layer=layer,
+                forward_batch=forward_batch,
+                sequence_lens=sequence_lens_tensor,
+                cu_seqlens_k=cu_seqlens_k,
                 total_k=total_context,
                 output_dtype=q.dtype,
             )
@@ -2672,7 +2693,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             if fused_output is not None:
                 return fused_output
-            self._store_kv(layer, forward_batch, k, v)
+            self._store_kv(layer=layer, forward_batch=forward_batch, k=k, v=v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
@@ -2701,7 +2722,7 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if self._kv_offload is not None:
             return self._forward_offloaded_attention(
-                q, layer, forward_batch, topk_indices
+                q=q, layer=layer, forward_batch=forward_batch, topk_indices=topk_indices
             )
         pool = self.token_to_kv_pool
         k_buffer = pool.layer_router.read(layer.layer_id).key()
@@ -2727,12 +2748,17 @@ class QwenSparseAttnBackend(AttentionBackend):
             output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
             return output.reshape(q.shape[0], -1)
         return self._forward_gathered_attention(
-            q,
-            layer,
-            forward_batch,
-            metadata,
-            topk_indices,
-            self._pool_gather_source(k_buffer, v_buffer, forward_batch, metadata),
+            q=q,
+            layer=layer,
+            forward_batch=forward_batch,
+            metadata=metadata,
+            topk_indices=topk_indices,
+            source=self._pool_gather_source(
+                k_buffer=k_buffer,
+                v_buffer=v_buffer,
+                forward_batch=forward_batch,
+                metadata=metadata,
+            ),
         )
 
     def _pool_gather_source(
@@ -2742,7 +2768,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             k_buffer=k_buffer,
             v_buffer=v_buffer,
             slot_table=self.req_to_token_pool.req_to_token,
-            row_requests=self._row_requests(forward_batch, metadata),
+            row_requests=self._row_requests(forward_batch=forward_batch, metadata=metadata),
             sequence_lengths=metadata.sequence_lengths,
         )
 
