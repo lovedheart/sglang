@@ -570,5 +570,8 @@ POSITIONAL_FIELD_ORDER = (
     "layernorm_sp_min_tokens",
     "paged_experts_host_memory_gb",
     "_max_running_requests_explicitly_set",
+    "enable_qsa_kv_offload",
+    "qsa_kv_offload_host_size",
+    "qsa_kv_offload_hot_blocks",
 )
 # fmt: on
