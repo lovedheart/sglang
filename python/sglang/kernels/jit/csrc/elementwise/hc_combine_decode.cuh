@@ -20,7 +20,8 @@ struct HcCombineDecode {
         .output = nullptr,
         .partials = static_cast<float*>(partials.data_ptr())};
     LaunchKernel(dim3(m.unwrap(), 32, 1), 32, dev.unwrap())
-        .enable_pdl(true)(hc_combine_gate_kernel<4, 2560, true, bf16_t>, params);
+        // kFoldNorm=false: the gate reads the materialized normed residual.
+        .enable_pdl(true)(hc_combine_gate_kernel<4, 2560, true, false, bf16_t>, params);
   }
   static void apply(
       tvm::ffi::TensorView block,

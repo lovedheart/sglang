@@ -34,6 +34,22 @@ def _hc_gate_stream(device: int) -> torch.cuda.Stream:
     return torch.cuda.Stream(device=device)
 
 
+@lru_cache(None)
+def _hc_decode_fusion_enabled() -> bool:
+    """Gate the split-gate/apply decode fusion (side-stream gate).
+
+    The kernels are plain CUDA warp code (no tcgen05), so they run on the
+    consumer Blackwell (sm_120) family too; they were tuned on sm_100.
+    Enabled on both by default; SGLANG_HC_DECODE_FUSION=0 disables it
+    everywhere and restores the stock two-kernel combine.
+    """
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_HC_DECODE_FUSION.get():
+        return False
+    return torch.cuda.get_device_capability()[0] in (10, 12)
+
+
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
     hc_count: int = 4
     hidden_size: int = 64
@@ -214,7 +230,7 @@ class GatedResidual(HyperConnectionBase):
                 and config.hc_per_branch_norm
                 and config.params_dtype == torch.bfloat16
                 and torch.cuda.is_available()
-                and torch.cuda.get_device_capability()[0] == 10
+                and _hc_decode_fusion_enabled()
             ):
                 # Create before graph capture; all layers on a device share it.
                 self._gate_stream = _hc_gate_stream(torch.cuda.current_device())
