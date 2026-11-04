@@ -387,6 +387,10 @@ class Envs:
     # projections (TileKernels-style), so the normed residual is never
     # materialized; the per-branch rsqrt factors ride on the mix partials.
     SGLANG_HC_NORM_FOLD = EnvBool(False)
+    # Run the HC decode gate (inject-weight dot) on a side stream during mix
+    # and finish combine with the apply-only kernel, hiding the gate behind
+    # attention. sm_100/sm_120 only; 0 restores the stock combine path.
+    SGLANG_HC_DECODE_FUSION = EnvBool(True)
     # --ple-offload-backend file: where the sparse, file-backed PLE table lives
     # (deterministic name, reused across restarts), whether prefill-sized
     # gathers hint the page cache first, and an escape hatch for the device
