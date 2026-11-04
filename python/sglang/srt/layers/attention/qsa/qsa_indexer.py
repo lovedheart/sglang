@@ -638,19 +638,29 @@ class QSAIndexer(MultiPlatformOp):
             and self.block_topk == 512
             and not is_batch_invariant_mode_enabled()
         )
-        logits = qsa_mqa_decode(
+        from sglang.srt.environ import envs
+
+        # Fused scorer epilogue: the tilelang decode kernel atomically counts
+        # each row's fp16-ordered high-byte bins while writing logits, so the
+        # top-k refine skips its own stage-1 row scan entirely.
+        fused_hist = use_fast_topk and envs.SGLANG_QSA_FUSED_TOPK_HIST.get()
+        decode_out = qsa_mqa_decode(
             q,
             compressed_cache,
             compressed_page_table,
             compressed_lengths,
             max_model_len,
             min_scored_len=self.block_topk if use_fast_topk else 0,
+            fused_hist=fused_hist,
         )
+        logits, coarse_hist = decode_out if fused_hist else (decode_out, None)
         if use_fast_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
-            from sglang.kernels.ops.attention.fast_topk import fast_topk
-            from sglang.srt.environ import envs
+            from sglang.kernels.ops.attention.fast_topk import (
+                fast_topk,
+                fast_topk_refine_from_hist,
+            )
             from sglang.srt.layers.attention.qsa.kernel import (
                 _sort_qsa_topk_indices,
             )
@@ -658,14 +668,26 @@ class QSAIndexer(MultiPlatformOp):
             # Fold the determinism sort into the expand kernel below (one
             # launch instead of the five-launch torch.sort chain); when the
             # env kill-switch is off the fold is off and behavior matches
-            # SORT_TOPK=0 exactly.
-            fold_sort = envs.SGLANG_QSA_SORT_TOPK.get()
-            topk_indices = fast_topk(
-                logits,
-                compressed_lengths.to(torch.int32),
-                topk=self.block_topk,
-                row_starts=None,
-            )
+            # SORT_TOPK=0 exactly.  The fold is the cheap side of the trade:
+            # fast_topk_v2's sorted deposit costs 2-6us/layer more than this
+            # kernel's bitonic, so SGLANG_QSA_SORTED_TOPK defaults off and the
+            # row arrives here in atomic order.
+            fold_sort = envs.SGLANG_QSA_SORT_TOPK.get() and not envs.SGLANG_QSA_SORTED_TOPK.get()
+            lengths_i32 = compressed_lengths.to(torch.int32)
+            if fused_hist:
+                topk_indices = fast_topk_refine_from_hist(
+                    logits,
+                    lengths_i32,
+                    coarse_hist.to(torch.uint32),
+                    topk=self.block_topk,
+                )
+            else:
+                topk_indices = fast_topk(
+                    logits,
+                    lengths_i32,
+                    topk=self.block_topk,
+                    row_starts=None,
+                )
             block_indices = (
                 topk_indices if fold_sort else _sort_qsa_topk_indices(topk_indices)
             )

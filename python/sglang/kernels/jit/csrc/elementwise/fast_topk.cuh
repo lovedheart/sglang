@@ -271,6 +271,15 @@ __global__ __launch_bounds__(fast_topk_detail::kThreadsPerBlock) void fast_topk_
   if (length <= kTopK) {
     naive_topk<kTopK>(indice, length);
   } else {
+    // Pre-fill the tail: radix_select_topk writes only the strictly-greater
+    // winners plus the tie deposit, so slots beyond the final s_counter keep
+    // whatever the buffer held. Under eager allocation torch's new_empty fill
+    // hides that, but a CUDA-graph replay reuses the same buffer and would
+    // otherwise return the previous replay's tail indices.
+    for (int i = threadIdx.x; i < kTopK; i += kThreadsPerBlock) {
+      indice[i] = -1;
+    }
+    __syncthreads();
     radix_select_topk<kTopK>(score, indice, row_start, length);
   }
 

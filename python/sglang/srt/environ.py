@@ -349,6 +349,21 @@ class Envs:
     # top-k kernels emit slots in atomic order; sparse attention merges in
     # list order, making logits run-dependent).  0 keeps the raw order.
     SGLANG_QSA_SORT_TOPK = EnvBool(True)
+    # Fold the selection into the radix-select deposit so fast_topk emits its
+    # row already sorted descending (ascending index rank inside a tie bin,
+    # matching torch.topk's tie convention) with -1 padding last.  Measured
+    # cost 2-6us/layer at decode shapes vs ~0.5us for the expand kernel's own
+    # sort fold, and no consumer reads the raw slot order (attention masks
+    # per element; expand only needs valid-before-padding, which the fold
+    # restores), so this defaults OFF and select_decode_tokens folds in
+    # expand instead.  1 moves the sort back into fast_topk's deposit.
+    SGLANG_QSA_SORTED_TOPK = EnvBool(False)
+    # Fuse the top-k's stage-1 coarse histogram into the QSA decode scorer's
+    # epilogue: each scored logit atomically bumps its row's 256-bin fp16-
+    # ordered high-byte count, so the selection kernel refines straight from
+    # those counts and never rescans the logits for stage 1.  Opt-in until
+    # measured end to end; only applies when the tilelang decode scorer runs.
+    SGLANG_QSA_FUSED_TOPK_HIST = EnvBool(False)
     # Feed the QSA sparse-attention paged decode kernel fp8 scratch instead of
     # widening KV to the query dtype first.  On an fp8_e4m3 pool the cast to
     # bf16 is exact (scale 1.0), so this only switches the kernel to its

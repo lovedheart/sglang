@@ -531,6 +531,7 @@ if HAS_TILELANG:
         min_scored_len: int = 0,
         threads: int = 128,
         dtype: str = "bfloat16",
+        fused_hist: bool = False,
     ):
         # The MMA layout needs 64 GEMM rows; a compressed page has full_page // ratio,
         # so pages are packed as sub-pages of one 64-row tile.
@@ -549,6 +550,7 @@ if HAS_TILELANG:
             PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
             ContextLens: T.Tensor([batch], T.int32),  # type: ignore
             Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
+            Hist: T.Tensor([batch, 256], T.int32),  # type: ignore
             Scale: T.float32,
         ):
             # A fixed number of CTAs per row strides over that row's groups, so the
@@ -598,7 +600,20 @@ if HAS_TILELANG:
                             for token in T.Parallel(GROUP):
                                 position = group * GROUP + token
                                 if position < context_len:
-                                    Logits[bx, position] = reduced[token] / Scale
+                                    v = reduced[token] / Scale
+                                    Logits[bx, position] = v
+                                    if fused_hist:
+                                        # Coarse stage-1 histogram for the
+                                        # fused top-k: fp16-ordered high byte,
+                                        # the exact binning fast_topk's
+                                        # convert_to_uint8 would recompute.
+                                        h = T.reinterpret(
+                                            T.Cast("float16", v), T.uint16
+                                        )
+                                        key = T.if_then_else(
+                                            (h & 0x8000) != 0, ~h, h | 0x8000
+                                        )
+                                        T.atomic_add(Hist[bx, (key >> 8) & 0xFF], 1)
 
         return kernel
 
@@ -795,6 +810,7 @@ def tilelang_qsa_mqa_decode(
     score_scale: Optional[float] = None,
     *,
     min_scored_len: int = 0,
+    fused_hist: bool = False,
 ) -> torch.Tensor:
     """Validated TileLang paged decode kernel with weights removed.
 
@@ -846,6 +862,11 @@ def tilelang_qsa_mqa_decode(
             ],
             dim=1,
         )
+    hist = (
+        torch.zeros((q.shape[0], 256), dtype=torch.int32, device=q.device)
+        if fused_hist
+        else None
+    )
     _tilelang_qsa_mqa_decode_kernel(
         heads=kernel_heads,
         head_dim=head_dim,
@@ -853,14 +874,20 @@ def tilelang_qsa_mqa_decode(
         ctas_per_row=_decode_ctas_per_row(q.shape[0], q.device),
         min_scored_len=min_scored_len,
         dtype=_TILELANG_DTYPES[scoring_dtype],
+        fused_hist=fused_hist,
     )(
         q_kernel.unsqueeze(1).contiguous(),
         k_cache.to(scoring_dtype).contiguous(),
         page_table.to(device=q.device, dtype=torch.int32).contiguous(),
         context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
         logits,
+        # The kernel signature always carries the histogram; without the
+        # fused flag it stays an unused zero buffer the epilogue never hits.
+        hist if fused_hist else logits.new_zeros((q.shape[0], 256), dtype=torch.int32),
         float(score_scale or math.sqrt(head_dim)),
     )
+    if fused_hist:
+        return logits, hist
     return logits
 
 
@@ -909,6 +936,7 @@ def qsa_mqa_decode(
     score_scale: Optional[float] = None,
     *,
     min_scored_len: int = 0,
+    fused_hist: bool = False,
 ) -> torch.Tensor:
     page_size = int(k_cache.shape[1])
     can_tilelang = (
@@ -933,6 +961,7 @@ def qsa_mqa_decode(
             max_model_len,
             score_scale,
             min_scored_len=min_scored_len,
+            fused_hist=fused_hist,
         )
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale

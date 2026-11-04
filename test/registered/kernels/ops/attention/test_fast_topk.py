@@ -129,6 +129,30 @@ def test_fast_topk_negative_and_zero(topk):
     _check_topk_values(score, lengths, indices, topk, None)
 
 
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_fast_topk_wide_stride_short_rows(topk):
+    """Logits wider than each row (a max_model_len buffer with short context)
+    must not fall into the split path's identity pre-fill. pick_split keys on
+    the tensor width, so a wide-but-short row used to take the split route,
+    get an identity prefix from pass 1, and have refine skip it -- returning
+    0..k-1 instead of the real top-k. The refine now re-scores every row at or
+    below the split floor, so the selection matches torch.topk regardless of
+    how much padding trails the row."""
+    torch.manual_seed(0)
+    batch, length = 4, 1500
+    stride = 32768  # far larger than any row -> forces split>0 by width
+    score = torch.full(
+        (batch, stride), float("-inf"), dtype=torch.float32, device="cuda"
+    )
+    score[:, :length] = torch.randn(
+        batch, length, dtype=torch.float32, device="cuda"
+    )
+    lengths = torch.full((batch,), length, dtype=torch.int32, device="cuda")
+
+    indices = fast_topk(score, lengths, topk)
+    _check_topk_values(score, lengths, indices, topk, None)
+
+
 def test_fast_topk_unsupported_k():
     score = torch.randn(2, 4096, dtype=torch.float32, device="cuda")
     lengths = torch.full((2,), 4096, dtype=torch.int32, device="cuda")
