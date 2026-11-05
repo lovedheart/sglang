@@ -835,6 +835,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         mxfp8_config: Fp8Config,
         fp8_block_config: Fp8Config,
         mxfp8_linear_config: Optional[Fp8Config] = None,
+        fp3a16_config: Optional["ModelOptFp4Config"] = None,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
@@ -845,6 +846,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
         self.block_fp8_moe_online_config: Optional[QuantizationConfig] = None
+        # W3A16_NVFP4 (FP3) MoE layers; same shape family as the A16 configs.
+        self.fp3a16_config = fp3a16_config
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -916,6 +919,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if layer_info.get("quant_algo", "").upper() in (
                 "NVFP4",
                 "W4A16_NVFP4",
+                "W3A16_NVFP4",
             ):
                 group_size = layer_info.get("group_size", 16)
                 break
@@ -1030,6 +1034,24 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             group_size=group_size,
             use_per_token_activation=False,
         )
+        # FP3 W3A16 MoE: 3-bit NVFP4-codebook payload, BF16 activations. The
+        # quantizer stores raw uint8 sf bytes (bit0 = codebook mirror flag)
+        # plus an fp3_bridge descriptor; the sm12x_fp3_bf16 runner decodes
+        # them in-kernel, so nothing here swizzles or dequantizes.
+        fp3a16_config = None
+        if any(
+            layer_info.get("quant_algo", "").upper() == "W3A16_NVFP4"
+            for layer_info in quantized_layers.values()
+        ):
+            fp3a16_config = ModelOptFp4Config(
+                is_checkpoint_nvfp4_serialized=True,
+                kv_cache_quant_algo=kv_cache_quant_algo,
+                exclude_modules=[],
+                packed_modules_mapping=packed_modules_mapping,
+                group_size=group_size,
+                use_per_token_activation=False,
+            )
+            fp3a16_config.is_w3a16 = True
 
         return cls(
             kv_cache_quant_algo=kv_cache_quant_algo,
@@ -1042,6 +1064,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             mxfp8_linear_config=mxfp8_linear_config,
             nvfp4_config=nvfp4_config,
             nvfp4a16_config=nvfp4a16_config,
+            fp3a16_config=fp3a16_config,
         )
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
@@ -1194,6 +1217,14 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4a16_config)
+            if quant_algo == "W3A16_NVFP4":
+                if self.fp3a16_config is None:
+                    raise ValueError(
+                        f"{prefix}: W3A16_NVFP4 MoE layers need the FP3 "
+                        "config built from a W3A16_NVFP4 quantized_layers "
+                        "entry."
+                    )
+                return ModelOptNvFp4FusedMoEMethod(self.fp3a16_config)
             if quant_algo == "W4A8_MXFP4_FP8":
                 # MXFP4 packed e2m1 experts + e8m0 g32 scales, MXFP8 dynamic
                 # activations at runtime (true W4A8). The checkpoint tensors
@@ -1617,6 +1648,9 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             logger.info("Detected nvfp4 checkpoint.")
         self.is_awq = is_awq
         self.is_w4a16 = False
+        # FP3 W3A16 (3-bit NVFP4-codebook payload): set by MIXED_PRECISION
+        # configs for layers whose quant_algo is W3A16_NVFP4.
+        self.is_w3a16 = False
         self.group_size = group_size
         if not is_checkpoint_nvfp4_serialized:
             if use_per_token_activation:
@@ -1783,10 +1817,16 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
                 )
 
-        if quant_method not in ["FP8", "NVFP4", "NVFP4_AWQ", "W4A16_NVFP4"]:
+        if quant_method not in [
+            "FP8",
+            "NVFP4",
+            "NVFP4_AWQ",
+            "W4A16_NVFP4",
+            "W3A16_NVFP4",
+        ]:
             raise ValueError(
                 "ModelOpt currently only supports: FP8, NVFP4, NVFP4_AWQ, "
-                "W4A16_NVFP4 "
+                "W4A16_NVFP4, W3A16_NVFP4 "
                 "quantizations in sglang. Please check the "
                 "quantization config for your model's configuration."
             )
@@ -1812,6 +1852,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             use_per_token_activation=(False if quant_method == "W4A16_NVFP4" else None),
         )
         quant_config.is_w4a16 = quant_method == "W4A16_NVFP4"
+        quant_config.is_w3a16 = quant_method == "W3A16_NVFP4"
         return quant_config
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
@@ -2617,6 +2658,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
             weight_loader = make_nvfp4_megamoe_weight_loader(layer, weight_loader)
+        # FP3 W3A16: 3-bit codes packed MSB-first into 48-bit blocks (16
+        # codes = 6 bytes) and raw uint8 block-scale bytes (bit0 = codebook
+        # mirror flag); payload/scale widths differ from the 4-bit FP4 paths.
+        is_w3a16 = bool(getattr(self.quant_config, "is_w3a16", False))
+        if is_w3a16:
+            weight_scale_dtype = torch.uint8
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
@@ -2624,8 +2671,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             data=torch.empty(
                 layer.num_local_experts,
                 num_shards * intermediate_size_per_partition,
-                # 2 fp4 items are packed in the input dimension
-                hidden_size // 2,
+                # fp4: 2 codes/byte; fp3: 8/3 codes per byte (3-bit payload)
+                hidden_size * 3 // 8 if is_w3a16 else hidden_size // 2,
                 dtype=weight_dtype,
             ),
             input_dim=1,
@@ -2639,8 +2686,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             data=torch.empty(
                 layer.num_local_experts,
                 hidden_size,
-                # 2 fp4 items are packed in the input dimension
-                intermediate_size_per_partition // 2,
+                # fp4: 2 codes/byte; fp3: 8/3 codes per byte (3-bit payload)
+                intermediate_size_per_partition * 3 // 8
+                if is_w3a16
+                else intermediate_size_per_partition // 2,
                 dtype=weight_dtype,
             ),
             input_dim=1,
@@ -2663,13 +2712,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
         # AUTO is resolved later in create_moe_runner(); process_weights_after_loading()
-        # rebinds the swizzled scales for every backend that reads them.
+        # rebinds the swizzled scales for every backend that reads them. TRTLLM
+        # replaces blockscale_swizzled with an alias to weight_scale during
+        # process_weights_after_loading, so skip the expensive swizzle+allocate
+        # here. FP3 W3A16 keeps raw unswizzled scales (the Triton kernel reads
+        # sf byte i for code group i), so no swizzled parameter is created.
         skip_swizzled_blockscales = (
             self.enable_flashinfer_trtllm_moe
             or moe_runner_backend.is_flashinfer_megamoe()
             or moe_runner_backend.is_marlin()
             or moe_runner_backend.is_lora_marlin()
             or moe_runner_backend.is_auto()
+            or is_w3a16
         )
         if skip_swizzled_blockscales:
             layer.w13_blockscale_swizzled = None
@@ -2942,6 +2996,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         use_nvfp4_dispatch = _use_nvfp4_dispatch()
         if moe_runner_backend.is_sm12x_nvfp4_bf16():
             self._prepare_sm12x_w4a16_weights(layer)
+            return
+        if moe_runner_backend.is_sm12x_fp3_bf16():
+            # FP3 W3A16 runs on the raw checkpoint layout: unswizzled uint8
+            # sf bytes (bit0 = codebook mirror flag), 3-bit payload, and the
+            # per-expert gate/up w13_weight_scale_2 columns consumed directly
+            # by the kernel. Nothing to transform.
             return
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
@@ -3318,6 +3378,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
+        if getattr(self.quant_config, "is_w3a16", False):
+            if not moe_runner_backend.is_sm12x_fp3_bf16():
+                raise NotImplementedError(
+                    "W3A16_NVFP4 (FP3) MoE layers are only implemented by "
+                    "--moe-runner-backend sm12x_fp3_bf16."
+                )
+
         if moe_runner_backend.is_auto():
             if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
                 moe_runner_backend = MoeRunnerBackend.MARLIN
@@ -3349,6 +3416,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     "SM120/SM121 (Blackwell GeForce / RTX PRO) GPUs."
                 )
             import sglang.srt.layers.moe.moe_runner.sm12x_nvfp4_bf16  # noqa: F401 – triggers @register_fused_func
+
+        if moe_runner_backend.is_sm12x_fp3_bf16():
+            if get_device_capability()[0] != 12:
+                raise NotImplementedError(
+                    "--moe-runner-backend sm12x_fp3_bf16 supports only "
+                    "SM120/SM121 (Blackwell GeForce / RTX PRO) GPUs."
+                )
+            import sglang.srt.layers.moe.moe_runner.sm12x_fp3_bf16  # noqa: F401 – triggers @register_fused_func
 
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
@@ -3462,6 +3537,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w2_gs=layer.w2_weight_scale_2.data,
                 a13_gs=getattr(layer, "w4a4_a13_gs", None),
                 a2_gs=getattr(layer, "w4a4_a2_gs", None),
+            )
+            return self.runner.run(dispatch_output, quant_info)
+
+        if moe_runner_backend.is_sm12x_fp3_bf16():
+            from sglang.srt.layers.moe.moe_runner.sm12x_fp3_bf16 import (
+                Sm12xFp3W3A16MoeQuantInfo,
+            )
+
+            if getattr(layer, "expert_map", None) is not None:
+                raise NotImplementedError(
+                    "sm12x_fp3_bf16 does not support expert-parallel "
+                    "expert_map remapping yet."
+                )
+            quant_info = Sm12xFp3W3A16MoeQuantInfo(
+                w13=layer.w13_weight.data,
+                w13_sf=layer.w13_weight_scale.data,
+                w13_gs=layer.w13_weight_scale_2.data,
+                w2=layer.w2_weight.data,
+                w2_sf=layer.w2_weight_scale.data,
+                w2_gs=layer.w2_weight_scale_2.data,
             )
             return self.runner.run(dispatch_output, quant_info)
 
