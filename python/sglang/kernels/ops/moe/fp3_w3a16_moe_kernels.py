@@ -241,6 +241,27 @@ def _sf_fold_swizzle(sf: torch.Tensor, out: torch.Tensor | None = None) -> torch
     return out
 
 
+def _w4a4_scales(w13_gs, w2_gs, dev):
+    """Kernel scale vectors from checkpoint global scales.
+
+    Canonical storage has one global scale per weight matrix. With the gate
+    scale on w13, the gate/up ratio rescales the up half of h, which the
+    GEMM2 scale absorbs exactly (same fold as the sm12x_nvfp4_bf16 runner);
+    a zero gate scale keeps the raw gs2.
+    """
+    if w13_gs.dim() == 2:
+        gate = w13_gs[:, 0].float()
+        up = w13_gs[:, 1].float()
+        gs13 = gate.contiguous()
+        ratio = torch.where(gate > 0, up / gate.clamp_min(1e-30), torch.ones_like(up))
+        gs2 = (w2_gs.float() * ratio).contiguous()
+    else:
+        gs13 = w13_gs.float().contiguous()
+        gs2 = w2_gs.float().contiguous()
+    a_gs = torch.ones(1, dtype=torch.float32, device=dev)
+    return gs13, gs2, a_gs
+
+
 def _w4a4_canonical(w13, w13_sf, w13_gs, w2, w2_sf, w2_gs, bufs=None):
     """Canonical NVFP4 buffers + the kernel scale vectors. Returns
     (w13_4, w13_sf4, gs13, w2_4, w2_sf4, gs2, a_gs) with a_gs the (scalar)
@@ -282,20 +303,7 @@ def _w4a4_canonical(w13, w13_sf, w13_gs, w2, w2_sf, w2_gs, bufs=None):
     b13, b2 = bufs if bufs is not None else (None, None)
     w13_4, w13_sf4 = repack(w13, w13_sf, b13)
     w2_4, w2_sf4 = repack(w2, w2_sf, b2)
-    if w13_gs.dim() == 2:
-        # Canonical storage has one global scale per weight matrix. With the
-        # gate scale on w13, the gate/up ratio rescales the up half of h,
-        # which the GEMM2 scale absorbs exactly (same fold as the
-        # sm12x_nvfp4_bf16 runner); a zero gate scale keeps the raw gs2.
-        gate = w13_gs[:, 0].float()
-        up = w13_gs[:, 1].float()
-        gs13 = gate.contiguous()
-        ratio = torch.where(gate > 0, up / gate.clamp_min(1e-30), torch.ones_like(up))
-        gs2 = (w2_gs.float() * ratio).contiguous()
-    else:
-        gs13 = w13_gs.float().contiguous()
-        gs2 = w2_gs.float().contiguous()
-    a_gs = torch.ones(1, dtype=torch.float32, device=w13.device)
+    gs13, gs2, a_gs = _w4a4_scales(w13_gs, w2_gs, w13.device)
     if budget > 0 and bufs is None:
         entry = (
             (w13_4, w13_sf4, gs13, w2_4, w2_sf4, gs2, a_gs),
@@ -419,17 +427,26 @@ def _w4a4_experts(
     topk_weights,
     topk_ids,
     routed_scaling_factor,
+    fused=False,
 ):
-    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_nvfp4_w4a4 import (
-        allocate_workspace,
-        run_moe_w4a4,
-    )
+    if fused:
+        # Fused arm: the kernel unpacks LSB3 -> FP4 in registers, so the
+        # checkpoint payload and raw scales go to the GEMMs untouched.
+        from sglang.kernels.ops.moe.sm12x_fp3_lsb3_w4a4_moe import (
+            allocate_workspace,
+            run_moe_fp3_lsb3_w4a4 as run_moe_w4a4,
+        )
+    else:
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_nvfp4_w4a4 import (
+            allocate_workspace,
+            run_moe_w4a4,
+        )
 
     m, h = hidden_states.shape
     e = w13.shape[0]
     topk = topk_ids.shape[1]
     inter = w2.shape[2] * 8 // 3
-    prefetch_on = envs.SGLANG_SM12X_W3A4_PREFETCH.get()
+    prefetch_on = envs.SGLANG_SM12X_W3A4_PREFETCH.get() and not fused
     key = _arm_key(w13, w13_sf, w2, w2_sf)
     # The prefetch fast path: the previous layer scheduled a repack of
     # these weights on the side stream. It is consumed (event wait) only
@@ -440,6 +457,10 @@ def _w4a4_experts(
         pend = _prefetch_pending.pop(key, None)
     if pend is not None:
         w13_4, w13_sf4, gs13, w2_4, w2_sf4, gs2, a_gs = pend[0]
+    elif fused:
+        w13_4, w13_sf4 = w13, w13_sf
+        w2_4, w2_sf4 = w2, w2_sf
+        gs13, gs2, a_gs = _w4a4_scales(w13_gs, w2_gs, hidden_states.device)
     else:
         w13_4, w13_sf4, gs13, w2_4, w2_sf4, gs2, a_gs = _w4a4_canonical(
             w13, w13_sf, w13_gs, w2, w2_sf, w2_gs
@@ -459,7 +480,7 @@ def _w4a4_experts(
         x = hidden_states
     if routed_scaling_factor != 1.0:
         wts = wts * routed_scaling_factor
-    ws_key = (b, h, inter, e, topk, dev)
+    ws_key = (b, h, inter, e, topk, dev, fused)
     ws = _w4a4_ws.get(ws_key)
     if ws is None:
         ws = allocate_workspace(b, h, inter, e, topk, True, dev)
@@ -925,6 +946,7 @@ def fused_experts_fp3_w3a16(
                 topk_weights,
                 topk_ids,
                 routed_scaling_factor or 1.0,
+                fused=envs.SGLANG_SM12X_W3A4_FUSED.get(),
             )
         except Exception as exc:  # noqa: BLE001  (flashinfer optional: never fatal)
             _w4a4_failures += 1
