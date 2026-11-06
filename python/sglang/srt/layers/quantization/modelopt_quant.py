@@ -2959,10 +2959,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self._prepare_sm12x_w4a16_weights(layer)
             return
         if moe_runner_backend.is_sm12x_fp3_bf16():
-            # FP3 W3A16 runs on the raw checkpoint layout: unswizzled uint8
-            # sf bytes (bit0 = codebook mirror flag), 3-bit payload, and the
-            # per-expert gate/up w13_weight_scale_2 columns consumed directly
-            # by the kernel. Nothing to transform.
+            # FP3 W3A16 runs on the raw checkpoint scales: unswizzled uint8
+            # sf bytes (bit0 = codebook mirror flag) and the per-expert
+            # gate/up w13_weight_scale_2 columns consumed directly by the
+            # kernel. The 48-bit-block payload is repacked once here into the
+            # LSB-first 8-codes-per-3-bytes layout both executors read (a
+            # pure byte permutation, so this adds no VRAM).
+            from sglang.kernels.ops.moe.fp3_w3a16_moe_kernels import (
+                repack_fp3_w3a16_lsb3,
+            )
+
+            copy_or_rebind_param(
+                layer, "w13_weight", repack_fp3_w3a16_lsb3(layer.w13_weight.data)
+            )
+            copy_or_rebind_param(
+                layer, "w2_weight", repack_fp3_w3a16_lsb3(layer.w2_weight.data)
+            )
             return
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
