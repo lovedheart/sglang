@@ -48,6 +48,77 @@ if TYPE_CHECKING:
 # 512 with the Qwen3.8-Flash-Next-FP3 expert shape.
 _GEMV_MAX_SLOTS = 384
 
+# Slot count at or below which the CuTe DSL LSB3 fork (3-bit codes expanded
+# to NVFP4 nibbles in registers, sm12x W4A16 tile kernels) beats both other
+# paths on sm_120; measured 1.5-3.8x over GEMV/Triton up to ~1536 tokens at
+# top-k 10, Triton GEMM wins from ~2048 tokens up.
+_CUTE_MAX_SLOTS = 15360
+_cute_failures = 0
+_cute_disabled = False
+# swizzled-scale cache keyed by the raw scale tensor's storage; the entry
+# keeps a reference so the data_ptr key cannot be recycled underneath it.
+_cute_sf_cache: dict = {}
+
+
+def _is_sm12x() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major == 12
+
+
+def _cute_sf_swizzled(sf: torch.Tensor) -> torch.Tensor:
+    """Fold the codebook mirror bit into the e4m3 sign and swizzle to the
+    128x4 tile layout the CuTe fork consumes. Done once per weight tensor."""
+    key = (sf.data_ptr(), tuple(sf.shape))
+    hit = _cute_sf_cache.get(key)
+    if hit is not None:
+        return hit[1]
+    from sglang.srt.layers.quantization.utils import swizzle_blockscale
+
+    b = sf.to(torch.int64)
+    folded = ((b & 0xFE) ^ ((b & 1) << 7)).to(torch.uint8)
+    sw = swizzle_blockscale(folded.view(torch.float8_e4m3fn)).to(sf.device)
+    _cute_sf_cache[key] = (sf, sw)
+    return sw
+
+
+def _cute_fork_experts(
+    hidden_states,
+    w13,
+    w13_sf,
+    w13_gs,
+    w2,
+    w2_sf,
+    w2_gs,
+    topk_weights,
+    topk_ids,
+    routed_scaling_factor,
+):
+    from sglang.kernels.ops.moe.sm12x_fp3_lsb3_w3a16_moe import run_moe_fp3_lsb3
+
+    if w13_gs.dim() == 1:
+        w13_gs = w13_gs.unsqueeze(1).expand(-1, 2).contiguous()
+    wts = (
+        topk_weights
+        if routed_scaling_factor == 1.0
+        else topk_weights.float() * routed_scaling_factor
+    )
+    out = torch.empty_like(hidden_states)
+    run_moe_fp3_lsb3(
+        hidden_states,
+        topk_ids,
+        wts,
+        w13,
+        _cute_sf_swizzled(w13_sf),
+        w13_gs,
+        w2,
+        _cute_sf_swizzled(w2_sf),
+        w2_gs.float(),
+        out,
+    )
+    return out
+
 
 def repack_fp3_w3a16_lsb3(payload: torch.Tensor) -> torch.Tensor:
     """Convert the checkpoint 48-bit-block payload to the LSB3 kernel layout.
@@ -425,7 +496,7 @@ def fused_experts_fp3_w3a16(
     Dispatches decode-size slot counts to the grouped SIMT GEMV (zero VRAM
     overhead, fp32 math) and larger ones to the Triton tensor-core GEMM.
     """
-    global _gemv_unavailable
+    global _gemv_unavailable, _cute_failures, _cute_disabled
     assert hidden_states.dtype == torch.bfloat16 and hidden_states.is_contiguous()
     assert activation == "silu", f"fp3_w3a16 supports silu, got {activation}"
     m, k = hidden_states.shape
@@ -434,6 +505,39 @@ def fused_experts_fp3_w3a16(
     topk = topk_ids.shape[1]
     inter = w2.shape[2] * 8 // 3
     slots = m * topk
+
+    # CuTe DSL LSB3 fork: expands the 3-bit codebook payload to NVFP4 nibbles
+    # in registers and runs the sm12x W4A16 tile kernels. Fastest path on
+    # sm_120/121 up to the measured crossover with the Triton GEMM; any
+    # failure (shape unsupported, not compiled before graph capture) falls
+    # back to GEMV/Triton for that call.
+    if (
+        not _cute_disabled
+        and config is None
+        and 0 < slots <= _CUTE_MAX_SLOTS
+        and _is_sm12x()
+    ):
+        try:
+            return _cute_fork_experts(
+                hidden_states,
+                w13,
+                w13_sf,
+                w13_gs,
+                w2,
+                w2_sf,
+                w2_gs,
+                topk_weights.float(),
+                topk_ids.int(),
+                routed_scaling_factor or 1.0,
+            )
+        except Exception as exc:  # noqa: BLE001  (fork optional: never fatal)
+            _cute_failures += 1
+            if _cute_failures >= 3:
+                _cute_disabled = True
+                print(
+                    f"fp3_w3a16 CuTe DSL fork disabled after {_cute_failures} "
+                    f"failures ({exc}); using GEMV/Triton"
+                )
 
     # The quad-load GEMV needs 12-byte-aligned row slices (K/8 % 4 == 0).
     if (
