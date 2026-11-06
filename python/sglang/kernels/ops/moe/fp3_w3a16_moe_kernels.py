@@ -187,6 +187,56 @@ def _lsb3_to_nvfp4_kernel(
     tl.store(out32_ptr + g, word, mask=gmask)
 
 
+@triton.jit
+def _sf_fold_swizzle_kernel(
+    sf_ptr, out_ptr, mc, c_len, kt_len, total, BLOCK: tl.constexpr
+):
+    """Fold the codebook mirror bit into the e4m3 sign and swizzle the raw
+    block scales into the 128x4-tile interleaved layout in one pass (the
+    torch swizzle_blockscale path allocates+zero-pads+copies the full scale
+    matrix per call, ~4x the traffic for aligned shapes). Assumes M % 128 ==
+    0 and C % 4 == 0 (no padding); callers fall back otherwise."""
+    pid = tl.program_id(0)
+    idx = pid * BLOCK + tl.arange(0, BLOCK)
+    m = idx < total
+    s = tl.load(sf_ptr + idx, mask=m, other=0).to(tl.uint32)
+    folded = (s & 0xFE) ^ ((s & 1) << 7)
+    e = idx // mc
+    rem = idx % mc
+    r = rem // c_len
+    c = rem % c_len
+    mt = r // 128
+    mr = r % 128
+    kt = c // 4
+    kc = c % 4
+    off = e * mc + ((mt * kt_len + kt) * 32 + (mr % 32)) * 16 + (mr // 32) * 4 + kc
+    tl.store(out_ptr + off, folded.to(tl.uint8), mask=m)
+
+
+def _sf_fold_swizzle(sf: torch.Tensor) -> torch.Tensor:
+    """swizzle_blockscale((sf & 0xFE) ^ ((sf & 1) << 7)) for 3-D uint8
+    scales with sf.shape[1] % 128 == 0 and sf.shape[2] % 4 == 0."""
+    from sglang.srt.layers.quantization.utils import swizzle_blockscale
+
+    m, c = sf.shape[1], sf.shape[2]
+    if m % 128 != 0 or c % 4 != 0:
+        folded = (sf & 0xFE) ^ ((sf & 1) << 7)
+        return swizzle_blockscale(folded.view(torch.float8_e4m3fn)).view(torch.uint8)
+    out = torch.empty_like(sf)
+    total = sf.numel()
+    _sf_fold_swizzle_kernel[(triton.cdiv(total, 1024),)](
+        sf.reshape(-1),
+        out.reshape(-1),
+        m * c,
+        c,
+        c // 4,
+        total,
+        BLOCK=1024,
+        num_warps=4,
+    )
+    return out
+
+
 def _w4a4_canonical(w13, w13_sf, w13_gs, w2, w2_sf, w2_gs):
     """Canonical NVFP4 buffers + the kernel scale vectors. Returns
     (w13_4, w13_sf4, gs13, w2_4, w2_sf4, gs2, a_gs) with a_gs the (scalar)
@@ -203,7 +253,6 @@ def _w4a4_canonical(w13, w13_sf, w13_gs, w2, w2_sf, w2_gs):
     if hit is not None:
         _w4a4_cache.move_to_end(key)
         return hit[0]
-    from sglang.srt.layers.quantization.utils import swizzle_blockscale
 
     def repack(payload, sf):
         e, r, kb3 = payload.shape
@@ -216,9 +265,7 @@ def _w4a4_canonical(w13, w13_sf, w13_gs, w2, w2_sf, w2_gs):
             payload.view(torch.uint32), sf, out32, n_groups, BLOCK_G=512, num_warps=4
         )
         out = out32.view(torch.uint8).view(e, r, kb3 * 4 // 3)
-        return out, swizzle_blockscale((sf & 0xFE).view(torch.float8_e4m3fn)).view(
-            torch.uint8
-        )
+        return out, _sf_fold_swizzle(sf)
 
     w13_4, w13_sf4 = repack(w13, w13_sf)
     w2_4, w2_sf4 = repack(w2, w2_sf)
@@ -251,10 +298,13 @@ def _w4a4_canonical(w13, w13_sf, w13_gs, w2, w2_sf, w2_gs):
 
 def _w4a4_bucket(t: int) -> int:
     # flashinfer compiles and allocates per token count; prefill batch sizes
-    # never repeat, so round up to a power of two to bound the compile set
-    # (one compile per octave) at <=2x padding. The arm's token floor keeps
-    # this within the 1..8192 ladder.
-    return t if t & (t - 1) == 0 else 1 << (t - 1).bit_length()
+    # never repeat, so bucket to bound the compile set. Below 1024 keep a
+    # power-of-two ladder (decode/verify sizes are rare); at or above 1024
+    # round to 1024 multiples: a power-of-two ladder pads a 4005-token tail
+    # chunk to 8192 (2x wasted GEMM work), this wastes <=25%.
+    if t < 1024:
+        return t if t & (t - 1) == 0 else 1 << (t - 1).bit_length()
+    return (t + 1023) // 1024 * 1024
 
 
 def _w4a4_experts(
