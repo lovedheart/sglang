@@ -1461,6 +1461,13 @@ class Envs:
     # order, so an LRU budget below the full set gets ~0 hits (the next
     # forward reaches layer 0 exactly when its entry was evicted).
     SGLANG_SM12X_W3A4_CACHE_MB = EnvInt(0)
+    # Run the W3A4 prefill repack for the NEXT MoE layer on a side stream
+    # while the current layer's FP4 GEMMs and attention overlap. The two
+    # double-buffered canonical sets add ~2.5 GB to prefill peak, so this
+    # is opt-in for a KV-tight host; the win scales with the compute work
+    # overlapping the bandwidth-bound repack (modularly ~5% per-layer in a
+    # loop bench, more when long attention spans hide it).
+    SGLANG_SM12X_W3A4_PREFETCH = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
