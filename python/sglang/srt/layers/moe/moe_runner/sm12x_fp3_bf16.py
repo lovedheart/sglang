@@ -12,7 +12,6 @@ from __future__ import annotations
 import logging
 
 import torch
-
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -23,9 +22,12 @@ logger = logging.getLogger(__name__)
 
 
 class Sm12xFp3W3A16MoeQuantInfo(MoeQuantInfo):
-    """Packed FP3 expert weights for the Triton W3A16 dequant GEMM.
+    """Packed FP3 expert weights for the W3A16 dequant experts (grouped SIMT
+    GEMV at decode sizes, Triton tensor-core GEMM at prefill sizes).
 
-    w13:   uint8 [E, 2I, K*3//8] (gate rows [0:I], up rows [I:2I])
+    w13:   uint8 [E, 2I, K*3//8] LSB3-repacked payload (gate rows [0:I], up
+    rows [I:2I]; bytes 3g..3g+2 hold codes 8g..8g+7 LSB-first, see
+    sglang.kernels.ops.moe.fp3_w3a16_moe_kernels.repack_fp3_w3a16_lsb3)
     w13_sf: uint8 [E, 2I, K//16] raw sf bytes (bit0 = codebook mirror flag)
     w13_gs: fp32  [E, 2] per-expert (gate, up) global scales
     w2:    uint8 [E, K, I*3//8], w2_sf uint8 [E, K, I//16], w2_gs fp32 [E]
