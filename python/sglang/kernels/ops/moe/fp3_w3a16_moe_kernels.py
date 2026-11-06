@@ -43,9 +43,10 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 # Fused MoE slot counts (tokens x topk) at or below which the grouped SIMT
-# GEMV beats the Triton tensor-core path on sm_120 (crossover measured at
-# ~512 slots with the Qwen3.8-Flash-Next-FP3 expert shape).
-_GEMV_MAX_SLOTS = 512
+# GEMV beats the Triton tensor-core path on sm_120. v6's per-block X staging
+# adds traffic that grows with slots; measured crossover sits between 320 and
+# 512 with the Qwen3.8-Flash-Next-FP3 expert shape.
+_GEMV_MAX_SLOTS = 384
 
 
 def repack_fp3_w3a16_lsb3(payload: torch.Tensor) -> torch.Tensor:
@@ -67,17 +68,23 @@ def repack_fp3_w3a16_lsb3(payload: torch.Tensor) -> torch.Tensor:
     # Chunk rows so the int64 bit-unpacking intermediates stay ~64 MiB.
     chunk = max(1, (1 << 26) // (k * 8))
     for s in range(0, rows, chunk):
-        b = src[s:s + chunk].to(torch.int64).reshape(-1, k // 16, 6)
+        b = src[s : s + chunk].to(torch.int64).reshape(-1, k // 16, 6)
         v = (
-            (b[..., 0] << 40) | (b[..., 1] << 32) | (b[..., 2] << 24)
-            | (b[..., 3] << 16) | (b[..., 4] << 8) | b[..., 5]
+            (b[..., 0] << 40)
+            | (b[..., 1] << 32)
+            | (b[..., 2] << 24)
+            | (b[..., 3] << 16)
+            | (b[..., 4] << 8)
+            | b[..., 5]
         )
         codes = torch.stack([(v >> (45 - 3 * j)) & 7 for j in range(16)], -1)
         c = codes.reshape(-1, k // 8, 8)
         w = sum(c[..., j] << (3 * j) for j in range(8))
-        dst[s:s + chunk] = torch.stack(
-            [(w >> (8 * t)) & 0xFF for t in range(3)], -1
-        ).reshape(-1, kb3).to(torch.uint8)
+        dst[s : s + chunk] = (
+            torch.stack([(w >> (8 * t)) & 0xFF for t in range(3)], -1)
+            .reshape(-1, kb3)
+            .to(torch.uint8)
+        )
     return out
 
 
@@ -183,8 +190,9 @@ def _fp3_w3a16_gemm_kernel(
     )
     # 4-byte window per 8-code group (the 4th byte lane is masked off; the
     # payload stores 3 bytes per group).
-    bgrp = (tl.arange(0, BLOCK_K_CODE_GROUPS)[:, None] * 3
-            + tl.arange(0, 4)[None, :])[None, :, :]
+    bgrp = (tl.arange(0, BLOCK_K_CODE_GROUPS)[:, None] * 3 + tl.arange(0, 4)[None, :])[
+        None, :, :
+    ]
     bsel = tl.arange(0, 4)[None, None, :] < 3
     group_off = tl.arange(0, BLOCK_K_GROUPS)[None, :]
     b_base = b_ptr + off_experts * stride_be + offs_bn[:, None] * stride_bn
@@ -199,8 +207,9 @@ def _fp3_w3a16_gemm_kernel(
 
         # Bytes 3g..3g+2 of the row window hold codes 8g..8g+7 LSB-first;
         # assemble each 24-bit group, then extract its 8 codes.
-        p = tl.load(b_base[:, None, :] + (k_start * 3 // 8) + bgrp,
-                    mask=bsel, other=0).to(tl.uint32)
+        p = tl.load(
+            b_base[:, None, :] + (k_start * 3 // 8) + bgrp, mask=bsel, other=0
+        ).to(tl.uint32)
         p3 = tl.sum(p << (8 * tl.arange(0, 4))[None, None, :], axis=2)  # [BN, BK/8]
         codes = tl.reshape(
             (p3.to(tl.int32)[:, :, None] >> shifts) & 7,
@@ -249,11 +258,23 @@ def _default_config(num_slots: int) -> dict[str, int]:
     # that regime.
     if num_slots <= 8192:
         # Slots per expert stay small; BM16 minimizes padding waste.
-        return {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": 8, "num_warps": 4, "num_stages": 4}
+        return {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 4,
+        }
     # Prefill-size batches: each expert owns enough slots to fill BM128.
-    return {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 8, "num_warps": 8, "num_stages": 4}
+    return {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 8,
+        "num_stages": 4,
+    }
 
 
 def _invoke_fp3_gemm(
@@ -322,24 +343,28 @@ def _invoke_fp3_gemm(
 _gemv_unavailable = False
 
 
-def _gemv_rows_per_block(num_slots: int):
-    # Tuned on sm_120 with the Qwen3.8-Flash-Next-FP3 expert shape; small
-    # slot counts want more, smaller blocks to fill the SMs.
+def _gemv_blocks(num_slots: int):
+    # (rows_per_block, lanes_per_row) per GEMM, tuned on sm_120 with the
+    # Qwen3.8-Flash-Next-FP3 expert shape: LN = 8 lanes/row doubles the
+    # prefetch horizon vs LN = 16 (measured ~1.6x at 160 slots on GEMM1).
     if num_slots <= 48:
-        return 8, 4
-    return 16, 16
+        return (16, 16), (16, 2)
+    if num_slots <= 192:
+        return (16, 8), (32, 4)
+    return (32, 16), (32, 4)
 
 
 @cache_once
-def _jit_gemv_module(gemm: int, kt: int, r: int) -> Module:
+def _jit_gemv_module(gemm: int, kt: int, r: int, ln: int) -> Module:
     cls = "Fp3W3A16GemvG1" if gemm == 1 else "Fp3W3A16GemvG2"
     return load_jit(
         "fp3_w3a16_gemv",
         gemm,
         kt,
         r,
+        ln,
         cuda_files=["moe/fp3_w3a16_gemv.cuh"],
-        cuda_wrappers=[("run", f"sglang::{cls}<{kt}, {r}>::run")],
+        cuda_wrappers=[("run", f"sglang::{cls}<{kt}, {r}, {ln}>::run")],
         extra_cuda_cflags=["-O3"],
     )
 
@@ -367,14 +392,14 @@ def _gemv_fused_experts(
     etab = topk_ids.reshape(-1).to(torch.int64, copy=False) | (
         torch.arange(slots, dtype=torch.int64, device=dev) << 32
     )
-    r1, r2 = _gemv_rows_per_block(slots)
+    (r1, ln1), (r2, ln2) = _gemv_blocks(slots)
     y1 = torch.empty((slots, 2 * inter), dtype=torch.float32, device=dev)
-    _jit_gemv_module(1, k // 8, r1).run(
+    _jit_gemv_module(1, k // 8, r1, ln1).run(
         hidden_states, w13, w13_sf, w13_gs, etab, y1, topk
     )
     act = torch.nn.functional.silu(y1[:, :inter]) * y1[:, inter:]
     y2 = torch.empty((slots, k), dtype=torch.float32, device=dev)
-    _jit_gemv_module(2, inter // 8, r2).run(act, w2, w2_sf, w2_gs, etab, y2)
+    _jit_gemv_module(2, inter // 8, r2, ln2).run(act, w2, w2_sf, w2_gs, etab, y2)
     out = (y2.view(m, topk, k) * topk_weights.reshape(m, topk, 1)).sum(1)
     if routed_scaling_factor != 1.0:
         out = out * routed_scaling_factor
@@ -410,12 +435,27 @@ def fused_experts_fp3_w3a16(
     inter = w2.shape[2] * 8 // 3
     slots = m * topk
 
-    if config is None and slots <= _GEMV_MAX_SLOTS and w13_gs.dim() == 2 \
-            and not _gemv_unavailable:
+    # The quad-load GEMV needs 12-byte-aligned row slices (K/8 % 4 == 0).
+    if (
+        config is None
+        and slots <= _GEMV_MAX_SLOTS
+        and w13_gs.dim() == 2
+        and (k // 8) % 4 == 0
+        and (inter // 8) % 4 == 0
+        and not _gemv_unavailable
+    ):
         try:
             return _gemv_fused_experts(
-                hidden_states, w13, w13_sf, w13_gs, w2, w2_sf, w2_gs,
-                topk_weights, topk_ids, routed_scaling_factor or 1.0,
+                hidden_states,
+                w13,
+                w13_sf,
+                w13_gs,
+                w2,
+                w2_sf,
+                w2_gs,
+                topk_weights,
+                topk_ids,
+                routed_scaling_factor or 1.0,
             )
         except Exception as exc:  # noqa: BLE001  (JIT build/host: stay on Triton)
             _gemv_unavailable = True
@@ -444,26 +484,51 @@ def fused_experts_fp3_w3a16(
 
     cache1 = torch.empty((num_valid, n13), dtype=torch.bfloat16, device=dev)
     _invoke_fp3_gemm(
-        hidden_states, w13, w13_sf, w13_gs, cache1, topk_weights_f32,
-        sorted_token_ids, expert_ids, num_tokens_post_padded, num_valid,
-        top_k_a=topk, mul_routed_weight=False, config=config,
+        hidden_states,
+        w13,
+        w13_sf,
+        w13_gs,
+        cache1,
+        topk_weights_f32,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        num_valid,
+        top_k_a=topk,
+        mul_routed_weight=False,
+        config=config,
     )
 
     cache2 = torch.empty((num_valid, inter), dtype=torch.bfloat16, device=dev)
     act_and_mul_triton(
-        cache1, cache2, config, topk_ids=topk_ids_i32, activation=activation,
+        cache1,
+        cache2,
+        config,
+        topk_ids=topk_ids_i32,
+        activation=activation,
     )
 
     cache3 = torch.empty((num_valid, k), dtype=torch.bfloat16, device=dev)
     _invoke_fp3_gemm(
-        cache2, w2, w2_sf, w2_gs, cache3, topk_weights_f32,
-        sorted_token_ids, expert_ids, num_tokens_post_padded, num_valid,
-        top_k_a=1, mul_routed_weight=True, config=config,
+        cache2,
+        w2,
+        w2_sf,
+        w2_gs,
+        cache3,
+        topk_weights_f32,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        num_valid,
+        top_k_a=1,
+        mul_routed_weight=True,
+        config=config,
     )
 
     out = torch.empty((m, k), dtype=torch.bfloat16, device=dev)
     moe_sum_reduce_triton(
-        cache3.view(m, topk, k), out,
+        cache3.view(m, topk, k),
+        out,
         routed_scaling_factor=routed_scaling_factor or 1.0,
     )
     return out
