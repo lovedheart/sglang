@@ -14,7 +14,6 @@ Run:  .venv/bin/python test/manual/quant/test_sm12x_fp3_moe.py
 
 from __future__ import annotations
 
-import math
 import time
 
 import numpy as np
@@ -102,7 +101,6 @@ def reference(x, ids, wts, tensors):
 def main():
     assert torch.cuda.is_available(), "needs CUDA"
     torch.manual_seed(0)
-    rng = np.random.default_rng(0)
     tensors = load_experts()
 
     x = torch.randn(T, HID, dtype=torch.bfloat16, device="cuda")
@@ -111,21 +109,26 @@ def main():
     wts = wts / wts.sum(1, keepdim=True)
 
     # --- fused func (GPU) ---
+    from sglang.kernels.ops.moe.fp3_w3a16_moe_kernels import (
+        repack_fp3_w3a16_lsb3,
+    )
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
     from sglang.srt.layers.moe.moe_runner.sm12x_fp3_bf16 import (
         Sm12xFp3W3A16MoeQuantInfo,
         fused_experts_none_to_sm12x_fp3_bf16,
     )
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardDispatchOutput,
     )
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
 
+    # The checkpoint ships 48-bit-block payloads; the weight loader repacks
+    # them into the LSB3 layout both executors consume, so do the same here.
     qi = Sm12xFp3W3A16MoeQuantInfo(
-        w13=torch.from_numpy(tensors[0]).cuda(),
+        w13=repack_fp3_w3a16_lsb3(torch.from_numpy(tensors[0]).cuda()),
         w13_sf=torch.from_numpy(tensors[1]).cuda(),
         w13_gs=torch.from_numpy(tensors[2]).cuda(),
-        w2=torch.from_numpy(tensors[3]).cuda(),
+        w2=repack_fp3_w3a16_lsb3(torch.from_numpy(tensors[3]).cuda()),
         w2_sf=torch.from_numpy(tensors[4]).cuda(),
         w2_gs=torch.from_numpy(tensors[5]).cuda(),
     )
@@ -157,6 +160,25 @@ def main():
     print(f"(elementwise worst, floor 1e-2: {elem.max():.3e})")
     assert (rel < 1e-2).all(), f"per-token rel err exceeds 1e-2: {rel}"
     print("NUMERICS OK: all per-token norm-rel < 1e-2 vs f64 reference")
+
+    # Same reference for the Triton tensor-core path (explicit config forces
+    # it past the decode-size grouped-GEMV dispatch).
+    from sglang.kernels.ops.moe.fp3_w3a16_moe_kernels import (
+        _default_config,
+    )
+    from sglang.kernels.ops.moe.fp3_w3a16_moe_kernels import (
+        fused_experts_fp3_w3a16 as _fx,
+    )
+
+    out_tri = _fx(
+        x, qi.w13, qi.w13_sf, qi.w13_gs, qi.w2, qi.w2_sf, qi.w2_gs,
+        wts, ids.to(torch.int64), config=_default_config(8192),
+    )
+    got_t = out_tri.float().cpu().numpy()
+    rel_t = np.linalg.norm(got_t - ref, axis=1) / np.linalg.norm(ref, axis=1)
+    print(f"triton path max per-token rel (norm): {rel_t.max():.3e}")
+    assert (rel_t < 1e-2).all(), f"triton per-token rel err exceeds 1e-2: {rel_t}"
+    print("NUMERICS OK (triton path)")
 
     # --- GPU perf sanity (tiny; GPU is shared with a running server) ---
     from sglang.kernels.ops.moe.fp3_w3a16_moe_kernels import fused_experts_fp3_w3a16
