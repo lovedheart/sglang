@@ -1443,6 +1443,27 @@ class Envs:
     # safe margin, but the W4A4 arm quantizes activations (slightly less
     # accurate), so enabling it stays a deliberate accuracy tradeoff.
     SGLANG_SM12X_W4A4_PREFILL_MIN_TOKENS = EnvInt(0)
+    # Sibling knob for the sm12x_fp3_bf16 (FP3 LSB3 W3A16) MoE runner: batches
+    # with at least this many tokens repack the 3-bit payload losslessly to
+    # NVFP4 storage and run flashinfer's moe_nvfp4_w4a4 kernel (activations
+    # quantized to NVFP4 in-kernel).  With the repack cache off the repack
+    # rides ~2.1 ms per layer per call, so measured wins are 1.70x at 2048
+    # and 1.65x at 4096 (E=512,H=2560,I=640,top-10, vs the CuTe W3A16 fork);
+    # below ~1536 tokens the repack eats the win, hence the 2048 default.
+    # 0 disables the arm.  With SGLANG_SM12X_W3A4_CACHE_MB large enough to
+    # hold every MoE layer the repack amortizes and the win starts near 128
+    # tokens (5.3x at 4096), but a canonical copy costs ~1.5 GB per
+    # 512-expert layer — on a KV-tight server that is not affordable.
+    # Same activation-quantization accuracy tradeoff as the W4A4 knob
+    # above (the fp3 weights themselves repack exactly).
+    SGLANG_SM12X_W3A4_PREFILL_MIN_TOKENS = EnvInt(2048)
+    # MB budget for caching the repacked NVFP4 copies in the sm12x_fp3_bf16
+    # MoE runner (LRU).  A canonical copy costs ~4/3 of a layer's 3-bit
+    # payload (~1.5 GB per 512-expert layer), so caching every MoE layer of
+    # a KV-tight server OOMs it; 0 (default) repacks into recycled scratch
+    # per call instead (peak ~1.5 GB, +~1.4 ms/call), at the cost of a
+    # higher useful value of the min-tokens knob above.
+    SGLANG_SM12X_W3A4_CACHE_MB = EnvInt(0)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
