@@ -1468,6 +1468,12 @@ class Envs:
     # overlapping the bandwidth-bound repack (modularly ~5% per-layer in a
     # loop bench, more when long attention spans hide it).
     SGLANG_SM12X_W3A4_PREFETCH = EnvBool(False)
+    # Run the prefill W3A4 arm from the LSB3 payload directly: the grouped
+    # GEMM expands 3-bit codes to FP4 nibbles and folds the raw scale mirror
+    # bit in registers, so no canonical repack (or its traffic) happens at
+    # all. Same MMA operands as the repacked arm; requires H and I to be
+    # multiples of 128. Default on: 1.4-2.8x the repacked arm's prefill time.
+    SGLANG_SM12X_W3A4_FUSED = EnvBool(True)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
