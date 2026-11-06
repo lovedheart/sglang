@@ -213,16 +213,20 @@ def _sf_fold_swizzle_kernel(
     tl.store(out_ptr + off, folded.to(tl.uint8), mask=m)
 
 
-def _sf_fold_swizzle(sf: torch.Tensor) -> torch.Tensor:
+def _sf_fold_swizzle(sf: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """swizzle_blockscale((sf & 0xFE) ^ ((sf & 1) << 7)) for 3-D uint8
-    scales with sf.shape[1] % 128 == 0 and sf.shape[2] % 4 == 0."""
+    scales with sf.shape[1] % 128 == 0 and sf.shape[2] % 4 == 0. ``out``
+    reuses a preallocated buffer (same shape) when given."""
     from sglang.srt.layers.quantization.utils import swizzle_blockscale
 
     m, c = sf.shape[1], sf.shape[2]
     if m % 128 != 0 or c % 4 != 0:
         folded = (sf & 0xFE) ^ ((sf & 1) << 7)
         return swizzle_blockscale(folded.view(torch.float8_e4m3fn)).view(torch.uint8)
-    out = torch.empty_like(sf)
+    if out is None:
+        out = torch.empty_like(sf)
+    else:
+        assert out.shape == sf.shape
     total = sf.numel()
     _sf_fold_swizzle_kernel[(triton.cdiv(total, 1024),)](
         sf.reshape(-1),
@@ -237,7 +241,7 @@ def _sf_fold_swizzle(sf: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _w4a4_canonical(w13, w13_sf, w13_gs, w2, w2_sf, w2_gs):
+def _w4a4_canonical(w13, w13_sf, w13_gs, w2, w2_sf, w2_gs, bufs=None):
     """Canonical NVFP4 buffers + the kernel scale vectors. Returns
     (w13_4, w13_sf4, gs13, w2_4, w2_sf4, gs2, a_gs) with a_gs the (scalar)
     activation quantization multiplier. Caching is off by default
@@ -245,7 +249,9 @@ def _w4a4_canonical(w13, w13_sf, w13_gs, w2, w2_sf, w2_gs):
     allocator recycles for the next layer, keeping peak overhead to ~1.5 GB
     regardless of layer count (caching every layer is what OOMed a
     KV-tight server). A positive budget enables an LRU cache of that many
-    MB, for hosts with real headroom."""
+    MB, for hosts with real headroom. bufs=(b13, b2) supplies preallocated
+    (payload, swizzled-sf) output buffers (the prefetch double-buffer);
+    shapes are derived from the payload and checked against the buffers."""
     global _w4a4_cached_bytes
     budget = envs.SGLANG_SM12X_W3A4_CACHE_MB.get() * (1 << 20)
     key = (w13.data_ptr(), w13_sf.data_ptr(), w2.data_ptr(), w2_sf.data_ptr())
@@ -254,21 +260,28 @@ def _w4a4_canonical(w13, w13_sf, w13_gs, w2, w2_sf, w2_gs):
         _w4a4_cache.move_to_end(key)
         return hit[0]
 
-    def repack(payload, sf):
+    def repack(payload, sf, buf=None):
         e, r, kb3 = payload.shape
         assert kb3 % 4 == 0, "payload row must be uint32-viewable"
         n_groups = payload.numel() // 3
-        out32 = torch.empty(
-            e, r, kb3 * 4 // 3 // 4, dtype=torch.uint32, device=payload.device
-        )
+        if buf is None:
+            out32 = torch.empty(
+                e, r, kb3 * 4 // 3 // 4, dtype=torch.uint32, device=payload.device
+            )
+            sf_out = None
+        else:
+            out4, sf_out = buf
+            assert out4.shape == (e, r, kb3 * 4 // 3)
+            out32 = out4.view(torch.uint32).view(e, r, kb3 * 4 // 3 // 4)
         _lsb3_to_nvfp4_kernel[(triton.cdiv(n_groups, 512),)](
             payload.view(torch.uint32), sf, out32, n_groups, BLOCK_G=512, num_warps=4
         )
         out = out32.view(torch.uint8).view(e, r, kb3 * 4 // 3)
-        return out, _sf_fold_swizzle(sf)
+        return out, _sf_fold_swizzle(sf, sf_out)
 
-    w13_4, w13_sf4 = repack(w13, w13_sf)
-    w2_4, w2_sf4 = repack(w2, w2_sf)
+    b13, b2 = bufs if bufs is not None else (None, None)
+    w13_4, w13_sf4 = repack(w13, w13_sf, b13)
+    w2_4, w2_sf4 = repack(w2, w2_sf, b2)
     if w13_gs.dim() == 2:
         # Canonical storage has one global scale per weight matrix. With the
         # gate scale on w13, the gate/up ratio rescales the up half of h,
@@ -283,7 +296,7 @@ def _w4a4_canonical(w13, w13_sf, w13_gs, w2, w2_sf, w2_gs):
         gs13 = w13_gs.float().contiguous()
         gs2 = w2_gs.float().contiguous()
     a_gs = torch.ones(1, dtype=torch.float32, device=w13.device)
-    if budget > 0:
+    if budget > 0 and bufs is None:
         entry = (
             (w13_4, w13_sf4, gs13, w2_4, w2_sf4, gs2, a_gs),
             (w13, w13_sf, w2, w2_sf),  # keepalive: data_ptr keys stay valid
@@ -294,6 +307,94 @@ def _w4a4_canonical(w13, w13_sf, w13_gs, w2, w2_sf, w2_gs):
             _, oldest = _w4a4_cache.popitem(last=False)
             _w4a4_cached_bytes -= sum(t.numel() * t.element_size() for t in oldest[0])
     return (w13_4, w13_sf4, gs13, w2_4, w2_sf4, gs2, a_gs)
+
+
+# --- W4A4 side-stream repack prefetch ------------------------------------
+# Arm calls walk the same chain of MoE weight sets every forward. Learn the
+# chain on the first forward, then repack the successor layer on a side
+# stream while the current layer's FP4 GEMMs are in flight: repack is
+# bandwidth-bound, the GEMMs and the next layer's attention are not, so most
+# of the ~2 ms/layer repack disappears. Costs up to two repack sets (~2.6
+# GB) in flight during prefill; SGLANG_SM12X_W3A4_PREFETCH=0 reverts to the
+# synchronous per-call repack.
+_prefetch_stream = None
+_prefetch_pending: dict = {}  # key -> (canonical tuple, done event, slot)
+_prefetch_succ: dict = {}  # key -> (next key, next weight snapshot)
+_prefetch_prev = None  # key of the previous arm call
+# Double-buffer pool: two resident canonical sets per weight shape,
+# alternated by consecutive calls, so the set the current GEMMs read is
+# never the set the next prefetch overwrites. Allocating per call instead
+# made the allocator cudaMalloc fresh blocks each layer (blocks freed on a
+# side stream cannot recycle into the main pool): prefill slowed 2.8 ->
+# 5.6 ms in the loop bench.
+_pf_pool: dict = {}  # shape key -> [slot0 (b13, b2), slot1 (b13, b2)]
+_pf_parity = 0
+
+
+def _arm_key(w13, w13_sf, w2, w2_sf):
+    return (w13.data_ptr(), w13_sf.data_ptr(), w2.data_ptr(), w2_sf.data_ptr())
+
+
+def _arm_record_and_prefetch(key, weights):
+    """Learn the forward's weight chain and start repacking the successor
+    layer on the side stream. Payload/sf tensors are model-owned and
+    stable across calls; global scales are per-call temporaries in some
+    paths, so a small fp32 snapshot is taken when recording the link."""
+    global _prefetch_stream, _prefetch_prev, _pf_parity
+    if _prefetch_prev is not None:
+        _prefetch_succ[_prefetch_prev] = (key, weights)
+    _prefetch_prev = key
+    if torch.cuda.is_current_stream_capturing():
+        return
+    nxt = _prefetch_succ.get(key)
+    if nxt is None or nxt[0] in _prefetch_pending:
+        return
+    nkey, (n13, n13_sf, n13_gs, n2, n2_sf, n2_gs) = nxt
+    skey = (n13.shape, n13_sf.shape, n2.shape, n2_sf.shape)
+    bufs = _pf_pool.get(skey)
+    if bufs is None:
+        # Two resident (payload, swizzled-sf) sets per weight shape,
+        # allocated on the main stream and never freed: the allocator is
+        # never in the loop. ~2.6 GB per distinct MoE weight shape.
+        def _mk(payload, sf_shape):
+            e, r, kb3 = payload.shape
+            return (
+                torch.empty(
+                    e, r, kb3 * 4 // 3, dtype=torch.uint8, device=payload.device
+                ),
+                torch.empty(
+                    e,
+                    sf_shape[1],
+                    sf_shape[2],
+                    dtype=torch.uint8,
+                    device=payload.device,
+                ),
+            )
+
+        bufs = [(_mk(n13, n13_sf.shape), _mk(n2, n2_sf.shape)) for _ in range(2)]
+        _pf_pool[skey] = bufs
+    slot = _pf_parity
+    if any(ent[2] == slot for ent in _prefetch_pending.values()):
+        return  # a live pending still pins this slot; skip this round
+    _pf_parity ^= 1
+    if _prefetch_stream is None:
+        _prefetch_stream = torch.cuda.Stream()
+    cur = torch.cuda.current_stream()
+    _prefetch_stream.wait_stream(cur)
+    b13, b2 = bufs[slot]
+    with torch.cuda.stream(_prefetch_stream):
+        try:
+            canon = _w4a4_canonical(
+                n13, n13_sf, n13_gs, n2, n2_sf, n2_gs, bufs=(b13, b2)
+            )
+        except RuntimeError:  # OOM under prefill pressure: inline next call
+            canon = None
+        ev = torch.cuda.Event()
+        ev.record(_prefetch_stream)
+    if canon is not None:
+        _prefetch_pending[nkey] = (canon, ev, slot)
+    while len(_prefetch_pending) > 2:
+        _prefetch_pending.pop(next(iter(_prefetch_pending)))
 
 
 def _w4a4_bucket(t: int) -> int:
@@ -328,9 +429,21 @@ def _w4a4_experts(
     e = w13.shape[0]
     topk = topk_ids.shape[1]
     inter = w2.shape[2] * 8 // 3
-    w13_4, w13_sf4, gs13, w2_4, w2_sf4, gs2, a_gs = _w4a4_canonical(
-        w13, w13_sf, w13_gs, w2, w2_sf, w2_gs
-    )
+    prefetch_on = envs.SGLANG_SM12X_W3A4_PREFETCH.get()
+    key = _arm_key(w13, w13_sf, w2, w2_sf)
+    # The prefetch fast path: the previous layer scheduled a repack of
+    # these weights on the side stream. It is consumed (event wait) only
+    # right before the GEMMs below, so the padding and routing prep here
+    # keeps the main stream busy while the repack finishes.
+    pend = None
+    if prefetch_on and not torch.cuda.is_current_stream_capturing():
+        pend = _prefetch_pending.pop(key, None)
+    if pend is not None:
+        w13_4, w13_sf4, gs13, w2_4, w2_sf4, gs2, a_gs = pend[0]
+    else:
+        w13_4, w13_sf4, gs13, w2_4, w2_sf4, gs2, a_gs = _w4a4_canonical(
+            w13, w13_sf, w13_gs, w2, w2_sf, w2_gs
+        )
     b = _w4a4_bucket(m)
     dev = hidden_states.device
     if b != m:
@@ -351,6 +464,32 @@ def _w4a4_experts(
     if ws is None:
         ws = allocate_workspace(b, h, inter, e, topk, True, dev)
         _w4a4_ws[ws_key] = ws
+    if prefetch_on:
+        # Launch the successor layer's repack first (side stream waits on
+        # everything queued so far, including the previous layer's GEMMs
+        # that last read these recycled blocks), THEN let this call's GEMMs
+        # queue behind its own repack's event. The repack is bandwidth-
+        # bound, the GEMMs that run alongside it are not. The global
+        # scales are per-call temporaries in the runner, so store small
+        # fp32 snapshots next to the stable payload/sf tensors.
+        _arm_record_and_prefetch(
+            key,
+            (
+                w13,
+                w13_sf,
+                w13_gs.float().clone(),
+                w2,
+                w2_sf,
+                w2_gs.float().clone(),
+            ),
+        )
+        if pend is not None:
+            cur = torch.cuda.current_stream()
+            cur.wait_event(pend[1])
+            # freed at call end: keep the allocator from recycling these
+            # blocks out from under the GEMMs' reads.
+            for t in pend[0]:
+                t.record_stream(cur)
     out = torch.empty(b, h, dtype=torch.bfloat16, device=dev)
     run_moe_w4a4(
         x,
