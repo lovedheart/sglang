@@ -1454,15 +1454,23 @@ class Envs:
     # hold every MoE layer the repack amortizes and the win starts near 128
     # tokens (5.3x at 4096), but a canonical copy costs ~1.5 GB per
     # 512-expert layer — on a KV-tight server that is not affordable.
+    # With per-call repack (cache off) the fused fold+swizzle repack still
+    # wins from ~1024 tokens: 1.1x at 1024, 2.0x at 2048, 1.9x at 4096
+    # (fork W3A16 triton GEMM crossover measured at ~768).
     # Same activation-quantization accuracy tradeoff as the W4A4 knob
     # above (the fp3 weights themselves repack exactly).
-    SGLANG_SM12X_W3A4_PREFILL_MIN_TOKENS = EnvInt(2048)
+    SGLANG_SM12X_W3A4_PREFILL_MIN_TOKENS = EnvInt(1024)
     # MB budget for caching the repacked NVFP4 copies in the sm12x_fp3_bf16
     # MoE runner (LRU).  A canonical copy costs ~4/3 of a layer's 3-bit
     # payload (~1.5 GB per 512-expert layer), so caching every MoE layer of
     # a KV-tight server OOMs it; 0 (default) repacks into recycled scratch
     # per call instead (peak ~1.5 GB, +~1.4 ms/call), at the cost of a
     # higher useful value of the min-tokens knob above.
+    # Only the prefills at or above the min-tokens knob use this cache;
+    # decode/verify forwards stay on the W3A16 fork path. It is also
+    # all-or-nothing in practice: forwards cycle through every MoE layer in
+    # order, so an LRU budget below the full set gets ~0 hits (the next
+    # forward reaches layer 0 exactly when its entry was evicted).
     SGLANG_SM12X_W3A4_CACHE_MB = EnvInt(0)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
