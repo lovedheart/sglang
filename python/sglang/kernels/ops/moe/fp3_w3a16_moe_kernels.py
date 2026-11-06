@@ -14,6 +14,10 @@ share that payload:
   Triton path is launch- and SM-starved.
 * ``_fp3_w3a16_gemm_kernel`` (Triton): grouped tensor-core GEMM with in-loop
   dequant, bf16 dots and FP32 accumulation; used for prefill-size batches.
+* flashinfer ``moe_nvfp4_w4a4`` (SM12x): on request, prefill-size batches
+  instead run block-scaled FP4 x FP4 tensor cores, fed by a lossless repack
+  of the payload into canonical NVFP4 storage (the dispatcher arms this at
+  or above the SGLANG_SM12X_W3A4_PREFILL_MIN_TOKENS threshold).
 
     w = CB[code] * E4M3[sf_byte & 0xFE] * (sf_byte & 1 ? -1 : 1) * gs
     CB = [-6, -2, -1, 0, 1, 2, 3, 6]
@@ -31,6 +35,7 @@ no gate/up ratio fold is needed.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 import torch
@@ -38,6 +43,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -59,6 +65,31 @@ _cute_disabled = False
 # keeps a reference so the data_ptr key cannot be recycled underneath it.
 _cute_sf_cache: dict = {}
 
+# flashinfer sm12x NVFP4 W4A4 grouped tensor-core arm, used for prefill-size
+# batches: the 3-bit payload repacks losslessly into canonical NVFP4 storage
+# (the codebook is a subset of the e2m1 grid; the sf mirror sign moves onto
+# the nibble), block scales are swizzled, and the gate/up global scales fold
+# as in the sm12x_nvfp4_bf16 runner (the ratio rides on gs2). Activations are
+# quantized to NVFP4 inside the kernel, so batches at or above
+# SGLANG_SM12X_W3A4_PREFILL_MIN_TOKENS (0 disables the arm) run fp4 x fp4
+# block-scaled MMA instead of the SIMT dequantize GEMMs. The repack costs
+# ~2.1 ms per 512-expert layer per call, so on a KV-tight server (cache off,
+# see below) the win starts around 1536 tokens: 1.70x at 2048, 1.65x at
+# 4096 vs the CuTe fork. With SGLANG_SM12X_W3A4_CACHE_MB big enough to hold
+# every MoE layer the repack amortizes and the arm wins from ~96 tokens up
+# (5-5.7x over Triton w3a16, 5.3x over the CuTe fork at 4096); a canonical
+# copy costs ~1.5 GB per 512-expert layer, so caching all layers of a deep
+# model OOMs a KV-tight server — 0 (default) repacks into allocator-
+# recycled scratch per call, peak ~1.5 GB regardless of layer count.
+_w4a4_failures = 0
+_w4a4_disabled = False
+# canonical repack LRU cache keyed by the weight storages; entries keep a
+# reference to the source tensors so data_ptr keys cannot be recycled.
+_w4a4_cache: OrderedDict[tuple, tuple] = OrderedDict()
+_w4a4_cached_bytes = 0
+# flashinfer workspaces, keyed by (bucket, h, i, e, topk, device)
+_w4a4_ws: dict = {}
+
 
 def _is_sm12x() -> bool:
     if not torch.cuda.is_available():
@@ -76,8 +107,7 @@ def _cute_sf_swizzled(sf: torch.Tensor) -> torch.Tensor:
         return hit[1]
     from sglang.srt.layers.quantization.utils import swizzle_blockscale
 
-    b = sf.to(torch.int64)
-    folded = ((b & 0xFE) ^ ((b & 1) << 7)).to(torch.uint8)
+    folded = (sf & 0xFE) ^ ((sf & 1) << 7)
     sw = swizzle_blockscale(folded.view(torch.float8_e4m3fn)).to(sf.device)
     _cute_sf_cache[key] = (sf, sw)
     return sw
@@ -118,6 +148,176 @@ def _cute_fork_experts(
         out,
     )
     return out
+
+
+@triton.jit
+def _lsb3_to_nvfp4_kernel(
+    payload_ptr, sf_ptr, out32_ptr, n_groups, BLOCK_G: tl.constexpr
+):
+    """Repack the LSB3 payload (8 codes per 3-byte group) into packed e2m1
+    nibbles (4 codes per byte, one u32 per group). The codebook
+    [-6,-2,-1,0,1,2,3,6] lands on e2m1 magnitude codes [7,4,2,0,2,4,5,7]
+    with sign on codes 0..2; the sf mirror bit (bit0) flips the nibble sign
+    so the canonical (non-negative) block scale is just ``sf & 0xFE``.
+    Each group's 8 codes share one sf byte (16 codes per scale block).
+    payload_ptr/out32_ptr are viewed as uint32 (so kb3 % 4 == 0).
+    """
+    pid = tl.program_id(0)
+    g = pid * BLOCK_G + tl.arange(0, BLOCK_G)
+    gmask = g < n_groups
+    byte = g * 3
+    w0 = tl.load(payload_ptr + byte // 4, mask=gmask, other=0)
+    w1 = tl.load(payload_ptr + (byte + 2) // 4, mask=gmask, other=0)
+    pair = w0.to(tl.uint64) | (w1.to(tl.uint64) << 32)
+    v = ((pair >> ((byte % 4) * 8).to(tl.uint64)) & 0xFFFFFF).to(tl.uint32)
+    j = tl.arange(0, 8)[None, :]
+    code = (v[:, None] >> (3 * j)) & 7
+    mag = tl.where(code == 1, 4, 0)
+    mag = tl.where(code == 2, 2, mag)
+    mag = tl.where(code == 4, 2, mag)
+    mag = tl.where(code == 5, 4, mag)
+    mag = tl.where(code == 6, 5, mag)
+    mag = tl.where((code == 0) | (code == 7), 7, mag)
+    sgn = (code < 3).to(tl.uint32)
+    sfl = tl.load(sf_ptr + g // 2, mask=gmask, other=0).to(tl.uint32)
+    nib = mag | ((sgn ^ (sfl[:, None] & 1)) << 3)
+    lo, hi = tl.split(tl.reshape(nib, (BLOCK_G, 4, 2)))
+    b = (lo | (hi << 4)).to(tl.uint32)
+    word = tl.sum(b << (8 * tl.arange(0, 4))[None, :].to(tl.uint32), axis=1)
+    tl.store(out32_ptr + g, word, mask=gmask)
+
+
+def _w4a4_canonical(w13, w13_sf, w13_gs, w2, w2_sf, w2_gs):
+    """Canonical NVFP4 buffers + the kernel scale vectors. Returns
+    (w13_4, w13_sf4, gs13, w2_4, w2_sf4, gs2, a_gs) with a_gs the (scalar)
+    activation quantization multiplier. Caching is off by default
+    (SGLANG_SM12X_W3A4_CACHE_MB=0): each call repacks into scratch that the
+    allocator recycles for the next layer, keeping peak overhead to ~1.5 GB
+    regardless of layer count (caching every layer is what OOMed a
+    KV-tight server). A positive budget enables an LRU cache of that many
+    MB, for hosts with real headroom."""
+    global _w4a4_cached_bytes
+    budget = envs.SGLANG_SM12X_W3A4_CACHE_MB.get() * (1 << 20)
+    key = (w13.data_ptr(), w13_sf.data_ptr(), w2.data_ptr(), w2_sf.data_ptr())
+    hit = _w4a4_cache.get(key)
+    if hit is not None:
+        _w4a4_cache.move_to_end(key)
+        return hit[0]
+    from sglang.srt.layers.quantization.utils import swizzle_blockscale
+
+    def repack(payload, sf):
+        e, r, kb3 = payload.shape
+        assert kb3 % 4 == 0, "payload row must be uint32-viewable"
+        n_groups = payload.numel() // 3
+        out32 = torch.empty(
+            e, r, kb3 * 4 // 3 // 4, dtype=torch.uint32, device=payload.device
+        )
+        _lsb3_to_nvfp4_kernel[(triton.cdiv(n_groups, 512),)](
+            payload.view(torch.uint32), sf, out32, n_groups, BLOCK_G=512, num_warps=4
+        )
+        out = out32.view(torch.uint8).view(e, r, kb3 * 4 // 3)
+        return out, swizzle_blockscale((sf & 0xFE).view(torch.float8_e4m3fn)).view(
+            torch.uint8
+        )
+
+    w13_4, w13_sf4 = repack(w13, w13_sf)
+    w2_4, w2_sf4 = repack(w2, w2_sf)
+    if w13_gs.dim() == 2:
+        # Canonical storage has one global scale per weight matrix. With the
+        # gate scale on w13, the gate/up ratio rescales the up half of h,
+        # which the GEMM2 scale absorbs exactly (same fold as the
+        # sm12x_nvfp4_bf16 runner); a zero gate scale keeps the raw gs2.
+        gate = w13_gs[:, 0].float()
+        up = w13_gs[:, 1].float()
+        gs13 = gate.contiguous()
+        ratio = torch.where(gate > 0, up / gate.clamp_min(1e-30), torch.ones_like(up))
+        gs2 = (w2_gs.float() * ratio).contiguous()
+    else:
+        gs13 = w13_gs.float().contiguous()
+        gs2 = w2_gs.float().contiguous()
+    a_gs = torch.ones(1, dtype=torch.float32, device=w13.device)
+    if budget > 0:
+        entry = (
+            (w13_4, w13_sf4, gs13, w2_4, w2_sf4, gs2, a_gs),
+            (w13, w13_sf, w2, w2_sf),  # keepalive: data_ptr keys stay valid
+        )
+        _w4a4_cache[key] = entry
+        _w4a4_cached_bytes += sum(t.numel() * t.element_size() for t in entry[0])
+        while _w4a4_cached_bytes > budget and len(_w4a4_cache) > 1:
+            _, oldest = _w4a4_cache.popitem(last=False)
+            _w4a4_cached_bytes -= sum(t.numel() * t.element_size() for t in oldest[0])
+    return (w13_4, w13_sf4, gs13, w2_4, w2_sf4, gs2, a_gs)
+
+
+def _w4a4_bucket(t: int) -> int:
+    # flashinfer compiles and allocates per token count; prefill batch sizes
+    # never repeat, so round up to a power of two to bound the compile set
+    # (one compile per octave) at <=2x padding. The arm's token floor keeps
+    # this within the 1..8192 ladder.
+    return t if t & (t - 1) == 0 else 1 << (t - 1).bit_length()
+
+
+def _w4a4_experts(
+    hidden_states,
+    w13,
+    w13_sf,
+    w13_gs,
+    w2,
+    w2_sf,
+    w2_gs,
+    topk_weights,
+    topk_ids,
+    routed_scaling_factor,
+):
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_nvfp4_w4a4 import (
+        allocate_workspace,
+        run_moe_w4a4,
+    )
+
+    m, h = hidden_states.shape
+    e = w13.shape[0]
+    topk = topk_ids.shape[1]
+    inter = w2.shape[2] * 8 // 3
+    w13_4, w13_sf4, gs13, w2_4, w2_sf4, gs2, a_gs = _w4a4_canonical(
+        w13, w13_sf, w13_gs, w2, w2_sf, w2_gs
+    )
+    b = _w4a4_bucket(m)
+    dev = hidden_states.device
+    if b != m:
+        ids = torch.full((b, topk), e, dtype=torch.int32, device=dev)
+        ids[:m] = topk_ids.to(torch.int32)
+        wts = torch.zeros(b, topk, dtype=torch.float32, device=dev)
+        wts[:m] = topk_weights
+        x = torch.zeros(b, h, dtype=torch.bfloat16, device=dev)
+        x[:m] = hidden_states
+    else:
+        ids = topk_ids.to(torch.int32)
+        wts = topk_weights.to(torch.float32)
+        x = hidden_states
+    if routed_scaling_factor != 1.0:
+        wts = wts * routed_scaling_factor
+    ws_key = (b, h, inter, e, topk, dev)
+    ws = _w4a4_ws.get(ws_key)
+    if ws is None:
+        ws = allocate_workspace(b, h, inter, e, topk, True, dev)
+        _w4a4_ws[ws_key] = ws
+    out = torch.empty(b, h, dtype=torch.bfloat16, device=dev)
+    run_moe_w4a4(
+        x,
+        ids,
+        wts,
+        w13_4,
+        w13_sf4,
+        gs13,
+        w2_4,
+        w2_sf4,
+        gs2,
+        a_gs,
+        a_gs,
+        out,
+        workspace=ws,
+    )
+    return out[:m]
 
 
 def repack_fp3_w3a16_lsb3(payload: torch.Tensor) -> torch.Tensor:
@@ -496,7 +696,12 @@ def fused_experts_fp3_w3a16(
     Dispatches decode-size slot counts to the grouped SIMT GEMV (zero VRAM
     overhead, fp32 math) and larger ones to the Triton tensor-core GEMM.
     """
-    global _gemv_unavailable, _cute_failures, _cute_disabled
+    global \
+        _gemv_unavailable, \
+        _cute_failures, \
+        _cute_disabled, \
+        _w4a4_failures, \
+        _w4a4_disabled
     assert hidden_states.dtype == torch.bfloat16 and hidden_states.is_contiguous()
     assert activation == "silu", f"fp3_w3a16 supports silu, got {activation}"
     m, k = hidden_states.shape
@@ -505,6 +710,41 @@ def fused_experts_fp3_w3a16(
     topk = topk_ids.shape[1]
     inter = w2.shape[2] * 8 // 3
     slots = m * topk
+
+    # flashinfer SM12x NVFP4 W4A4 grouped tensor-core arm (prefill sizes): the
+    # payload repacks losslessly to canonical NVFP4 (cached) and the kernel
+    # quantizes activations to fp4. The first call at a new token bucket
+    # compiles, so it must not run under CUDA graph capture; any failure
+    # falls back to the W3A16 paths below and disables the arm after 3 tries.
+    w4a4_min = envs.SGLANG_SM12X_W3A4_PREFILL_MIN_TOKENS.get()
+    if (
+        not _w4a4_disabled
+        and config is None
+        and w4a4_min > 0
+        and m >= w4a4_min
+        and _is_sm12x()
+    ):
+        try:
+            return _w4a4_experts(
+                hidden_states,
+                w13,
+                w13_sf,
+                w13_gs,
+                w2,
+                w2_sf,
+                w2_gs,
+                topk_weights,
+                topk_ids,
+                routed_scaling_factor or 1.0,
+            )
+        except Exception as exc:  # noqa: BLE001  (flashinfer optional: never fatal)
+            _w4a4_failures += 1
+            if _w4a4_failures >= 3:
+                _w4a4_disabled = True
+                print(
+                    f"fp3_w3a16 W4A4 prefill arm disabled after {_w4a4_failures} "
+                    f"failures ({exc}); using W3A16 paths"
+                )
 
     # CuTe DSL LSB3 fork: expands the 3-bit codebook payload to NVFP4 nibbles
     # in registers and runs the sm12x W4A16 tile kernels. Fastest path on
