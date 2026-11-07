@@ -2636,11 +2636,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         return self._forward_varlen_sparse(
             q, k_buffer, v_buffer, layer, forward_batch, metadata, topk_indices
         )
-            )
-
-        return self._forward_varlen_sparse(
-            q, k_buffer, v_buffer, layer, forward_batch, metadata, topk_indices
-        )
 
     def _forward_varlen_sparse(
         self,
