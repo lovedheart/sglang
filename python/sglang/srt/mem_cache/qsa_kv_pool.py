@@ -163,14 +163,6 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 MHATokenToKVPool,
             ):
                 raise ValueError("QSA K/V offload needs a directly addressed K/V pool")
-            if (
-                quant_method is not None
-                and envs.SGLANG_DEBUG_QSA_KV_OFFLOAD_VERIFY.get()
-            ):
-                raise ValueError(
-                    "QSA K/V offload verify compares dequantized gathers; the "
-                    "quantized host tier compares packed rows (not yet wired)"
-                )
             # The GPU keeps only the hot-cache and scratch rows of the K/V (in
             # verify mode next to the full pool). A quantized tier stores and
             # mirrors the packed rows plus their scale planes verbatim.
