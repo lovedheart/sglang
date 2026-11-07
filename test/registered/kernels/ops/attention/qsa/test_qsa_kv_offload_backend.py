@@ -120,7 +120,10 @@ def _assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor, what: st
 
 @pytest.mark.parametrize("torch_resolve", [False, True])
 @pytest.mark.parametrize("quantized", [False, True])
-def test_backend_offload_matches_full_pool(server_context, torch_resolve, quantized):
+@pytest.mark.parametrize("verify", [False, True])
+def test_backend_offload_matches_full_pool(
+    server_context, verify, quantized, torch_resolve
+):
     from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
         get_kv_cache_quant_method,
     )
@@ -144,9 +147,13 @@ def test_backend_offload_matches_full_pool(server_context, torch_resolve, quanti
         page_size=PAGE,
     )
     full = _backend(req_to_token, kv_offload_layout=None, quant_method=quant)
-    with envs.SGLANG_USE_QSA_KV_OFFLOAD_TORCH_RESOLVE.override(torch_resolve):
+    with (
+        envs.SGLANG_USE_QSA_KV_OFFLOAD_TORCH_RESOLVE.override(torch_resolve),
+        envs.SGLANG_DEBUG_QSA_KV_OFFLOAD_VERIFY.override(verify),
+    ):
         offloaded = _backend(req_to_token, kv_offload_layout=layout, quant_method=quant)
     assert full._kv_offload is None
+    assert offloaded._kv_offload.verify is verify
     assert offloaded._kv_offload.use_fused is not torch_resolve
     assert (offloaded._kv_offload.dev_ksf is not None) == quantized
     try:
