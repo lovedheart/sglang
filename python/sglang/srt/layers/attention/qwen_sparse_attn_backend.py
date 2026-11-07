@@ -156,6 +156,7 @@ def _gather_cp_kv(
     v_full = v_full.reshape(-1, v.shape[1], v.shape[2]).contiguous()
     return k_full, v_full
 
+
 # Cache for constant uniform row->request mappings (device, batch, rows-per-req).
 _ROW_TO_REQUEST_CACHE: dict = {}
 
