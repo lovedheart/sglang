@@ -236,6 +236,10 @@ def _gather_cp_kv(
     return k_full, v_full
 
 
+# Cache for constant uniform row->request mappings (device, batch, rows-per-req).
+_ROW_TO_REQUEST_CACHE: dict = {}
+
+
 class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     """Per-forward metadata consumed by core sparse attention."""
 
