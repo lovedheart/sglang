@@ -14,7 +14,7 @@ from sglang.srt.layers.fp8_lm_head import (
     quantize_lm_head_to_fp8_block128,
 )
 from sglang.srt.layers.lm_head_quant import quantize_lm_head
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.device import is_sm120_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 

@@ -29,7 +29,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     E3M4_BLOCK_FP8_ALGO,
     ModelOptMixedPrecisionConfig,
 )
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.device import is_sm120_supported
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
