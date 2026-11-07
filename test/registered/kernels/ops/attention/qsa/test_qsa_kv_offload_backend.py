@@ -47,7 +47,7 @@ def server_context():
         reset_context()
 
 
-def _backend(req_to_token, kv_offload_layout):
+def _backend(req_to_token, kv_offload_layout, quant_method=None):
     pool = QSATokenToKVPool(
         size=POOL_TOKENS,
         dtype=torch.bfloat16,
@@ -63,6 +63,7 @@ def _backend(req_to_token, kv_offload_layout):
         qsa_token_topk=TOKEN_TOPK,
         num_request_slots=REQUESTS + 1,
         kv_offload_layout=kv_offload_layout,
+        quant_method=quant_method,
     )
     runner = SimpleNamespace(
         device="cuda",
@@ -118,8 +119,18 @@ def _assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor, what: st
 
 
 @pytest.mark.parametrize("torch_resolve", [False, True])
-def test_backend_offload_matches_full_pool(server_context, torch_resolve):
+@pytest.mark.parametrize("quantized", [False, True])
+def test_backend_offload_matches_full_pool(server_context, torch_resolve, quantized):
+    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        get_kv_cache_quant_method,
+    )
+
     torch.manual_seed(11)
+    quant = (
+        get_kv_cache_quant_method("nvfp4", num_layers=1, device="cuda", page_size=PAGE)
+        if quantized
+        else None
+    )
     req_to_token = torch.zeros(
         (REQUESTS + 1, CONTEXT), dtype=torch.int32, device="cuda"
     )
@@ -132,11 +143,12 @@ def test_backend_offload_matches_full_pool(server_context, torch_resolve):
         max_extend_tokens=EXTEND_TOKENS,
         page_size=PAGE,
     )
-    full = _backend(req_to_token, kv_offload_layout=None)
+    full = _backend(req_to_token, kv_offload_layout=None, quant_method=quant)
     with envs.SGLANG_USE_QSA_KV_OFFLOAD_TORCH_RESOLVE.override(torch_resolve):
-        offloaded = _backend(req_to_token, kv_offload_layout=layout)
+        offloaded = _backend(req_to_token, kv_offload_layout=layout, quant_method=quant)
     assert full._kv_offload is None
     assert offloaded._kv_offload.use_fused is not torch_resolve
+    assert (offloaded._kv_offload.dev_ksf is not None) == quantized
     try:
         layer = SimpleNamespace(
             layer_id=0,
