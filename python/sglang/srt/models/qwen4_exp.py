@@ -2776,9 +2776,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             )
 
     def precompile_kernels_after_loading(self) -> None:
-        from sglang.srt.layers.quantization.unquant import precompile_splitk_tactics
+        from sglang.srt.layers.quantization.unquant import precompile_sm107_splitk_tactics
 
-        if precompile_splitk_tactics():
+        if precompile_sm107_splitk_tactics():
             logger.info("Precompiled BF16 split-K GEMM tactics for Qwen4-Exp")
 
     @classmethod
