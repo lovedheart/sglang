@@ -1745,6 +1745,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def _try_fused_kv_attention(self, q, k, v, layer, forward_batch, indices):
+        if self._kv_offload is not None:
+            # The fused writer stores straight into physical pool slots; under
+            # the K/V offload a forward's new rows belong to the offload's
+            # ring/scratch rows, which only ``_store_kv`` can address.
+            return None
         if not self._fused_kv_pool_eligible or not q.is_cuda or k is None or v is None:
             return None
         mode = forward_batch.forward_mode
@@ -2229,9 +2234,18 @@ class QwenSparseAttnBackend(AttentionBackend):
         # valid-counts + strided gather + paged decode; measured faster at
         # every batch size for NVFP4 (up to 2.8x at bs<=4), so it is enabled
         # for all realistic fp4 batches (scratch capped at ~1MB/row).
+        # A gather ``source`` (K/V offload) flows through as the row table:
+        # the kernel addresses the hot cache exactly like the full pool.
+        # Pending ``new_kv`` rows must land in the pool first: the kernel
+        # reads every attended row through the slot table.
         if self._fused_sparse_decode and batch <= (256 if fused_fp4 else 8):
+            if new_kv is not None:
+                new_k, new_v, new_loc, _ = new_kv
+                self.kv_layers.layer(layer.layer_id).store(
+                    layer, new_loc, new_k, new_v
+                )
             fused = self._forward_fused_sparse_decode(
-                q, layer, forward_batch, metadata, topk_indices, fused_fp4
+                q, layer, forward_batch, metadata, topk_indices, fused_fp4, source
             )
             if fused is not None:
                 return fused
@@ -2469,6 +2483,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         metadata,
         topk_indices: torch.Tensor,
         fp4: bool,
+        source: Optional[QSAKVGatherSource] = None,
     ) -> Optional[torch.Tensor]:
         """Gather + dequant + attention in one Triton pass over the top-k list.
 
@@ -2487,7 +2502,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             return None
         method = self.kv_cache_quant_method
         if fp4:
-            if method is None:
+            if method is None or source is not None:
+                # No fused FP4 read path over a gather source (the FP4 offload
+                # ships its own dequant row views; see the FP4 host tier).
                 return None
             k, v, k_sf, v_sf = pool.get_raw_kv_buffer(layer.layer_id)
             if k.dtype != torch.uint8:
@@ -2496,8 +2513,25 @@ class QwenSparseAttnBackend(AttentionBackend):
             v_gs = method.v_scales_gpu[layer.layer_id : layer.layer_id + 1]
             kv_heads = k.shape[1]
         else:
-            k = pool.get_key_buffer(layer.layer_id)
-            v = pool.get_value_buffer(layer.layer_id)
+            if source is not None:
+                # K/V offload: the per-forward device-row table addresses the
+                # hot cache exactly like req_to_token addresses the full pool,
+                # so the fused kernel runs over the pair unchanged.
+                k = source.k_buffer
+                v = source.v_buffer
+                gather_table = source.slot_table
+                req_indices = source.row_requests
+                sequence_lens = source.sequence_lengths
+            else:
+                k = pool.get_key_buffer(layer.layer_id)
+                v = pool.get_value_buffer(layer.layer_id)
+                gather_table = self.req_to_token_pool.req_to_token
+                req_indices = (
+                    metadata.row_req_pool_indices
+                    if metadata.row_req_pool_indices is not None
+                    else forward_batch.req_pool_indices
+                )
+                sequence_lens = metadata.sequence_lengths
             if k.dtype != torch.bfloat16:
                 return None
             k_sf = v_sf = k_gs = v_gs = None
@@ -2507,13 +2541,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         h_per_kv = q_heads // kv_heads
         if h_per_kv > 16 or kv_heads > 8 or k.shape[2] * (2 if fp4 else 1) != head_dim:
             return None
-        if metadata.sequence_lengths.dtype != torch.int32:
+        if sequence_lens.dtype != torch.int32:
             return None
-        req_indices = (
-            metadata.row_req_pool_indices
-            if metadata.row_req_pool_indices is not None
-            else forward_batch.req_pool_indices
-        )
         out = sparse_decode_attention(
             q.contiguous(),
             k,
@@ -2523,9 +2552,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             k_gs,
             v_gs,
             topk_indices,
-            self.req_to_token_pool.req_to_token,
+            gather_table,
             req_indices,
-            metadata.sequence_lengths,
+            sequence_lens,
             layer.scaling,
             fp4,
             self._qsa_fused_scratch,
