@@ -158,14 +158,22 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_rope_position_buffer = torch.empty(0)
         full_kv_pool = offload_pool = None
         if kv_offload_layout is not None:
+            if post_capture_active or full_kv_pool_class not in (
+                None,
+                MHATokenToKVPool,
+            ):
+                raise ValueError("QSA K/V offload needs a directly addressed K/V pool")
             if (
                 quant_method is not None
-                or post_capture_active
-                or full_kv_pool_class not in (None, MHATokenToKVPool)
+                and envs.SGLANG_DEBUG_QSA_KV_OFFLOAD_VERIFY.get()
             ):
-                raise ValueError("QSA K/V offload needs a plain unquantized K/V pool")
+                raise ValueError(
+                    "QSA K/V offload verify compares dequantized gathers; the "
+                    "quantized host tier compares packed rows (not yet wired)"
+                )
             # The GPU keeps only the hot-cache and scratch rows of the K/V (in
-            # verify mode next to the full pool).
+            # verify mode next to the full pool). A quantized tier stores and
+            # mirrors the packed rows plus their scale planes verbatim.
             offload_pool = MHATokenToKVPool(
                 size=kv_offload_layout.device_rows,
                 page_size=page_size,
@@ -176,7 +184,16 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 kv_cache_layout="nhd",
+                quant_method=quant_method,
             )
+            if quant_method is not None and (
+                offload_pool.k_scale_buffer is None
+                or offload_pool.v_scale_buffer is None
+            ):
+                raise ValueError(
+                    "QSA K/V offload with a quantized pool needs row-aligned "
+                    "per-block K/V scale planes"
+                )
             if not envs.SGLANG_DEBUG_QSA_KV_OFFLOAD_VERIFY.get():
                 full_kv_pool = offload_pool
         super().__init__(
@@ -204,6 +221,8 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 layout=kv_offload_layout,
                 k_buffers=offload_pool.k_buffer,
                 v_buffers=offload_pool.v_buffer,
+                k_sf_buffers=offload_pool.k_scale_buffer,
+                v_sf_buffers=offload_pool.v_scale_buffer,
                 host_rows=size + page_size,
                 verify=offload_pool is not self.full_kv_pool,
             )

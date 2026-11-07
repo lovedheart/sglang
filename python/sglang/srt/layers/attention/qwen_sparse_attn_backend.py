@@ -2502,16 +2502,32 @@ class QwenSparseAttnBackend(AttentionBackend):
             return None
         method = self.kv_cache_quant_method
         if fp4:
-            if method is None or source is not None:
-                # No fused FP4 read path over a gather source (the FP4 offload
-                # ships its own dequant row views; see the FP4 host tier).
+            if method is None:
                 return None
+            # Under the offload the pool IS the hot-cache pool, so the raw
+            # buffers are already the resolved device rows; only the row
+            # addressing differs.
             k, v, k_sf, v_sf = pool.get_raw_kv_buffer(layer.layer_id)
             if k.dtype != torch.uint8:
                 return None
             k_gs = method.k_scales_gpu[layer.layer_id : layer.layer_id + 1]
             v_gs = method.v_scales_gpu[layer.layer_id : layer.layer_id + 1]
             kv_heads = k.shape[1]
+            gather_table, req_indices, sequence_lens = (
+                (
+                    source.slot_table,
+                    source.row_requests,
+                    source.sequence_lengths,
+                )
+                if source is not None
+                else (
+                    self.req_to_token_pool.req_to_token,
+                    metadata.row_req_pool_indices
+                    if metadata.row_req_pool_indices is not None
+                    else forward_batch.req_pool_indices,
+                    metadata.sequence_lengths,
+                )
+            )
         else:
             if source is not None:
                 # K/V offload: the per-forward device-row table addresses the
@@ -2585,19 +2601,22 @@ class QwenSparseAttnBackend(AttentionBackend):
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
     def _gather_topk_rows_fp4(
-        self, layer, forward_batch, metadata, topk_indices: torch.Tensor
+        self,
+        layer,
+        forward_batch,
+        metadata,
+        topk_indices: torch.Tensor,
+        source: Optional[QSAKVGatherSource] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Row-gather + dequantize the selected (batch, topk) KV rows of an
         FP4 pool; the result is addressed by ``batch * topk + col`` and is
-        consumed by ``_compact_kv_gathered_rows`` downstream."""
-        req_to_token = self.req_to_token_pool.req_to_token
-        req_indices = (
-            metadata.row_req_pool_indices
-            if metadata.row_req_pool_indices is not None
-            else forward_batch.req_pool_indices
+        consumed by ``_compact_kv_gathered_rows`` downstream. A gather
+        ``source`` (K/V offload) selects through its device-row table."""
+        slot_table, req_indices = self._gather_tables(
+            forward_batch=forward_batch, metadata=metadata, source=source
         )
         positions = topk_indices.clamp(min=0).long()
-        slots = req_to_token[req_indices.long().unsqueeze(1), positions]
+        slots = slot_table[req_indices.long().unsqueeze(1), positions]
         return self._gather_kv_fp4(layer.layer_id, slots.reshape(-1))
 
     def _forward_paged_attention(
