@@ -358,8 +358,24 @@ class QwenSparseAttnBackend(AttentionBackend):
             f"qsa attention backend. Available {phase} accesses: {available}."
         )
 
+    def _fp4_read_buffers(self, layer_id: int, source=None):
+        """Packed K/V rows and their scale planes addressed by an FP4 gather.
+        A gather ``source`` (the K/V offload) addresses the offload's device
+        rows; only verify mode keeps those apart from the pool's own rows,
+        so an offload must never fall through to the full pool here."""
+        if source is not None:
+            offload = self._kv_offload
+            layer_idx = self.token_to_kv_pool.full_attention_layer_index(layer_id)
+            return (
+                source.k_buffer,
+                source.v_buffer,
+                offload.dev_ksf[layer_idx],
+                offload.dev_vsf[layer_idx],
+            )
+        return self.token_to_kv_pool.get_raw_kv_buffer(layer_id)
+
     def _gather_kv_fp4(
-        self, layer_id: int, slots: torch.Tensor
+        self, layer_id: int, slots: torch.Tensor, source=None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Gather physical token slots from packed FP4 storage and dequantize
         only those rows, for the GATHER_DEQUANT access.
@@ -369,8 +385,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         the access's compute dtype.  ``slots`` may hold -1 for invalid rows;
         those read row 0 and callers mask them downstream.
         """
-        pool = self.token_to_kv_pool
-        k_fp4, v_fp4, k_scales, v_scales = pool.get_raw_kv_buffer(layer_id)
+        k_fp4, v_fp4, k_scales, v_scales = self._fp4_read_buffers(layer_id, source)
         safe = slots.clamp(min=0).long()
         gather_dtype = k_fp4.dtype
         if gather_dtype == torch.uint8 and k_fp4.element_size() != 1:
@@ -2001,9 +2016,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 cu_k=cu_seqlens_k,
                 total_k=total_context,
                 max_k=max(sequence_lens, default=1),
-                output_dtype=None
-                if k_buffer.dtype == torch.float8_e4m3fn
-                else q.dtype,
+                output_dtype=None if k_buffer.dtype == torch.float8_e4m3fn else q.dtype,
             )
         # fp8 KV buffers carry implicit scale 1.0, so the kernel can widen
         # the gathered rows itself (it casts both K/V tiles to the query
@@ -2241,9 +2254,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if self._fused_sparse_decode and batch <= (256 if fused_fp4 else 8):
             if new_kv is not None:
                 new_k, new_v, new_loc, _ = new_kv
-                self.kv_layers.layer(layer.layer_id).store(
-                    layer, new_loc, new_k, new_v
-                )
+                self.kv_layers.layer(layer.layer_id).store(layer, new_loc, new_k, new_v)
             fused = self._forward_fused_sparse_decode(
                 q, layer, forward_batch, metadata, topk_indices, fused_fp4, source
             )
@@ -2333,9 +2344,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             # directly and dequantizes into the scratch in one launch.  The
             # gathered_rows/quantized flags below are set for the legacy path
             # only, so the buffers they name are never materialized here.
-            k_fp4, v_fp4, k_sf, v_sf = self.token_to_kv_pool.get_raw_kv_buffer(
-                layer.layer_id
-            )
+            k_fp4, v_fp4, k_sf, v_sf = self._fp4_read_buffers(layer.layer_id, source)
             if k_sf.dtype == torch.float8_e4m3fn:
                 k_sf = k_sf.view(torch.uint8)
                 v_sf = v_sf.view(torch.uint8)
@@ -2507,7 +2516,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             # Under the offload the pool IS the hot-cache pool, so the raw
             # buffers are already the resolved device rows; only the row
             # addressing differs.
-            k, v, k_sf, v_sf = pool.get_raw_kv_buffer(layer.layer_id)
+            k, v, k_sf, v_sf = self._fp4_read_buffers(layer.layer_id, source)
             if k.dtype != torch.uint8:
                 return None
             k_gs = method.k_scales_gpu[layer.layer_id : layer.layer_id + 1]
@@ -2617,7 +2626,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         positions = topk_indices.clamp(min=0).long()
         slots = slot_table[req_indices.long().unsqueeze(1), positions]
-        return self._gather_kv_fp4(layer.layer_id, slots.reshape(-1))
+        return self._gather_kv_fp4(layer.layer_id, slots.reshape(-1), source)
 
     def _forward_paged_attention(
         self,
@@ -2743,9 +2752,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             forward_batch=forward_batch, metadata=metadata, source=source
         )
         if self.kv_cache_quant_method is not None and self._fused_fp4_gather:
-            k_fp4, v_fp4, k_sf, v_sf = self.token_to_kv_pool.get_raw_kv_buffer(
-                layer.layer_id
-            )
+            k_fp4, v_fp4, k_sf, v_sf = self._fp4_read_buffers(layer.layer_id, source)
             if k_sf.dtype == torch.float8_e4m3fn:
                 k_sf = k_sf.view(torch.uint8)
                 v_sf = v_sf.view(torch.uint8)
