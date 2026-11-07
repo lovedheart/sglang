@@ -21,7 +21,7 @@ import logging
 
 import torch
 from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.device import is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
