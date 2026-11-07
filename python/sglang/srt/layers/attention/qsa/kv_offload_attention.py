@@ -11,7 +11,6 @@ compared with the full pool's.
 
 from __future__ import annotations
 
-from functools import partial
 from typing import Tuple
 
 import msgspec
@@ -130,7 +129,13 @@ def gather_offloaded_context(
     ]
     pool = backend.token_to_kv_pool
     layer_idx = pool.full_attention_layer_index(layer.layer_id)
-    k, v = offload.gather_context(layer_idx=layer_idx, slots=slots)
+    k, v, k_sf, v_sf = offload.gather_context(layer_idx=layer_idx, slots=slots)
+    if k_sf is not None:
+        # Quantized host tier: dequantize the gathered packed rows here; the
+        # prefill attention runs on plain K/V either way.
+        return backend.kv_cache_quant_method.dequantize_gathered_kv(
+            k, k_sf, v, v_sf, layer.layer_id, output_dtype
+        )
     pool_k = pool.layer_router.read(layer.layer_id).key()
     pool_v = pool.layer_router.read(layer.layer_id).value()
     packed = (
@@ -185,11 +190,20 @@ def forward_offloaded_attention(
     # Valid positions lead each row, so column ids keep the packing order.
     columns = torch.arange(width, dtype=torch.int32, device=rows.device)
     indices = torch.where(rows >= 0, columns, -1)
-    pool_k = pool.layer_router.read(layer.layer_id).key()
-    pool_v = pool.layer_router.read(layer.layer_id).value()
+    quantized = backend.kv_cache_quant_method is not None
+    if quantized:
+        # The device rows of a quantized offload are packed rows already; a
+        # quantized layer_router read would dequantize the whole pool.
+        k_source = offload.dev_k[layer_idx]
+        v_source = offload.dev_v[layer_idx]
+    else:
+        pool_k = pool.layer_router.read(layer.layer_id).key()
+        pool_v = pool.layer_router.read(layer.layer_id).value()
+        k_source = offload.dev_k[layer_idx].view(pool_k.dtype)
+        v_source = offload.dev_v[layer_idx].view(pool_v.dtype)
     source = QSAKVGatherSource(
-        k_buffer=offload.dev_k[layer_idx].view(pool_k.dtype),
-        v_buffer=offload.dev_v[layer_idx].view(pool_v.dtype),
+        k_buffer=k_source,
+        v_buffer=v_source,
         slot_table=rows,
         row_requests=torch.arange(num_rows, device=rows.device),
         sequence_lengths=torch.full(
@@ -219,15 +233,40 @@ def forward_offloaded_attention(
             ),
         )
     indices = indices.to(torch.int32).contiguous()
-    attention = (
-        backend._forward_varlen_sparse
-        if trtllm_decode is None
-        else partial(backend._forward_trtllm_sparse, trtllm_decode=trtllm_decode)
-    )
-    return attention(
+    if quantized:
+        if backend._fused_fp4_gather:
+            # The fused FP4 reads address the packed device rows directly
+            # through the source table; the buffers only carry metadata.
+            k_buffer = torch.empty(
+                (0, k_source.shape[1], k_source.shape[2] * 2),
+                dtype=backend._fp4_attn_dtype,
+                device=q.device,
+            )
+            v_buffer = k_buffer
+        else:
+            k_buffer, v_buffer = backend._gather_topk_rows_fp4(
+                layer, forward_batch, metadata, indices, source=source
+            )
+    else:
+        k_buffer = source.k_buffer
+        v_buffer = source.v_buffer
+    if trtllm_decode is not None:
+        return backend._forward_trtllm_sparse(
+            q=q,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+            layer=layer,
+            forward_batch=forward_batch,
+            metadata=metadata,
+            topk_indices=indices,
+            trtllm_decode=trtllm_decode,
+            source=source,
+            gathered_rows=quantized,
+        )
+    return backend._forward_varlen_sparse(
         q=q,
-        k_buffer=source.k_buffer,
-        v_buffer=source.v_buffer,
+        k_buffer=k_buffer,
+        v_buffer=v_buffer,
         layer=layer,
         forward_batch=forward_batch,
         metadata=metadata,

@@ -397,11 +397,33 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         layout = offload_layout_from_config(
             hf_config=model_config.hf_config, num_request_slots=1, page_size=page_size
         )
+        kv_size = torch._utils._element_size(kvc.kv_cache_dtype)
+        if is_float4_e2m1fn_x2(kvc.kv_cache_dtype):
+            # The offload mirrors exactly what a quantized MHA pool stores per
+            # token: packed rows plus their per-block scale planes.
+            from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+                get_kv_cache_quant_method,
+                resolve_kv_cache_quant,
+            )
+
+            quant_method = get_kv_cache_quant_method(
+                resolve_kv_cache_quant(kvc.kv_cache_dtype_str),
+                num_layers=num_layers,
+                device=kvc.device,
+                page_size=page_size,
+            )
+            offloaded_bytes_per_token = quant_method.compute_cell_size(
+                kv_heads, model_config.head_dim, num_layers, kv_size
+            )
+        else:
+            offloaded_bytes_per_token = (
+                kv_heads
+                * (model_config.head_dim + model_config.v_head_dim)
+                * num_layers
+                * kv_size
+            )
         return QSAKVOffloadBudget(
-            offloaded_bytes_per_token=kv_heads
-            * (model_config.head_dim + model_config.v_head_dim)
-            * num_layers
-            * torch._utils._element_size(kvc.kv_cache_dtype),
+            offloaded_bytes_per_token=offloaded_bytes_per_token,
             region_rows=layout.region_rows,
             fixed_rows=layout.scratch_rows + page_size,
             table_bytes_per_slot=offload_table_bytes_per_slot(

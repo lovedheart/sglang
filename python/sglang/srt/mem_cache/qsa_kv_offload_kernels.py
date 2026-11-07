@@ -21,6 +21,8 @@ synchronization, so decode and target-verify forwards can be captured:
 (CUDA-graph padding) change no state and get ``-1`` rows.
 """
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -353,6 +355,10 @@ class QSAKVFusedResolve:
         dev_v,
         host_k: torch.Tensor,
         host_v: torch.Tensor,
+        dev_ksf=None,
+        dev_vsf=None,
+        host_ksf: Optional[torch.Tensor] = None,
+        host_vsf: Optional[torch.Tensor] = None,
         max_rows_per_request: int,
     ):
         device = dev_k[0].device
@@ -365,6 +371,26 @@ class QSAKVFusedResolve:
         self.dev_v = [b.view(b.shape[0], -1).view(torch.int64) for b in dev_v]
         self.host_k_addr = [host_k[i].data_ptr() for i in range(layers)]
         self.host_v_addr = [host_v[i].data_ptr() for i in range(layers)]
+        # Quantized (NVFP4) K/V: the per-block scale planes ride the same
+        # copy launches, row-aligned, with their own row width.
+        self.sf = dev_ksf is not None
+        if self.sf:
+            sf_row_bytes = dev_ksf[0][0].numel() * dev_ksf[0].element_size()
+            words = sf_row_bytes // 8
+            if sf_row_bytes % 8 or words & (words - 1):
+                raise ValueError(
+                    f"K/V scale row of {sf_row_bytes} B is not a power-of-two "
+                    "number of 8 B words"
+                )
+            self.sf_row_words = words
+            self.dev_ksf = [
+                b.view(b.shape[0], -1).view(torch.int64) for b in dev_ksf
+            ]
+            self.dev_vsf = [
+                b.view(b.shape[0], -1).view(torch.int64) for b in dev_vsf
+            ]
+            self.host_ksf_addr = [host_ksf[i].data_ptr() for i in range(layers)]
+            self.host_vsf_addr = [host_vsf[i].data_ptr() for i in range(layers)]
         nr, hot, cr = num_request_slots, hot_blocks, compress_ratio
         self.num_request_slots, self.hot_blocks, self.cr = nr, hot, cr
         self.region_rows = region_rows
@@ -496,6 +522,36 @@ class QSAKVFusedResolve:
             ROW_WORDS=self.row_words,
             num_warps=2,
         )
+        if self.sf:
+            # The scale planes ride the identical plan with their own width.
+            _copy_plan_kernel[(groups, triton.cdiv(block_u, _PLAN_PER_PROGRAM))](
+                self.plan_src,
+                self.plan_dst,
+                self.plan_n,
+                self.num_real,
+                self.host_ksf_addr[layer_idx],
+                self.host_vsf_addr[layer_idx],
+                self.dev_ksf[layer_idx],
+                self.dev_vsf[layer_idx],
+                BLOCK_U=block_u,
+                PER_PROGRAM=_PLAN_PER_PROGRAM,
+                CR=self.cr,
+                ROW_WORDS=self.sf_row_words,
+                num_warps=8,
+            )
+            _ring_load_kernel[(groups,)](
+                self.rplan_src,
+                self.rplan_dst,
+                self.rplan_n,
+                self.num_real,
+                self.host_ksf_addr[layer_idx],
+                self.host_vsf_addr[layer_idx],
+                self.dev_ksf[layer_idx],
+                self.dev_vsf[layer_idx],
+                SLOTS=_RING * self.cr,
+                ROW_WORDS=self.sf_row_words,
+                num_warps=2,
+            )
         return rows
 
     def write_through(
@@ -513,3 +569,14 @@ class QSAKVFusedResolve:
             ROW_WORDS=self.row_words,
             num_warps=2,
         )
+        if self.sf:
+            _write_through_kernel[(rows.numel(),)](
+                rows,
+                loc,
+                self.host_ksf_addr[layer_idx],
+                self.host_vsf_addr[layer_idx],
+                self.dev_ksf[layer_idx],
+                self.dev_vsf[layer_idx],
+                ROW_WORDS=self.sf_row_words,
+                num_warps=2,
+            )

@@ -237,8 +237,7 @@ def offload_table_bytes_per_slot(
     return num_layers * per_layer
 
 
-def _copy_rows(
-    *,
+def _copy_plane(
     k_dst: torch.Tensor,
     v_dst: torch.Tensor,
     dst: torch.Tensor,
@@ -246,10 +245,12 @@ def _copy_rows(
     v_src: torch.Tensor,
     src: torch.Tensor,
 ) -> None:
-    """K/V rows ``src[i]`` -> ``dst[i]`` between device and pinned host buffers."""
-    if dst.numel() == 0:
-        return
-    if dst.is_cuda:
+    """One K/V plane's rows ``src[i]`` -> ``dst[i]`` across devices. The TMA
+    transfer kernel wants rows that are a multiple of one 32-lane package
+    group (128 B); the small scale planes of a quantized K/V fall back to
+    index copies, which is fine: they only travel on eager reference paths."""
+    row_bytes = k_dst[0].numel() * k_dst.element_size()
+    if dst.is_cuda and row_bytes % 128 == 0:
         from sglang.kernels.ops.kvcache.hicache import transfer_hicache_one_layer
 
         transfer_hicache_one_layer(
@@ -262,8 +263,33 @@ def _copy_rows(
             element_dim=k_dst[0].numel(),
         )
         return
-    k_dst.index_copy_(0, dst, k_src.index_select(0, src))
-    v_dst.index_copy_(0, dst, v_src.index_select(0, src))
+    gathered_k = k_src.index_select(0, src.to(k_src.device))
+    gathered_v = v_src.index_select(0, src.to(v_src.device))
+    k_dst.index_copy_(0, dst.to(k_dst.device), gathered_k.to(k_dst.device))
+    v_dst.index_copy_(0, dst.to(v_dst.device), gathered_v.to(v_dst.device))
+
+
+def _copy_rows(
+    *,
+    k_dst: torch.Tensor,
+    v_dst: torch.Tensor,
+    dst: torch.Tensor,
+    k_src: torch.Tensor,
+    v_src: torch.Tensor,
+    src: torch.Tensor,
+    ks_dst: Optional[torch.Tensor] = None,
+    vs_dst: Optional[torch.Tensor] = None,
+    ks_src: Optional[torch.Tensor] = None,
+    vs_src: Optional[torch.Tensor] = None,
+) -> None:
+    """K/V rows ``src[i]`` -> ``dst[i]`` between device and pinned host buffers.
+    A quantized K/V passes its per-block scale planes along; they travel with
+    the data rows of the same logical slots."""
+    if dst.numel() == 0:
+        return
+    _copy_plane(k_dst, v_dst, dst, k_src, v_src, src)
+    if ks_dst is not None:
+        _copy_plane(ks_dst, vs_dst, dst, ks_src, vs_src, src)
 
 
 class QSAKVHostOffload:
@@ -282,6 +308,8 @@ class QSAKVHostOffload:
         k_buffers: List[torch.Tensor],
         v_buffers: List[torch.Tensor],
         host_rows: int,
+        k_sf_buffers: Optional[List[torch.Tensor]] = None,
+        v_sf_buffers: Optional[List[torch.Tensor]] = None,
         pin_memory: bool = True,
         verify: bool = False,
     ):
@@ -295,6 +323,10 @@ class QSAKVHostOffload:
         self.tail_rows = layout.tail_rows
         self.dev_k = k_buffers
         self.dev_v = v_buffers
+        # A quantized (NVFP4) pool adds row-aligned per-block scale planes.
+        self.quantized = k_sf_buffers is not None
+        self.dev_ksf = k_sf_buffers
+        self.dev_vsf = v_sf_buffers
         self.num_layers = len(k_buffers)
         self.device = k_buffers[0].device
         row_shape = tuple(k_buffers[0].shape[1:])
@@ -307,21 +339,34 @@ class QSAKVHostOffload:
             )
         self.host_rows = host_rows
         dtype = k_buffers[0].dtype
+
         # Pageable memory of the exact size, page-locked with cudaHostRegister:
         # torch's pinned caching allocator rounds each block up to a power of two.
-        dims = (self.num_layers, host_rows, *row_shape)
-        self.host_k, self.host_v = (
-            alloc_with_host_register(
-                dims=dims,
+        def alloc(row_shape):
+            return alloc_with_host_register(
+                dims=(self.num_layers, host_rows, *row_shape),
                 dtype=dtype,
                 device="cpu",
                 pin_memory=pin_memory,
                 allocator=HostTensorAllocator(),
             )
-            for _ in range(2)
-        )
+
+        self.host_k, self.host_v = alloc(row_shape), alloc(row_shape)
+        if k_sf_buffers is not None:
+            sf_row_shape = tuple(k_sf_buffers[0].shape[1:])
+            if tuple(v_sf_buffers[0].shape[1:]) != sf_row_shape:
+                raise ValueError("QSA K/V offload needs equal K and V scale row shapes")
+            if k_sf_buffers[0].dtype != dtype or v_sf_buffers[0].dtype != dtype:
+                raise ValueError("QSA K/V offload scale planes must share the dtype")
+            self.host_ksf, self.host_vsf = alloc(sf_row_shape), alloc(sf_row_shape)
+        else:
+            self.host_ksf = self.host_vsf = None
         self.pin_memory = pin_memory
-        self.host_bytes = 2 * self.host_k.numel() * self.host_k.element_size()
+        self.host_bytes = 2 * self.host_k.numel() * self.host_k.element_size() + (
+            0
+            if self.host_ksf is None
+            else 2 * self.host_ksf.numel() * self.host_ksf.element_size()
+        )
         logger.info(
             "QSA K/V offload: %d layers, host K/V %.2f GB (%d rows), %d device "
             "rows (%d request slots x %d hot blocks + %d scratch rows)",
@@ -360,12 +405,17 @@ class QSAKVHostOffload:
         loc: torch.Tensor,
         pool_k: torch.Tensor,
         pool_v: torch.Tensor,
+        pool_ksf: Optional[torch.Tensor] = None,
+        pool_vsf: Optional[torch.Tensor] = None,
     ) -> None:
         """Verify mode: the new K/V the full pool holds at ``loc`` -> device
         rows ``rows`` and host rows ``loc`` (no host sync: graph-capturable)."""
         loc, rows = loc.long(), rows.long()
         self.dev_k[layer_idx][rows] = pool_k[loc]
         self.dev_v[layer_idx][rows] = pool_v[loc]
+        if pool_ksf is not None:
+            self.dev_ksf[layer_idx][rows] = pool_ksf[loc]
+            self.dev_vsf[layer_idx][rows] = pool_vsf[loc]
         self.write_through(layer_idx=layer_idx, rows=rows, loc=loc)
 
     def check(self, what: str, layer_idx: int, actual, expected) -> None:
@@ -401,8 +451,9 @@ class QSAKVHostOffload:
                 int(self.fused.errors),
             )
         if self.pin_memory:
-            for buffer in (self.host_k, self.host_v):
-                _cuda_host_unregister(buffer)
+            for buffer in (self.host_k, self.host_v, self.host_ksf, self.host_vsf):
+                if buffer is not None:
+                    _cuda_host_unregister(buffer)
         self.pin_memory = False
 
     def bind(self, req_to_token: torch.Tensor) -> None:
@@ -435,6 +486,10 @@ class QSAKVHostOffload:
                 dev_v=self.dev_v,
                 host_k=self.host_k,
                 host_v=self.host_v,
+                dev_ksf=self.dev_ksf,
+                dev_vsf=self.dev_vsf,
+                host_ksf=self.host_ksf,
+                host_vsf=self.host_vsf,
                 max_rows_per_request=self.layout.rows_per_request,
             )
             return
@@ -562,16 +617,31 @@ class QSAKVHostOffload:
             k_src=self.dev_k[layer_idx],
             v_src=self.dev_v[layer_idx],
             src=rows.long(),
+            ks_dst=self.host_ksf[layer_idx] if self.quantized else None,
+            vs_dst=self.host_vsf[layer_idx] if self.quantized else None,
+            ks_src=None if self.dev_ksf is None else self.dev_ksf[layer_idx],
+            vs_src=None if self.dev_vsf is None else self.dev_vsf[layer_idx],
         )
 
     def gather_context(
         self, layer_idx: int, slots: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Host K/V rows of these logical slots, in order, on the device."""
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
+    ]:
+        """Host K/V rows of these logical slots, in order, on the device (plus
+        the scale planes of a quantized K/V)."""
         rows = slots.numel()
         shape = (rows, *self.dev_k[layer_idx].shape[1:])
         k = torch.empty(shape, dtype=self.dev_k[layer_idx].dtype, device=self.device)
         v = torch.empty_like(k)
+        if self.quantized:
+            sf_shape = (rows, *self.dev_ksf[layer_idx].shape[1:])
+            ksf = torch.empty(
+                sf_shape, dtype=self.dev_ksf[layer_idx].dtype, device=self.device
+            )
+            vsf = torch.empty_like(ksf)
+        else:
+            ksf = vsf = None
         dst = torch.arange(rows, dtype=torch.int64, device=self.device)
         _copy_rows(
             k_dst=k,
@@ -580,8 +650,12 @@ class QSAKVHostOffload:
             k_src=self.host_k[layer_idx],
             v_src=self.host_v[layer_idx],
             src=slots.long(),
+            ks_dst=ksf,
+            vs_dst=vsf,
+            ks_src=self.host_ksf[layer_idx] if self.quantized else None,
+            vs_src=self.host_vsf[layer_idx] if self.quantized else None,
         )
-        return k, v
+        return k, v, ksf, vsf
 
     # ---- decode / target verify ----------------------------------------------
 
@@ -713,6 +787,10 @@ class QSAKVHostOffload:
                 k_src=self.host_k[layer_idx],
                 v_src=self.host_v[layer_idx],
                 src=src0[load_g, load_c].long(),
+                ks_dst=self.dev_ksf[layer_idx] if self.quantized else None,
+                vs_dst=self.dev_vsf[layer_idx] if self.quantized else None,
+                ks_src=self.host_ksf[layer_idx] if self.quantized else None,
+                vs_src=self.host_vsf[layer_idx] if self.quantized else None,
             )
         # A block that re-enters the ring is rewritten there: drop its LRU copy.
         for b in (block, block + 1):
@@ -793,4 +871,8 @@ class QSAKVHostOffload:
             k_src=self.host_k[layer_idx],
             v_src=self.host_v[layer_idx],
             src=src.long().reshape(-1),
+            ks_dst=self.dev_ksf[layer_idx] if self.quantized else None,
+            vs_dst=self.dev_vsf[layer_idx] if self.quantized else None,
+            ks_src=self.host_ksf[layer_idx] if self.quantized else None,
+            vs_src=self.host_vsf[layer_idx] if self.quantized else None,
         )
