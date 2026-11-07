@@ -24,7 +24,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.device import is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
