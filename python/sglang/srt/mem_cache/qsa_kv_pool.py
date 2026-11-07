@@ -84,6 +84,8 @@ class QSATokenToKVPool(HybridLinearKVPool):
     # Full slot 0 is the reserved padding slot; compressed slot 0 is the inert dump.
     # Pending-ring dtype: the raw keys are averaged from here, so it stays bf16.
     index_state_dtype = torch.bfloat16
+    # The host K/V tier, built by __init__ when a kv_offload_layout is given.
+    kv_offload: Optional[QSAKVHostOffload] = None
     # Compressed keys stay BF16 in the pool even under
     # SGLANG_QSA_USE_FP8_INDEXER: the SM120 paged FP8 kernel requires
     # block_kv 64 while compressed pages are ratio-shrunken, so a gathered
