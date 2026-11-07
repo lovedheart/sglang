@@ -33,6 +33,9 @@ class QSAKVGatherSource(msgspec.Struct, frozen=True):
     slot_table: torch.Tensor
     row_requests: torch.Tensor
     sequence_lengths: torch.Tensor
+    # A quantized (FP4) offload additionally addresses its device scale planes.
+    k_sf_buffer: torch.Tensor | None = None
+    v_sf_buffer: torch.Tensor | None = None
 
 
 def _pack_gathered_kv(source: QSAKVGatherSource, indices: torch.Tensor):
@@ -96,6 +99,12 @@ def store_offloaded_kv(*, backend, layer, forward_batch, k, v) -> None:
             loc=forward_batch.out_cache_loc,
             pool_k=pool.full_kv_pool.k_buffer[layer_idx],
             pool_v=pool.full_kv_pool.v_buffer[layer_idx],
+            pool_ksf=pool.full_kv_pool.k_scale_buffer[layer_idx]
+            if offload.quantized
+            else None,
+            pool_vsf=pool.full_kv_pool.v_scale_buffer[layer_idx]
+            if offload.quantized
+            else None,
         )
         return
     backend.kv_layers.layer(layer.layer_id).store(layer, rows, k, v)
@@ -131,6 +140,23 @@ def gather_offloaded_context(
     layer_idx = pool.full_attention_layer_index(layer.layer_id)
     k, v, k_sf, v_sf = offload.gather_context(layer_idx=layer_idx, slots=slots)
     if k_sf is not None:
+        if offload.verify:
+            # Packed rows compare bit for bit against the full pool's rows of
+            # the same logical slots; both sides quantized identically.
+            pool_kp, pool_vp, pool_ksf, pool_vsf = pool.get_raw_kv_buffer(
+                layer.layer_id
+            )
+            offload.check(
+                what="prefill context",
+                layer_idx=layer_idx,
+                actual=(k, v, k_sf, v_sf),
+                expected=(
+                    pool_kp[slots],
+                    pool_vp[slots],
+                    pool_ksf[slots],
+                    pool_vsf[slots],
+                ),
+            )
         # Quantized host tier: dequantize the gathered packed rows here; the
         # prefill attention runs on plain K/V either way.
         return backend.kv_cache_quant_method.dequantize_gathered_kv(
@@ -196,11 +222,14 @@ def forward_offloaded_attention(
         # quantized layer_router read would dequantize the whole pool.
         k_source = offload.dev_k[layer_idx]
         v_source = offload.dev_v[layer_idx]
+        k_sf_source = offload.dev_ksf[layer_idx]
+        v_sf_source = offload.dev_vsf[layer_idx]
     else:
         pool_k = pool.layer_router.read(layer.layer_id).key()
         pool_v = pool.layer_router.read(layer.layer_id).value()
         k_source = offload.dev_k[layer_idx].view(pool_k.dtype)
         v_source = offload.dev_v[layer_idx].view(pool_v.dtype)
+        k_sf_source = v_sf_source = None
     source = QSAKVGatherSource(
         k_buffer=k_source,
         v_buffer=v_source,
@@ -209,29 +238,57 @@ def forward_offloaded_attention(
         sequence_lengths=torch.full(
             (num_rows,), width, dtype=torch.int32, device=rows.device
         ),
+        k_sf_buffer=k_sf_source,
+        v_sf_buffer=v_sf_source,
     )
     if offload.verify:
-        reference = QSAKVGatherSource(
-            k_buffer=pool_k,
-            v_buffer=pool_v,
-            slot_table=offload.req_to_token,
-            row_requests=row_requests,
-            sequence_lengths=metadata.sequence_lengths,
-        )
-        # CUDA-graph padding rows resolve to no device row by design.
-        real_rows = offload.real_rows(
-            num_rows=num_rows, rows_per_request=rows_per_request
-        )
-        reference_positions = torch.where(real_rows[:, None], positions, -1)
-        offload.check(
-            what="decode gather",
-            layer_idx=layer_idx,
-            actual=_pack_gathered_kv(source=source, indices=indices),
-            expected=_pack_gathered_kv(
-                source=reference,
-                indices=reference_positions.to(torch.int32).contiguous(),
-            ),
-        )
+        if quantized:
+            valid = indices >= 0
+            dev_rows = rows.long()[valid]
+            ref_loc = offload.req_to_token[
+                row_requests.long()[:, None], positions.long().clamp(min=0)
+            ][valid]
+            pool_kp, pool_vp, pool_ksf, pool_vsf = pool.get_raw_kv_buffer(
+                layer.layer_id
+            )
+            offload.check(
+                what="decode rows",
+                layer_idx=layer_idx,
+                actual=(
+                    k_source[dev_rows],
+                    v_source[dev_rows],
+                    offload.dev_ksf[layer_idx][dev_rows],
+                    offload.dev_vsf[layer_idx][dev_rows],
+                ),
+                expected=(
+                    pool_kp[ref_loc],
+                    pool_vp[ref_loc],
+                    pool_ksf[ref_loc],
+                    pool_vsf[ref_loc],
+                ),
+            )
+        else:
+            reference = QSAKVGatherSource(
+                k_buffer=pool_k,
+                v_buffer=pool_v,
+                slot_table=offload.req_to_token,
+                row_requests=row_requests,
+                sequence_lengths=metadata.sequence_lengths,
+            )
+            # CUDA-graph padding rows resolve to no device row by design.
+            real_rows = offload.real_rows(
+                num_rows=num_rows, rows_per_request=rows_per_request
+            )
+            reference_positions = torch.where(real_rows[:, None], positions, -1)
+            offload.check(
+                what="decode gather",
+                layer_idx=layer_idx,
+                actual=_pack_gathered_kv(source=source, indices=indices),
+                expected=_pack_gathered_kv(
+                    source=reference,
+                    indices=reference_positions.to(torch.int32).contiguous(),
+                ),
+            )
     indices = indices.to(torch.int32).contiguous()
     if quantized:
         if backend._fused_fp4_gather:
