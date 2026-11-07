@@ -278,12 +278,20 @@ class _OffloadSim:
     """Logical K/V pool plus an offload, driven like the QSA backend drives it."""
 
     def __init__(
-        self, *, rows_per_request, seed, device="cpu", pin=False, hot_blocks=None
+        self,
+        *,
+        rows_per_request,
+        seed,
+        device="cpu",
+        pin=False,
+        hot_blocks=None,
+        quantized=False,
     ):
         self.rng = random.Random(seed)
         torch.manual_seed(seed)
         self.device = device
         self.layers, self.heads, self.dim = 2, 2, 8
+        self.sf_dim = self.dim // 4  # per-block scale plane, like FP4's /16
         self.block_topk = 16
         self.q = rows_per_request
         self.slots = 6  # request slot 0 is padding
@@ -310,16 +318,39 @@ class _OffloadSim:
         shape = (self.layout.device_rows + 64, self.heads, self.dim)
         self.dev_k = [torch.zeros(shape, device=device) for _ in range(self.layers)]
         self.dev_v = [torch.zeros(shape, device=device) for _ in range(self.layers)]
+        sf_shape = (self.layout.device_rows + 64, self.heads, self.sf_dim)
+        sf = (
+            {
+                "k_sf_buffers": [
+                    torch.zeros(sf_shape, device=device) for _ in range(self.layers)
+                ],
+                "v_sf_buffers": [
+                    torch.zeros(sf_shape, device=device) for _ in range(self.layers)
+                ],
+            }
+            if quantized
+            else {}
+        )
         self.offload = QSAKVHostOffload(
             layout=self.layout,
             k_buffers=self.dev_k,
             v_buffers=self.dev_v,
             host_rows=self.pool_size + 64,
             pin_memory=pin,
+            **sf,
         )
         ref_shape = (self.layers, self.pool_size + 64, self.heads, self.dim)
         self.ref_k = torch.zeros(ref_shape, device=device)
         self.ref_v = torch.zeros(ref_shape, device=device)
+        if quantized:
+            ref_sf_shape = (
+                self.layers,
+                self.pool_size + 64,
+                self.heads,
+                self.sf_dim,
+            )
+            self.ref_ksf = torch.zeros(ref_sf_shape, device=device)
+            self.ref_vsf = torch.zeros(ref_sf_shape, device=device)
         self.req_to_token = torch.zeros(
             (self.slots, self.width), dtype=torch.int32, device=device
         )
@@ -338,6 +369,15 @@ class _OffloadSim:
             v = torch.randn_like(k)
             self.dev_k[layer][rows] = k
             self.dev_v[layer][rows] = v
+            if self.offload.quantized:
+                ksf = torch.randn(
+                    slots.numel(), self.heads, self.sf_dim, device=self.device
+                )
+                vsf = torch.randn_like(ksf)
+                self.offload.dev_ksf[layer][rows] = ksf
+                self.offload.dev_vsf[layer][rows] = vsf
+                self.ref_ksf[layer][slots] = ksf
+                self.ref_vsf[layer][slots] = vsf
             self.offload.write_through(layer, rows, slots)
             self.ref_k[layer][slots] = k
             self.ref_v[layer][slots] = v
@@ -366,6 +406,19 @@ class _OffloadSim:
             self.ref_v[layer][slots] = torch.randn_like(self.ref_v[layer][slots])
             self.offload.host_k[layer][slots.cpu()] = self.ref_k[layer][slots].cpu()
             self.offload.host_v[layer][slots.cpu()] = self.ref_v[layer][slots].cpu()
+            if self.offload.quantized:
+                self.ref_ksf[layer][slots] = torch.randn_like(
+                    self.ref_ksf[layer][slots]
+                )
+                self.ref_vsf[layer][slots] = torch.randn_like(
+                    self.ref_vsf[layer][slots]
+                )
+                self.offload.host_ksf[layer][slots.cpu()] = self.ref_ksf[layer][
+                    slots
+                ].cpu()
+                self.offload.host_vsf[layer][slots.cpu()] = self.ref_vsf[layer][
+                    slots
+                ].cpu()
 
     def positions(self, qpos):
         """Expanded QSA selection of one query row (valid positions first)."""
@@ -417,11 +470,19 @@ class _OffloadSim:
         got_v = self.dev_v[layer][rows.long()[valid]]
         assert torch.equal(got_k, self.ref_k[layer][slots[valid]])
         assert torch.equal(got_v, self.ref_v[layer][slots[valid]])
+        if self.offload.quantized:
+            # The scale planes must have travelled with the data rows.
+            got_ksf = self.offload.dev_ksf[layer][rows.long()[valid]]
+            got_vsf = self.offload.dev_vsf[layer][rows.long()[valid]]
+            assert torch.equal(got_ksf, self.ref_ksf[layer][slots[valid]])
+            assert torch.equal(got_vsf, self.ref_vsf[layer][slots[valid]])
 
 
 class TestOffloadResolve(CustomTestCase):
-    def _run(self, rows_per_request, seed):
-        sim = _OffloadSim(rows_per_request=rows_per_request, seed=seed)
+    def _run(self, rows_per_request, seed, quantized=False):
+        sim = _OffloadSim(
+            rows_per_request=rows_per_request, seed=seed, quantized=quantized
+        )
         for req in range(1, sim.slots):
             sim.extend(req, sim.rng.randrange(200, 400))
         for step in range(60):
@@ -433,6 +494,9 @@ class TestOffloadResolve(CustomTestCase):
 
     def test_decode(self):
         self._run(rows_per_request=1, seed=1)
+
+    def test_quantized_packed_rows_travel_with_scale_planes(self):
+        self._run(rows_per_request=1, seed=7, quantized=True)
 
     def test_chain_verify_with_rejections(self):
         for q in (2, 3, CR):
