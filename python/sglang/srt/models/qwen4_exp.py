@@ -101,6 +101,7 @@ from sglang.srt.models.qwen3_5 import (
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen4_exp_ple_table import (
     allocate_ple_host_table,
+    allocate_ple_safetensors_table,
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
@@ -696,10 +697,26 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
         )
         if offload_embedding:
+            backend = getattr(config, "ple_offload_backend", "pinned")
             ngram_embedding = Qwen4ExpPinnedHostEmbedding(
                 ngram_embedding,
-                backend=getattr(config, "ple_offload_backend", "pinned"),
+                backend=backend,
                 table_dir=getattr(config, "ple_offload_dir", None),
+                # checkpoint shard i holds global rows [i*S, (i+1)*S) with
+                # S = ceil(org_vocab / split_ngram_parts) -- the same formula
+                # the loader uses to place shard tensors; the safetensors
+                # backend maps those tensors in place and needs the layout.
+                safetensors_shard_size=(
+                    (
+                        ngram_embedding.org_vocab_size
+                        + int(getattr(config, "split_ngram_parts", 512))
+                        - 1
+                    )
+                    // int(getattr(config, "split_ngram_parts", 512))
+                    if backend == "safetensors"
+                    else None
+                ),
+                safetensors_key_prefix=ngram_prefix if backend == "safetensors" else None,
             )
         self.ngram_embedding = ngram_embedding
 
@@ -925,11 +942,34 @@ def _gather_ple_embedding_from_pinned_kernel(
     is_fp8: tl.constexpr,
     is_fp6: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    seg_bases=0,
+    seg_starts=0,
+    seg_ends=0,
+    SEG_COUNT: tl.constexpr = 0,
+    SEG_BLOCK: tl.constexpr = 1,
 ):
     row_id = tl.program_id(0)
     global_idx = tl.load(ids_ptr + row_id)
     in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
     local_idx = tl.where(in_range, global_idx - tp_vocab_start, 0)
+    if SEG_COUNT > 0:
+        # Checkpoint-backed table: the rows are split across read-only mmaps
+        # (one per safetensors shard), so the row's segment base replaces the
+        # single weight pointer and the row offset restarts per segment. One
+        # launch still; the segment is a <=7-step lookup in an L1-hot array.
+        seg_ids = tl.arange(0, SEG_BLOCK)
+        starts = tl.load(seg_starts + seg_ids, mask=seg_ids < SEG_COUNT, other=2**62)
+        seg = tl.maximum(tl.sum((starts <= local_idx).to(tl.int32)) - 1, 0)
+        bound = tl.load(seg_starts + seg)
+        row_valid = (
+            in_range & (local_idx >= bound) & (local_idx < tl.load(seg_ends + seg))
+        )
+        base = tl.load(seg_bases + seg)
+        row_off = local_idx - bound
+    else:
+        row_valid = in_range
+        base = weight_ptr
+        row_off = local_idx
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < embedding_dim
     if is_fp6:
@@ -937,9 +977,9 @@ def _gather_ple_embedding_from_pinned_kernel(
         # byte 2 are the 4th code). The e2m3 magnitude grid is three step
         # blocks: codes 0..15 step 0.125, 16..23 step 0.25 from 2, 24..31 step
         # 0.5 from 4; bit 5 is the sign. One float32 scale per row.
-        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+        weight_ptr = base.to(tl.int64).to(tl.pointer_type(tl.uint8))
         scale_ptr = row_scale_ptr.to(tl.int64).to(tl.pointer_type(tl.float32))
-        row_bytes = local_idx * ((embedding_dim // 4) * 3)
+        row_bytes = row_off * ((embedding_dim // 4) * 3)
         group = offsets // 4
         lane = offsets % 4
         b0 = tl.load(weight_ptr + row_bytes + group * 3, mask=mask, other=0).to(
@@ -968,17 +1008,17 @@ def _gather_ple_embedding_from_pinned_kernel(
         values = value
     else:
         if is_fp8:
-            weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+            weight_ptr = base.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
         else:
-            weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
+            weight_ptr = base.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
         values = tl.load(
-            weight_ptr + local_idx * embedding_dim + offsets,
+            weight_ptr + row_off * embedding_dim + offsets,
             mask=mask,
             other=0.0,
         ).to(tl.float32)
     tl.store(
         output_ptr + row_id * embedding_dim + offsets,
-        tl.where(in_range, values, 0.0).to(tl.bfloat16),
+        tl.where(row_valid, values, 0.0).to(tl.bfloat16),
         mask=mask,
     )
 
@@ -1018,6 +1058,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         *,
         backend: str = "pinned",
         table_dir: Optional[str] = None,
+        safetensors_shard_size: Optional[int] = None,
+        safetensors_key_prefix: Optional[str] = None,
     ) -> None:
         nn.Module.__init__(self)
         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
@@ -1062,22 +1104,43 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 table_shape[0],
                 self.embedding_dim // 4 * 3,
             )
-        host_table = allocate_ple_host_table(
-            shape=table_shape,
-            dtype=source_weight.dtype,
-            backend=backend,
-            table_dir=table_dir,
-            # Each TP rank holds a different vocabulary shard of the same shape.
-            tag=(
-                f"rows{self.shard_indices.org_vocab_start_index}"
-                f"-{self.shard_indices.org_vocab_end_index}"
-            ),
-        )
+        self._segments = None
+        if backend == "safetensors":
+            # Map the checkpoint's own shard tensors read-only; the gather
+            # walks a per-segment base table instead of one host pointer, so
+            # no tensor of the table's size is ever materialized.
+            self._segments = allocate_ple_safetensors_table(
+                model_dir=table_dir,
+                prefix=safetensors_key_prefix,
+                dtype=source_weight.dtype,
+                # uint8/fp8 rows are one byte per element already; bf16 rows
+                # are two. (table_shape is the *packed* shape for fp6.)
+                row_bytes=int(table_shape[-1]) * source_weight.element_size(),
+                shard_size=safetensors_shard_size,
+                vocab_start=self.shard_indices.org_vocab_start_index,
+                vocab_end=self.shard_indices.org_vocab_end_index,
+            )
+            host_table = torch.empty(0, dtype=source_weight.dtype)
+            host_table._sglang_ple_segments = self._segments
+        else:
+            host_table = allocate_ple_host_table(
+                shape=table_shape,
+                dtype=source_weight.dtype,
+                backend=backend,
+                table_dir=table_dir,
+                # Each TP rank holds a different vocabulary shard of the same shape.
+                tag=(
+                    f"rows{self.shard_indices.org_vocab_start_index}"
+                    f"-{self.shard_indices.org_vocab_end_index}"
+                ),
+            )
         # Only the file backend has anything to prefetch (rows live on storage).
         self._file_prefetcher = make_ple_file_prefetcher(host_table)
         # ... and only it needs its resident set bounded: a fault maps a whole
         # folio, so the mapping would otherwise creep towards the full table.
-        self._file_rss_trimmer = make_ple_file_rss_trimmer(host_table)
+        self._file_rss_trimmer = make_ple_file_rss_trimmer(
+            host_table, self._file_prefetcher
+        )
         cpu_weight = nn.Parameter(host_table, requires_grad=False)
         for name, value in vars(source_weight).items():
             setattr(cpu_weight, name, value)
@@ -1102,6 +1165,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             ),
             persistent=True,
         )
+        # One (starts, ends, bases, block) set per table, built on first use
+        # and cached: constant across gathers, so CUDA-graph capture never
+        # allocates and the host addresses are fixed at mapping time.
+        self._seg_tensors = None
         del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
 
@@ -1143,8 +1210,18 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                     vocab_start=self.shard_indices.org_vocab_start_index,
                     vocab_end=self.shard_indices.org_vocab_end_index,
                 )
+            if self._segments is not None:
+                if self._seg_tensors is None:
+                    self._seg_tensors = self._segments.indirection_tensors(
+                        input_ids.device
+                    )
+                seg_starts, seg_ends, seg_bases, seg_block = self._seg_tensors
+                seg_count = len(self._segments.segments)
+            else:
+                seg_starts = seg_ends = seg_bases = 0
+                seg_block, seg_count = 1, 0
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self.weight.data_ptr(),
+                0 if self._seg_tensors is not None else self.weight.data_ptr(),
                 self.row_scales.data_ptr() if self._is_fp6 else 0,
                 flat_ids,
                 output,
@@ -1154,6 +1231,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 is_fp8=self.weight.dtype == torch.float8_e4m3fn,
                 is_fp6=self._is_fp6,
                 BLOCK_D=self._block_d,
+                seg_bases=seg_bases,
+                seg_starts=seg_starts,
+                seg_ends=seg_ends,
+                SEG_COUNT=seg_count,
+                SEG_BLOCK=seg_block,
             )
         return output
 
@@ -2623,6 +2705,12 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     f"storage is {emb.weight.dtype}; set "
                     'text_config.ple_embedding_dtype="fp6_e2m3"'
                 )
+            if getattr(emb, "_segments", None) is not None:
+                # safetensors backend: the gather kernel reads this very
+                # tensor off disk, so there is nothing to copy -- mark it
+                # loaded and let the reader skip the bytes.
+                loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
+                return True
             if (
                 emb.weight.dtype == torch.float8_e4m3fn
                 and loaded_weight.dtype != torch.float8_e4m3fn

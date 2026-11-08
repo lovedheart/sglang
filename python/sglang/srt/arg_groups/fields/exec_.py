@@ -1179,9 +1179,12 @@ class ExecOffload(msgspec.Struct):
             "file under --ple-offload-dir and lets the gather kernel read it "
             "directly; use it on unified-memory devices (e.g. GB10 / DGX Spark) "
             "where pinned host memory comes out of the same pool as the model "
-            "weights. Requires a device that reports "
+            "weights. 'safetensors' mmaps the checkpoint's own PLE tensors "
+            "read-only (no extra disk, no startup repack; the checkpoint "
+            "dtype must match ple_embedding_dtype). 'file' and "
+            "'safetensors' require a device that reports "
             "cudaDevAttrPageableMemoryAccess (GB10, or HMM).",
-            choices=["pinned", "file"],
+            choices=["pinned", "file", "safetensors"],
         ),
     ] = "pinned"
     ple_offload_dir: A[
