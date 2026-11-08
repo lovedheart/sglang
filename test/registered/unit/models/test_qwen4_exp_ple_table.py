@@ -141,12 +141,14 @@ class TestPleFileTableAllocator(CustomTestCase):
         out = torch.empty(2048, dim, dtype=torch.bfloat16, device="cuda")
         _gather_ple_embedding_from_pinned_kernel[(ids.numel(),)](
             table.data_ptr(),
+            0,
             ids,
             out,
             embedding_dim=dim,
             tp_vocab_start=0,
             tp_vocab_end=rows,
             is_fp8=False,
+            is_fp6=False,
             BLOCK_D=triton.next_power_of_2(dim),
         )
         torch.cuda.synchronize()
@@ -406,12 +408,14 @@ class TestPleFileTableGatherOnDevice(CustomTestCase):
             out = torch.empty(2048, dim, dtype=torch.bfloat16, device="cuda")
             _gather_ple_embedding_from_pinned_kernel[(ids.numel(),)](
                 table.data_ptr(),
+                0,
                 ids,
                 out,
                 embedding_dim=dim,
                 tp_vocab_start=0,
                 tp_vocab_end=rows,
                 is_fp8=False,
+                is_fp6=False,
                 BLOCK_D=triton.next_power_of_2(dim),
             )
             torch.cuda.synchronize()
