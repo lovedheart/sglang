@@ -401,6 +401,10 @@ class Envs:
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
+    # When the cap is below the table's size, drop-all re-colds the whole
+    # warm cache on a timer; rank the mappings by the gather's own row stream
+    # and evict only the coldest shard mappings until the cap holds.
+    SGLANG_QWEN4_PLE_FILE_RSS_LRU = EnvBool(True)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)

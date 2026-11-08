@@ -377,7 +377,20 @@ def load_model_with_memory_saver(
             model_config.hf_text_config.ple_offload_backend = (
                 get_exec().offload.ple_offload_backend
             )
-            if get_exec().offload.ple_offload_backend != "file":
+            ple_backend = get_exec().offload.ple_offload_backend
+            if ple_backend == "safetensors":
+                # The table lives in the checkpoint itself; nothing to create.
+                from sglang.srt.models.qwen4_exp_ple_table import (
+                    check_file_backend_supported,
+                )
+
+                model_config.hf_text_config.ple_offload_dir = get_model().model_path
+                if ple_offload_embedding and device == "cuda":
+                    check_file_backend_supported(
+                        torch.cuda.current_device() if torch.cuda.is_available() else 0,
+                        backend="safetensors",
+                    )
+            elif ple_backend != "file":
                 model_config.hf_text_config.ple_offload_dir = (
                     get_exec().offload.ple_offload_dir
                 )
