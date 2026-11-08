@@ -423,5 +423,442 @@ class TestPleFileTableGatherOnDevice(CustomTestCase):
             self.assertTrue(torch.equal(out, expected))
 
 
+def _write_fake_ple_checkpoint(d, shards=3, rows=64, row_bytes=120, dtype="U8"):
+    """Mini checkpoint: uint8 (packed fp6, + fp32 row scales) or F8_E4M3."""
+    import json
+
+    from safetensors.torch import save_file
+
+    torch.manual_seed(0)
+    weight_map = {}
+    for i in range(shards):
+        key = (
+            f"model.language_model.layers.1.ple.ple_embedding"
+            f".ngram_embedding.shard_{i}.weight"
+        )
+        tensors = {}
+        if dtype == "U8":
+            w = torch.randint(0, 256, (rows, row_bytes), dtype=torch.uint8)
+            sc = torch.linspace(0.5, 2.0, rows, dtype=torch.float32).reshape(rows, 1)
+            tensors[key[: -len(".weight")] + ".scale"] = sc
+        elif dtype == "F8_E4M3":
+            w = (
+                torch.randn(rows, row_bytes)
+                .clamp(-4, 4)
+                .to(torch.float8_e4m3fn)
+            )
+        else:
+            raise ValueError(dtype)
+        tensors[key] = w
+        fname = f"ple-{i:05d}.safetensors"
+        save_file(tensors, os.path.join(d, fname))
+        for k in tensors:
+            weight_map[k] = fname
+    with open(os.path.join(d, "model.safetensors.index.json"), "w") as f:
+        json.dump({"metadata": {}, "weight_map": weight_map}, f)
+
+
+class TestPleSafetensorsAllocator(CustomTestCase):
+    PREFIX = "model.layers.2.ple.ple_embedding.ngram_embedding"
+
+    def _alloc(self, d, shards, rows, row_bytes=120):
+        from sglang.srt.models.qwen4_exp_ple_table import (
+            allocate_ple_safetensors_table,
+        )
+
+        return allocate_ple_safetensors_table(
+            model_dir=d,
+            prefix=self.PREFIX,
+            dtype=torch.uint8,
+            row_bytes=row_bytes,
+            shard_size=rows,
+            vocab_start=0,
+            vocab_end=shards * rows,
+        )
+
+    def test_maps_checkpoint_shards_with_local_rows(self):
+        from sglang.srt.models.qwen4_exp_ple_table import (
+            allocate_ple_safetensors_table,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(d, shards=3, rows=64)
+            tbl = allocate_ple_safetensors_table(
+                model_dir=d,
+                prefix=self.PREFIX,
+                dtype=torch.uint8,
+                row_bytes=120,
+                shard_size=64,
+                vocab_start=0,
+                vocab_end=192,
+            )
+            self.assertEqual(tbl.row_start, 0)
+            self.assertEqual(tbl.row_end, 192)
+            self.assertEqual(tbl.segment_bounds(), [0, 64, 128])
+            self.assertEqual(tbl.total_bytes(), 3 * 64 * 120)
+
+    def test_tp_window_maps_only_overlapping_shards(self):
+        # TP rank covering rows [64, 128) touches shard 1 only, and its
+        # segment rows restart at 0.
+        from sglang.srt.models.qwen4_exp_ple_table import (
+            allocate_ple_safetensors_table,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(d, shards=3, rows=64)
+            tbl = allocate_ple_safetensors_table(
+                model_dir=d,
+                prefix=self.PREFIX,
+                dtype=torch.uint8,
+                row_bytes=120,
+                shard_size=64,
+                vocab_start=64,
+                vocab_end=128,
+            )
+            self.assertEqual(len(tbl.segments), 1)
+            self.assertEqual((tbl.row_start, tbl.row_end), (0, 64))
+
+    def test_mapped_bytes_equal_the_saved_tensors(self):
+        import ctypes
+        import json
+
+        import numpy as np
+
+        from sglang.srt.models.qwen4_exp_ple_table import (
+            allocate_ple_safetensors_table,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(d, shards=2, rows=32)
+            tbl = allocate_ple_safetensors_table(
+                model_dir=d,
+                prefix=self.PREFIX,
+                dtype=torch.uint8,
+                row_bytes=120,
+                shard_size=32,
+                vocab_start=0,
+                vocab_end=64,
+            )
+            with open(os.path.join(d, "model.safetensors.index.json")) as f:
+                wmap = json.load(f)["weight_map"]
+            key = (
+                "model.language_model.layers.1.ple.ple_embedding"
+                ".ngram_embedding.shard_1.weight"
+            )
+            import safetensors.numpy
+
+            with safetensors.numpy.safe_open(
+                os.path.join(d, wmap[key]), framework="np"
+            ) as f:
+                want = f.get_tensor(key)[5:20].reshape(-1)
+            seg = tbl.segments[tbl._segment_of(37)]  # row 37 -> shard 1 local 5
+            got = np.frombuffer(
+                ctypes.string_at(seg.addr + 5 * 120, 15 * 120), np.uint8
+            )
+            np.testing.assert_array_equal(got, want)
+
+    def test_stored_dtype_mismatch_is_refused(self):
+        # bf16 is a supported table dtype, but not against a uint8 checkpoint:
+        # reinterpreting the bytes would silently read garbage.
+        from sglang.srt.models.qwen4_exp_ple_table import (
+            allocate_ple_safetensors_table,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(d, shards=1, rows=8)
+            with self.assertRaisesRegex(ValueError, "stored as U8"):
+                allocate_ple_safetensors_table(
+                    model_dir=d,
+                    prefix=self.PREFIX,
+                    dtype=torch.bfloat16,
+                    row_bytes=320,
+                    shard_size=8,
+                    vocab_start=0,
+                    vocab_end=8,
+                )
+
+    def test_trimmer_drops_pages_of_every_segment(self):
+        # madvise(2) wants page-aligned addresses: the segment's tensor base
+        # carries an intra-page pad the kernel needs but madvise rejects with
+        # EINVAL (the trim then silently stops on the first segment).
+        import ctypes
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(d, shards=3, rows=40000)
+            tbl = self._alloc(d, shards=3, rows=40000)
+            for seg in tbl.segments:
+                ctypes.string_at(seg.buffer._addr, seg.buffer._nbytes)
+            trimmer = PleFileRssTrimmer(
+                addr=0,
+                nbytes=0,
+                segments=tbl,
+                budget_bytes=1 << 20,
+                interval_s=999,
+            )
+            try:
+                self.assertGreater(trimmer.mapping_rss_bytes(), 1 << 20)
+                self.assertGreater(trimmer.trim_once(), 0)
+                self.assertLessEqual(trimmer.mapping_rss_bytes(), 1 << 20)
+            finally:
+                trimmer.close()
+
+    def test_lru_trim_keeps_hot_segments(self):
+        # Budget under the table size: drop-all would re-cold the warm cache
+        # on a timer; LRU must evict only the coldest mappings (by the
+        # gather's own row stream) and leave the touched segment resident.
+        import ctypes
+
+        from sglang.srt.models.qwen4_exp_ple_table import (
+            _ranges_rss_bytes,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(d, shards=4, rows=40000)
+            tbl = self._alloc(d, shards=4, rows=40000)
+            self.assertEqual(len(tbl.segments), 4)
+            prefetcher = PleFilePrefetcher(
+                row_bytes=120, segments=tbl, min_rows=1
+            )
+            for seg in tbl.segments:
+                ctypes.string_at(seg.buffer._addr, seg.buffer._nbytes)
+            # Only rows of the last segment count as hot.
+            seg3 = tbl.segments[3]
+            ids = torch.arange(seg3.row_start, seg3.row_start + 5000)
+            self.assertTrue(prefetcher.enqueue(ids))
+            # Budget: the hot segment plus one more mapping's worth, so the
+            # trim must evict at least the two coldest to get under it.
+            warm = sum(_ranges_rss_bytes(tbl.mappings()))
+            trimmer = PleFileRssTrimmer(
+                segments=tbl,
+                prefetcher=prefetcher,
+                budget_bytes=int(warm * 0.6),
+                interval_s=999,
+            )
+            try:
+                self.assertGreater(trimmer.trim_once(), 0)
+                rss = _ranges_rss_bytes(tbl.mappings())
+            finally:
+                trimmer.close()
+            self.assertLess(sum(rss), warm)
+            self.assertGreater(rss[3], 1 << 20, "hot segment was evicted")
+
+    def test_prefetcher_advises_the_covered_segment_pages(self):
+        # The kernel crashed on launch until this path existed: the
+        # prefetcher must resolve rows through the segment table, not the
+        # single-file offsets the "file" backend uses.
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(d, shards=3, rows=256)
+            tbl = self._alloc(d, shards=3, rows=256)
+            advised = []
+
+            class Probe(PleFilePrefetcher):
+                def _advise(self, pages):
+                    advised.extend(pages)
+
+            p = Probe.__new__(Probe)
+            PleFilePrefetcher.__init__(
+                p, path=None, row_bytes=120, min_rows=0, segments=tbl
+            )
+            p.enqueue(torch.tensor([0, 255, 256, 511, 512, 767, 999999]))
+            p.close()
+            self.assertTrue(advised)
+            self.assertEqual(len({fd for fd, _ in advised}), 3)  # one per shard
+
+    def test_fp8_checkpoint_maps_rows(self):
+        # fp8 rows are embedding_dim 1-byte elements; scales do not exist.
+        from sglang.srt.models.qwen4_exp_ple_table import (
+            allocate_ple_safetensors_table,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(
+                d, shards=2, rows=32, row_bytes=160, dtype="F8_E4M3"
+            )
+            tbl = allocate_ple_safetensors_table(
+                model_dir=d,
+                prefix=self.PREFIX,
+                dtype=torch.float8_e4m3fn,
+                row_bytes=160,
+                shard_size=32,
+                vocab_start=0,
+                vocab_end=64,
+            )
+            self.assertEqual((tbl.row_start, tbl.row_end), (0, 64))
+            self.assertEqual(tbl.total_bytes(), 2 * 32 * 160)
+
+    def test_indirection_tensors_pad_to_power_of_two(self):
+        import torch
+
+        from sglang.srt.models.qwen4_exp_ple_table import (
+            allocate_ple_safetensors_table,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(d, shards=3, rows=8)
+            tbl = allocate_ple_safetensors_table(
+                model_dir=d,
+                prefix=self.PREFIX,
+                dtype=torch.uint8,
+                row_bytes=120,
+                shard_size=8,
+                vocab_start=0,
+                vocab_end=24,
+            )
+            if not torch.cuda.is_available():
+                self.skipTest("needs CUDA to build device tensors")
+            starts, ends, bases, block = tbl.indirection_tensors("cuda")
+            self.assertEqual(block, 4)  # padded from 3
+            self.assertEqual(starts.tolist()[:3], [0, 8, 16])
+            self.assertTrue((starts[3:] > 2**60).all())
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and device_reads_pageable_memory(0) is True,
+    "needs a device that reads pageable host memory",
+)
+class TestPleSafetensorsGatherOnDevice(CustomTestCase):
+    def test_segment_gather_matches_direct_decode(self):
+        import json
+
+        import triton
+        from safetensors import safe_open
+
+        from sglang.srt.models.qwen4_exp import (
+            _gather_ple_embedding_from_pinned_kernel,
+        )
+        from sglang.srt.models.qwen4_exp_ple_table import (
+            allocate_ple_safetensors_table,
+        )
+
+        dim = 160
+        row_bytes = (dim // 4) * 3
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(d, shards=3, rows=256, row_bytes=row_bytes)
+            tbl = allocate_ple_safetensors_table(
+                model_dir=d,
+                prefix="model.layers.2.ple.ple_embedding.ngram_embedding",
+                dtype=torch.uint8,
+                row_bytes=row_bytes,
+                shard_size=256,
+                vocab_start=0,
+                vocab_end=768,
+            )
+            starts, ends, bases, block = tbl.indirection_tensors("cuda")
+            scales = torch.rand(768, 1, dtype=torch.float32, device="cuda")
+            picks = [tbl.row_start, 255, 256, 511, 512, tbl.row_end - 1]
+            ids = torch.tensor(picks, device="cuda")
+            out = torch.empty(len(picks), dim, dtype=torch.bfloat16, device="cuda")
+            _gather_ple_embedding_from_pinned_kernel[(len(picks),)](
+                0,
+                scales.data_ptr(),
+                ids,
+                out,
+                embedding_dim=dim,
+                tp_vocab_start=0,
+                tp_vocab_end=768,
+                is_fp8=False,
+                is_fp6=True,
+                BLOCK_D=triton.next_power_of_2(dim),
+                seg_bases=bases,
+                seg_starts=starts,
+                seg_ends=ends,
+                SEG_COUNT=len(tbl.segments),
+                SEG_BLOCK=block,
+            )
+            torch.cuda.synchronize()
+
+            with open(os.path.join(d, "model.safetensors.index.json")) as f:
+                wmap = json.load(f)["weight_map"]
+
+            def golden(row):
+                shard = row // 256
+                key = (
+                    f"model.language_model.layers.1.ple.ple_embedding"
+                    f".ngram_embedding.shard_{shard}.weight"
+                )
+                with safe_open(os.path.join(d, wmap[key]), framework="pt") as f:
+                    packed = f.get_tensor(key)[row % 256].to(torch.int32)
+                u24 = packed.view(-1, 3) @ torch.tensor(
+                    [1, 256, 65536], dtype=torch.int32
+                )
+                codes = torch.stack(
+                    [(u24 >> (l * 6)) & 63 for l in range(4)], dim=1
+                ).reshape(-1)
+                m = codes & 31
+                v = torch.where(
+                    m < 16,
+                    m.float() * 0.125,
+                    torch.where(m < 24, 2 + (m - 16) * 0.25, 4 + (m - 24) * 0.5),
+                )
+                v = torch.where((codes & 32) != 0, -v, v)
+                # fp32 decode, fp32 scale, cast last -- kernel order.
+                return (v.cuda() * scales[row]).to(torch.bfloat16)
+
+            for i, row in enumerate(picks):
+                torch.testing.assert_close(
+                    out[i], golden(row), atol=0, rtol=0
+                )
+
+    def test_fp8_segment_gather_matches_tensor_reads(self):
+        import json
+
+        import triton
+        from safetensors import safe_open
+
+        from sglang.srt.models.qwen4_exp import (
+            _gather_ple_embedding_from_pinned_kernel,
+        )
+        from sglang.srt.models.qwen4_exp_ple_table import (
+            allocate_ple_safetensors_table,
+        )
+
+        dim = 160
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(
+                d, shards=3, rows=256, row_bytes=dim, dtype="F8_E4M3"
+            )
+            tbl = allocate_ple_safetensors_table(
+                model_dir=d,
+                prefix="model.layers.2.ple.ple_embedding.ngram_embedding",
+                dtype=torch.float8_e4m3fn,
+                row_bytes=dim,
+                shard_size=256,
+                vocab_start=0,
+                vocab_end=768,
+            )
+            starts, ends, bases, block = tbl.indirection_tensors("cuda")
+            picks = [tbl.row_start, 255, 256, 511, 512, tbl.row_end - 1]
+            ids = torch.tensor(picks, device="cuda")
+            out = torch.empty(len(picks), dim, dtype=torch.bfloat16, device="cuda")
+            _gather_ple_embedding_from_pinned_kernel[(len(picks),)](
+                0,
+                0,
+                ids,
+                out,
+                embedding_dim=dim,
+                tp_vocab_start=0,
+                tp_vocab_end=768,
+                is_fp8=True,
+                is_fp6=False,
+                BLOCK_D=triton.next_power_of_2(dim),
+                seg_bases=bases,
+                seg_starts=starts,
+                seg_ends=ends,
+                SEG_COUNT=len(tbl.segments),
+                SEG_BLOCK=block,
+            )
+            torch.cuda.synchronize()
+            with open(os.path.join(d, "model.safetensors.index.json")) as f:
+                wmap = json.load(f)["weight_map"]
+            for i, row in enumerate(picks):
+                key = (
+                    f"model.language_model.layers.1.ple.ple_embedding"
+                    f".ngram_embedding.shard_{row // 256}.weight"
+                )
+                with safe_open(os.path.join(d, wmap[key]), framework="pt") as f:
+                    want = f.get_tensor(key)[row % 256].to(torch.bfloat16).cuda()
+                torch.testing.assert_close(out[i], want, atol=0, rtol=0)
+
+
 if __name__ == "__main__":
     unittest.main()
