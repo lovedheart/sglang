@@ -39,10 +39,13 @@ def handle_offload_compatibility(server_args: Any) -> None:
             "would stage the pinned PLE embedding back to the device."
         )
 
-    if cfg.ple_offload_backend == "file" and cfg.ple_offload_embedding is False:
+    if cfg.ple_offload_backend in ("file", "safetensors") and (
+        cfg.ple_offload_embedding is False
+    ):
         raise ValueError(
-            "--ple-offload-backend file requires --ple-offload-embedding: "
-            "the file-backed table is the offloaded table."
+            f"--ple-offload-backend {cfg.ple_offload_backend} requires "
+            "--ple-offload-embedding: the file-backed table is the offloaded "
+            "table."
         )
 
 
