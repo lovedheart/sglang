@@ -23,8 +23,6 @@ Token semantics match ``_forward_trtllm_sparse``: a token participates iff
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
-
 import torch
 import triton
 import triton.language as tl
@@ -32,6 +30,46 @@ import triton.language as tl
 # Tokens per split-program iteration; one 64-token page is the GEMM sub-tile.
 _CHUNK = 64
 _MAX_SPLITS = 33  # 33 * 64 = 2112 >= final_topk = token_topk + ratio - 1 (2051)
+
+
+@triton.jit
+def _unpack_e2m1(packed):
+    # PTX cvt.rn.f16x2.e2m1x2 (sm_100a/sm_120a+): one instruction per packed
+    # byte; bitwise-identical to the e2m1 LUT (verified).  Falls back would
+    # be needed for pre-Blackwell, but the gate keeps this path Blackwell-only.
+    return tl.inline_asm_elementwise(
+        "{ .reg .b8 q; .reg .b32 t; cvt.u8.u32 q, $2; cvt.rn.f16x2.e2m1x2 t, q; mov.b32 {$0, $1}, t; }",
+        "=h,=h,r",
+        [packed],
+        dtype=(tl.float16, tl.float16),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _load_scale(
+    sf_ptr,
+    slots,
+    kvh,
+    CHUNK: tl.constexpr,
+    GROUPS: tl.constexpr,
+    REPS: tl.constexpr,
+    SF_STRIDE: tl.constexpr,
+):
+    """[CHUNK, GROUPS * REPS] fp32 scale tile, each group scale replicated
+    REPS times.  Value-identical to chaining ``tl.interleave`` log2(REPS)
+    times; the replicate runs come from a broadcast reshape instead of
+    shuffle-heavy interleaves."""
+    offs_g = tl.arange(0, GROUPS)
+    sf = (
+        tl.load(
+            sf_ptr + slots[:, None] * SF_STRIDE + kvh * GROUPS + offs_g[None, :]
+        ).to(tl.float8e4nv, bitcast=True)
+    ).to(tl.float32)
+    return tl.reshape(
+        tl.broadcast_to(sf[:, :, None], (CHUNK, GROUPS, REPS)), (CHUNK, GROUPS * REPS)
+    )
 
 
 @triton.jit
@@ -53,32 +91,60 @@ def _dequant_nvfp4(
         + kvh * (HEAD_DIM // 2)
         + offs_p[None, :]
     )
-    # PTX cvt.rn.f16x2.e2m1x2 (sm_100a/sm_120a+): one instruction per packed
-    # byte; bitwise-identical to the e2m1 LUT (verified).  Falls back would
-    # be needed for pre-Blackwell, but the gate keeps this path Blackwell-only.
-    lo, hi = tl.inline_asm_elementwise(
-        "{ .reg .b8 q; .reg .b32 t; cvt.u8.u32 q, $2; cvt.rn.f16x2.e2m1x2 t, q; mov.b32 {$0, $1}, t; }",
-        "=h,=h,r",
-        [packed],
-        dtype=(tl.float16, tl.float16),
-        is_pure=True,
-        pack=1,
-    )
+    lo, hi = _unpack_e2m1(packed)
     vals = tl.interleave(lo, hi).to(tl.float32)  # low nibble = even column
-    offs_g = tl.arange(0, HEAD_DIM // 16)
-    sf = (
-        tl.load(
-            sf_ptr
-            + slots[:, None] * SF_STRIDE
-            + kvh * (HEAD_DIM // 16)
-            + offs_g[None, :]
-        )
-        .to(tl.float8e4nv, bitcast=True)
-        .to(tl.float32)
+    sf = _load_scale(
+        sf_ptr,
+        slots,
+        kvh,
+        CHUNK,
+        GROUPS=HEAD_DIM // 16,
+        REPS=16,
+        SF_STRIDE=SF_STRIDE,
     )
-    for _ in tl.static_range(4):
-        sf = tl.interleave(sf, sf)
     return vals * sf
+
+
+@triton.jit
+def _dequant_nvfp4_v_planes(
+    packed_ptr,
+    sf_ptr,
+    slots,
+    kvh,
+    CHUNK: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    SLOT_STRIDE: tl.constexpr,
+    SF_STRIDE: tl.constexpr,
+):
+    """Even/odd head-dim planes of a dequantized NVFP4 V tile (fp32).
+
+    Per-element values match ``_dequant_nvfp4`` exactly (low nibble = even
+    column); keeping the planes apart lets p@V run as two dots whose
+    reduction dimension is still CHUNK, so every output lane sees the same
+    bf16 operands in the same HMMA k-order as the interleaved form -- that is
+    what preserves bit identity with the paged path.  A future edit must not
+    split along the head dim instead: that would reorder the reduction.
+    A group of 16 columns spans 8 even and 8 odd plane columns, so both
+    planes multiply the same replicated scale tile.
+    """
+    offs_p = tl.arange(0, HEAD_DIM // 2)
+    packed = tl.load(
+        packed_ptr
+        + slots[:, None] * SLOT_STRIDE
+        + kvh * (HEAD_DIM // 2)
+        + offs_p[None, :]
+    )
+    lo, hi = _unpack_e2m1(packed)
+    sf = _load_scale(
+        sf_ptr,
+        slots,
+        kvh,
+        CHUNK,
+        GROUPS=HEAD_DIM // 16,
+        REPS=8,
+        SF_STRIDE=SF_STRIDE,
+    )
+    return lo.to(tl.float32) * sf, hi.to(tl.float32) * sf
 
 
 @triton.jit
@@ -151,6 +217,10 @@ def _sparse_decode_split(
     m_i = tl.full([HEADS_P], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([HEADS_P], dtype=tl.float32)
     acc = tl.zeros([HEADS_P, HEAD_DIM], dtype=tl.float32)
+    # For NVFP4 the V dot runs on even/odd planes (see _dequant_nvfp4_v_planes);
+    # the interleaved acc is reconstructed at the partial store.
+    acc_even = tl.zeros([HEADS_P, HEAD_DIM // 2], dtype=tl.float32)
+    acc_odd = tl.zeros([HEADS_P, HEAD_DIM // 2], dtype=tl.float32)
 
     offs_t = tl.arange(0, CHUNK)
     tok0 = split * PER_SPLIT
@@ -171,7 +241,7 @@ def _sparse_decode_split(
             k_tile = _dequant_nvfp4(
                 k_ptr, ksf_ptr, slot, kvh, CHUNK, HEAD_DIM, SLOT_STRIDE_K, SF_STRIDE
             )
-            v_tile = _dequant_nvfp4(
+            v_even, v_odd = _dequant_nvfp4_v_planes(
                 v_ptr, vsf_ptr, slot, kvh, CHUNK, HEAD_DIM, SLOT_STRIDE_V, SF_STRIDE
             )
         else:
@@ -184,16 +254,31 @@ def _sparse_decode_split(
         p = tl.exp(s - m_safe[:, None])
         alpha = tl.exp(tl.where(m_i == float("-inf"), 0.0, m_i) - m_safe)
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v_tile.to(tl.bfloat16))
+        if NVFP4:
+            p_bf16 = p.to(tl.bfloat16)
+            acc_even = acc_even * alpha[:, None] + tl.dot(
+                p_bf16, v_even.to(tl.bfloat16)
+            )
+            acc_odd = acc_odd * alpha[:, None] + tl.dot(p_bf16, v_odd.to(tl.bfloat16))
+        else:
+            acc = acc * alpha[:, None] + tl.dot(
+                p.to(tl.bfloat16), v_tile.to(tl.bfloat16)
+            )
         m_i = m_new
 
     l_safe = tl.where(l_i == 0.0, 1.0, l_i)
     po = part_o_ptr + ((row * KV_HEADS + kvh) * SPLITS + split) * (HEADS_P * HEAD_DIM)
-    tl.store(
-        po + offs_h[:, None] * HEAD_DIM + offs_d[None, :],
-        acc / l_safe[:, None],
-        mask=hmask[:, None],
-    )
+    if NVFP4:
+        offs_p = tl.arange(0, HEAD_DIM // 2)
+        even_ptrs = po + offs_h[:, None] * HEAD_DIM + 2 * offs_p[None, :]
+        tl.store(even_ptrs, acc_even / l_safe[:, None], mask=hmask[:, None])
+        tl.store(even_ptrs + 1, acc_odd / l_safe[:, None], mask=hmask[:, None])
+    else:
+        tl.store(
+            po + offs_h[:, None] * HEAD_DIM + offs_d[None, :],
+            acc / l_safe[:, None],
+            mask=hmask[:, None],
+        )
     pm = part_ml_ptr + ((row * KV_HEADS + kvh) * SPLITS + split) * (HEADS_P * 2)
     tl.store(pm + offs_h * 2, m_i, mask=hmask)
     tl.store(pm + offs_h * 2 + 1, l_i, mask=hmask)
@@ -252,17 +337,17 @@ def sparse_decode_attention(
     q: torch.Tensor,  # [rows, q_heads, head_dim]
     k: torch.Tensor,
     v: torch.Tensor,
-    k_sf: Optional[torch.Tensor],
-    v_sf: Optional[torch.Tensor],
-    k_gs: Optional[torch.Tensor],
-    v_gs: Optional[torch.Tensor],
+    k_sf: torch.Tensor | None,
+    v_sf: torch.Tensor | None,
+    k_gs: torch.Tensor | None,
+    v_gs: torch.Tensor | None,
     topk_idx: torch.Tensor,  # [rows, topk] int32, -1 pad
     req_to_token: torch.Tensor,
     req_indices: torch.Tensor,
     seq_lens: torch.Tensor,
     sm_scale: float,
     nvfp4: bool,
-    scratch: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+    scratch: dict[int, tuple[torch.Tensor, torch.Tensor]],
 ) -> torch.Tensor:
     """Returns [rows, q_heads, head_dim] bf16."""
     rows, topk = topk_idx.shape
