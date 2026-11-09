@@ -623,14 +623,7 @@ class QSAKVHostOffload:
             vs_src=None if self.dev_vsf is None else self.dev_vsf[layer_idx],
         )
 
-    def gather_context(
-        self, layer_idx: int, slots: torch.Tensor
-    ) -> Tuple[
-        torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
-    ]:
-        """Host K/V rows of these logical slots, in order, on the device (plus
-        the scale planes of a quantized K/V)."""
-        rows = slots.numel()
+    def _gather_output(self, layer_idx: int, rows: int):
         shape = (rows, *self.dev_k[layer_idx].shape[1:])
         k = torch.empty(shape, dtype=self.dev_k[layer_idx].dtype, device=self.device)
         v = torch.empty_like(k)
@@ -642,7 +635,17 @@ class QSAKVHostOffload:
             vsf = torch.empty_like(ksf)
         else:
             ksf = vsf = None
-        dst = torch.arange(rows, dtype=torch.int64, device=self.device)
+        return k, v, ksf, vsf
+
+    def gather_context(
+        self, layer_idx: int, slots: torch.Tensor
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
+    ]:
+        """Host K/V rows of these logical slots, in order, on the device (plus
+        the scale planes of a quantized K/V)."""
+        k, v, ksf, vsf = self._gather_output(layer_idx, slots.numel())
+        dst = torch.arange(slots.numel(), dtype=torch.int64, device=self.device)
         _copy_rows(
             k_dst=k,
             v_dst=v,
@@ -654,6 +657,50 @@ class QSAKVHostOffload:
             vs_dst=vsf,
             ks_src=self.host_ksf[layer_idx] if self.quantized else None,
             vs_src=self.host_vsf[layer_idx] if self.quantized else None,
+        )
+        return k, v, ksf, vsf
+
+    def gather_context_hot_tail(
+        self,
+        layer_idx: int,
+        slots: torch.Tensor,
+        tail_mask: torch.Tensor,
+        tail_rows: torch.Tensor,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
+    ]:
+        """``gather_context`` reading the rows selected by ``tail_mask`` from
+        the DEVICE mirror rows ``tail_rows`` (cu order, one per masked slot)
+        and the rest from the host store. Bit-identical to ``gather_context``
+        whenever ``tail_rows`` holds exactly those slots' rows, which
+        ``store`` + ``write_through`` guarantee for the current chunk: the
+        host copy is a bitwise copy of the device rows it was written from."""
+        k, v, ksf, vsf = self._gather_output(layer_idx, slots.numel())
+        dst = torch.arange(slots.numel(), dtype=torch.int64, device=self.device)
+        host = ~tail_mask
+        _copy_rows(
+            k_dst=k,
+            v_dst=v,
+            dst=dst[host],
+            k_src=self.host_k[layer_idx],
+            v_src=self.host_v[layer_idx],
+            src=slots[host].long(),
+            ks_dst=ksf,
+            vs_dst=vsf,
+            ks_src=self.host_ksf[layer_idx] if self.quantized else None,
+            vs_src=self.host_vsf[layer_idx] if self.quantized else None,
+        )
+        _copy_rows(
+            k_dst=k,
+            v_dst=v,
+            dst=dst[tail_mask],
+            k_src=self.dev_k[layer_idx],
+            v_src=self.dev_v[layer_idx],
+            src=tail_rows.long(),
+            ks_dst=ksf,
+            vs_dst=vsf,
+            ks_src=self.dev_ksf[layer_idx] if self.quantized else None,
+            vs_src=self.dev_vsf[layer_idx] if self.quantized else None,
         )
         return k, v, ksf, vsf
 
