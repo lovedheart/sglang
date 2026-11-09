@@ -327,6 +327,11 @@ class Envs:
     # loop (a gather plus a full-context copy per sequence, plus two host
     # synchronizations per layer).
     SGLANG_QSA_VECTOR_PREFILL_GATHER = EnvBool(True)
+    # Read the current chunk's rows of a QSA offload prefill gather directly
+    # from the device mirror rows (they were just stored there), instead of
+    # round-tripping them host -> host store -> device over PCIe. Bitwise
+    # identical to the all-host gather; 0 restores the all-host path.
+    SGLANG_QSA_OFFLOAD_HOT_TAIL_GATHER = EnvBool(True)
     # Give the QSA sparse-prefill kernels two warps and a 3-deep pipeline instead of
     # the one-warp tail of the tuning tables.  With one warp Triton has nowhere to put
     # the head_dim-deep QK reduction, so it serialises it; splitting it across two
