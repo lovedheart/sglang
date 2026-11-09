@@ -16,10 +16,14 @@ from typing import Tuple
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     pack_qsa_prefill_kv,
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
 )
 
 
@@ -138,7 +142,39 @@ def gather_offloaded_context(
     ]
     pool = backend.token_to_kv_pool
     layer_idx = pool.full_attention_layer_index(layer.layer_id)
-    k, v, k_sf, v_sf = offload.gather_context(layer_idx=layer_idx, slots=slots)
+    extend_lens = forward_batch.extend_seq_lens
+    hot_tail = (
+        envs.SGLANG_QSA_OFFLOAD_HOT_TAIL_GATHER.get()
+        and not offload.verify
+        # The masked row copies have data-dependent shapes; a captured graph
+        # needs the fixed-shape all-host gather.
+        and not is_in_breakable_cuda_graph()
+        and not torch.cuda.is_current_stream_capturing()
+        and extend_lens is not None
+        and extend_lens.numel() == sequence_lens.numel()
+    )
+    if hot_tail:
+        # The current chunk's rows are in the device mirror scratch right now
+        # (store_offloaded_kv wrote them this layer); read them there instead
+        # of waiting on their host round-trip. Token (b, p) of the chunk owns
+        # scratch row scratch_base + (rows taken by earlier requests) + its
+        # offset in the chunk. Same cu order, bitwise same content.
+        seq = sequence_lens.long()
+        e = extend_lens.long()
+        starts = seq[owner] - e[owner]
+        tail_mask = positions >= starts
+        rows_before = torch.cumsum(e, 0) - e
+        tail_rows = (offload.layout.scratch_base + rows_before[owner] + (positions - starts))[
+            tail_mask
+        ]
+        k, v, k_sf, v_sf = offload.gather_context_hot_tail(
+            layer_idx=layer_idx,
+            slots=slots,
+            tail_mask=tail_mask,
+            tail_rows=tail_rows,
+        )
+    else:
+        k, v, k_sf, v_sf = offload.gather_context(layer_idx=layer_idx, slots=slots)
     if k_sf is not None:
         if offload.verify:
             # Packed rows compare bit for bit against the full pool's rows of
