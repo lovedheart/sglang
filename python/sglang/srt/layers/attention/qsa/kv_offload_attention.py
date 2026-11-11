@@ -11,7 +11,8 @@ compared with the full pool's.
 
 from __future__ import annotations
 
-from typing import Tuple
+import logging
+from typing import List, Optional, Tuple
 
 import msgspec
 import torch
@@ -22,9 +23,12 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
 )
+from sglang.srt.mem_cache.qsa_kv_offload import _copy_rows
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class QSAKVGatherSource(msgspec.Struct, frozen=True):
@@ -117,6 +121,383 @@ def store_offloaded_kv(*, backend, layer, forward_batch, k, v) -> None:
     )
 
 
+def _slabs_for(offload, req_ids, sequence_lens, extend_lens, layer_idx, slot0s):
+    """Per-request slabs, or None per request where the slab cannot serve.
+
+    A slab is dropped and re-reserved when it cannot be this request's:
+    its cursor for THIS layer (layers advance independently) passed the
+    prior, or its stamped first row differs from the slot table's — a
+    reused request slot with a radix hit keeps prior > 0, so cursor
+    depth alone cannot tell tenants apart (decode releases do not run
+    inside replayed graphs). The drop precedes the reserve, so a dead
+    slab never runs the grow/evict path. A slab that a later reserve
+    evicted from under its request aliases another's rows, so every
+    entry is re-checked against the allocator's table.
+    """
+    slabs = []
+    for req, seq, ext, slot0 in zip(req_ids, sequence_lens, extend_lens, slot0s):
+        prior = seq - ext
+        slab = offload._slabs.get(int(req))
+        if slab is not None and (
+            slab.cursors[layer_idx] > prior or slab.slot0 != slot0
+        ):
+            offload.slab_release(req)
+        slab = offload.slab_reserve(req, seq)
+        if slab is not None and max(slab.cursors) == 0:
+            slab.slot0 = slot0
+        slabs.append(slab)
+    return [
+        slab if slab is not None and offload._slabs.get(int(req)) is slab else None
+        for req, slab in zip(req_ids, slabs)
+    ]
+
+
+def _gather_union_from_slab(
+    *,
+    offload,
+    layer_idx: int,
+    slabs: list,
+    owners: torch.Tensor,
+    positions: torch.Tensor,
+    sequence_lens: List[int],
+    extend_lens: List[int],
+    req_ids: List[int],
+):
+    """Stage every selected row in the device slab, then gather the union
+    rows entirely on the device.
+
+    Rows the slab does not hold yet cross PCIe exactly once (host to slab),
+    the chunk's rows move from the scratch; afterwards the union reads slab
+    rows, so a chunk with a 95% union rate still costs no more PCIe than
+    its new rows. Bytes equal the host store's row for row, so the packed
+    result matches ``gather_context`` exactly."""
+    device = positions.device
+    k, v, k_sf, v_sf = offload._gather_output(layer_idx, positions.numel())
+    quant = offload.quantized
+    ext_before = 0
+    for b, (seq, ext, slab) in enumerate(zip(sequence_lens, extend_lens, slabs)):
+        cached = slab.cursors[layer_idx]
+        prior = seq - ext
+        if prior > cached:
+            _copy_rows(
+                k_dst=offload.slab_k[layer_idx],
+                v_dst=offload.slab_v[layer_idx],
+                dst=torch.arange(slab.base + cached, slab.base + prior, device=device),
+                k_src=offload.host_k[layer_idx],
+                v_src=offload.host_v[layer_idx],
+                src=offload.req_to_token[req_ids[b], cached:prior].long(),
+                ks_dst=offload.slab_ksf[layer_idx] if quant else None,
+                vs_dst=offload.slab_vsf[layer_idx] if quant else None,
+                ks_src=offload.host_ksf[layer_idx] if quant else None,
+                vs_src=offload.host_vsf[layer_idx] if quant else None,
+            )
+        if ext:
+            _copy_rows(
+                k_dst=offload.slab_k[layer_idx],
+                v_dst=offload.slab_v[layer_idx],
+                dst=torch.arange(slab.base + prior, slab.base + seq, device=device),
+                k_src=offload.dev_k[layer_idx],
+                v_src=offload.dev_v[layer_idx],
+                src=torch.arange(
+                    offload.layout.scratch_base + ext_before,
+                    offload.layout.scratch_base + ext_before + ext,
+                    device=device,
+                ),
+                ks_dst=offload.slab_ksf[layer_idx] if quant else None,
+                vs_dst=offload.slab_vsf[layer_idx] if quant else None,
+                ks_src=offload.dev_ksf[layer_idx] if quant else None,
+                vs_src=offload.dev_vsf[layer_idx] if quant else None,
+            )
+        slab.cursors[layer_idx] = seq
+        ext_before += ext
+    _copy_rows(
+        k_dst=k,
+        v_dst=v,
+        dst=torch.arange(positions.numel(), dtype=torch.int64, device=device),
+        k_src=offload.slab_k[layer_idx],
+        v_src=offload.slab_v[layer_idx],
+        src=torch.tensor([slab.base for slab in slabs], device=device)[owners]
+        + positions,
+        ks_dst=k_sf,
+        vs_dst=v_sf,
+        ks_src=offload.slab_ksf[layer_idx] if quant else None,
+        vs_src=offload.slab_vsf[layer_idx] if quant else None,
+    )
+    return k, v, k_sf, v_sf
+
+
+def gather_offloaded_context_union(
+    *,
+    backend,
+    layer,
+    forward_batch,
+    topk_indices: torch.Tensor,
+    extend_lens: List[int],
+    sequence_lens: List[int],
+    max_seq: int,
+    output_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The ``gather_offloaded_context`` bytes restricted to the rows the
+    chunk's top-k references.
+
+    The sparse-prefill kernel walks ``indices`` per query, so rows no query
+    selected never load; the per-request selection bitmap packs the union
+    (row-major, the order ``indices`` remaps into) and every query keeps its
+    column order and count, making the attention output bit-identical to the
+    dense gather. Returns the packed K/V (dequantized like the dense path),
+    the compact ``cu_seqlens_k`` and the remapped indices (``-1`` padding
+    preserved; ``kv_lens`` stays the true context lengths so the kernel's
+    visible-prefix truncation is unchanged)."""
+    offload = backend._kv_offload
+    pool = backend.token_to_kv_pool
+    layer_idx = pool.full_attention_layer_index(layer.layer_id)
+    device = topk_indices.device
+    num_sequences = len(sequence_lens)
+    # Query-row owner from the (possibly DP-padded) top-k row count, not the
+    # extend lengths: padded rows past the indexer's count still map to the
+    # request that owns the last extend row.
+    extend_end = torch.cumsum(
+        torch.tensor(extend_lens, dtype=torch.int32, device=device), 0
+    )
+    q_owner = torch.searchsorted(
+        extend_end,
+        torch.arange(topk_indices.shape[0], dtype=torch.int32, device=device),
+        right=True,
+    ).clamp(max=max(num_sequences - 1, 0))
+    entry_owner = q_owner.view(-1, *([1] * (topk_indices.ndim - 1))).expand(
+        topk_indices.shape
+    )
+    selected = topk_indices >= 0
+    chosen = torch.zeros((num_sequences, max_seq), dtype=torch.bool, device=device)
+    chosen[entry_owner[selected], topk_indices[selected].long()] = True
+    counts = chosen.sum(1, dtype=torch.int32)
+    cu_seqlens_k = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=device),
+            counts.cumsum(0, dtype=torch.int32),
+        ]
+    )
+    # Local row of a selection = selections of its request before it.
+    rank = chosen.cumsum(1, dtype=torch.int32) - 1
+    owners, positions = chosen.nonzero(as_tuple=True)
+    slots = offload.req_to_token[
+        forward_batch.req_pool_indices.long()[owners], positions
+    ].long()
+    # The chunk's own rows are in the mirror scratch (stored this layer);
+    # read them there, exactly as the dense path's hot tail does.
+    starts = torch.tensor(
+        [s - e for s, e in zip(sequence_lens, extend_lens)],
+        dtype=torch.int32,
+        device=device,
+    )[owners]
+    before = torch.tensor(
+        [sum(extend_lens[:i]) for i in range(num_sequences)],
+        dtype=torch.int32,
+        device=device,
+    )[owners]
+    tail_mask = positions >= starts
+    tail_rows = (offload.layout.scratch_base + before + (positions - starts))[tail_mask]
+    # NOTE: capture-safety (extend-only, no graph) is enforced by the one
+    # caller; any new caller must gate this block the same way.
+    slabs = None
+    req_ids = None
+    if offload.slab_rows > 0 and not offload.verify:
+        req_ids = forward_batch.req_pool_indices.tolist()
+        slot0s = offload.req_to_token[forward_batch.req_pool_indices, 0].tolist()
+        slabs = _slabs_for(
+            offload, req_ids, sequence_lens, extend_lens, layer_idx, slot0s
+        )
+        if any(slab is None for slab in slabs):
+            slabs = None
+    if slabs is not None:
+        k, v, k_sf, v_sf = _gather_union_from_slab(
+            offload=offload,
+            layer_idx=layer_idx,
+            slabs=slabs,
+            owners=owners,
+            positions=positions,
+            sequence_lens=sequence_lens,
+            extend_lens=extend_lens,
+            req_ids=req_ids,
+        )
+    elif tail_mask.any():
+        k, v, k_sf, v_sf = offload.gather_context_hot_tail(
+            layer_idx=layer_idx,
+            slots=slots,
+            tail_mask=tail_mask,
+            tail_rows=tail_rows,
+        )
+    else:
+        k, v, k_sf, v_sf = offload.gather_context(layer_idx=layer_idx, slots=slots)
+    # One line per forward (the first QSA layer): the union rate that decides
+    # whether this gather beats the dense one. The device->host read stays
+    # behind this test; other layers must not sync.
+    if layer_idx == 0 and envs.SGLANG_QSA_OFFLOAD_UNION_GATHER_LOG.get():
+        total_selected = int(cu_seqlens_k[-1])
+        logger.info(
+            "QSA union gather: %d/%d context rows (%.1f%%)",
+            total_selected,
+            sum(sequence_lens),
+            100.0 * total_selected / max(sum(sequence_lens), 1),
+        )
+    remapped = torch.where(
+        selected, rank[entry_owner, topk_indices.clamp(min=0)], topk_indices
+    ).contiguous()
+    if k_sf is not None:
+        return (
+            *backend.kv_cache_quant_method.dequantize_gathered_kv(
+                k, k_sf, v, v_sf, layer.layer_id, output_dtype
+            ),
+            cu_seqlens_k,
+            remapped,
+        )
+    pool_k = pool.layer_router.read(layer.layer_id).key()
+    return (
+        k.view(pool_k.dtype).to(output_dtype),
+        v.view(pool_k.dtype).to(output_dtype),
+        cu_seqlens_k,
+        remapped,
+    )
+
+
+def _gather_prefill_context_slab(
+    *, offload, layer_idx: int, slots: torch.Tensor, forward_batch
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Packed context whose prefix rows below the slab cursor are served from
+    the device slab instead of the host store.
+
+    Rows between the cursor and the chunk are re-staged from the host (a
+    slab evicted by pool pressure), and the current chunk's rows come from
+    the mirror scratch this layer just stored; the new rows then go into
+    the slab, so the next chunk finds them without a PCIe round-trip. The
+    layout and bytes match ``gather_context`` exactly: the slab holds byte
+    copies of the same host rows in cu order."""
+    dev = slots.device
+    seq_lens = [int(x) for x in forward_batch.seq_lens_cpu]
+    ext_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
+    reqs = forward_batch.req_pool_indices.tolist()
+    total_k = sum(seq_lens)
+    k = torch.empty(
+        (total_k, *offload.dev_k[layer_idx].shape[1:]),
+        dtype=offload.dev_k[layer_idx].dtype,
+        device=dev,
+    )
+    v = torch.empty_like(k)
+    quant = offload.quantized
+    k_sf = (
+        torch.empty(
+            (total_k, *offload.dev_ksf[layer_idx].shape[1:]),
+            dtype=offload.dev_ksf[layer_idx].dtype,
+            device=dev,
+        )
+        if quant
+        else None
+    )
+    v_sf = torch.empty_like(k_sf) if quant else None
+    planes = (
+        {
+            "ks_dst": k_sf,
+            "vs_dst": v_sf,
+            "ks_src": offload.host_ksf[layer_idx],
+            "vs_src": offload.host_vsf[layer_idx],
+        }
+        if quant
+        else {}
+    )
+
+    def span(a: int, b: int) -> torch.Tensor:
+        return torch.arange(a, b, dtype=torch.int64, device=dev)
+
+    slabs = _slabs_for(
+        offload,
+        reqs,
+        seq_lens,
+        ext_lens,
+        layer_idx,
+        # First row per request; a reused slot's new tenant differs here.
+        offload.req_to_token[reqs, 0].tolist(),
+    )
+    ext_seen = 0
+    start = 0
+    for seq, ext, slab in zip(seq_lens, ext_lens, slabs):
+        prior = seq - ext
+        if slab is None:
+            _copy_rows(
+                k_dst=k,
+                v_dst=v,
+                dst=span(start, start + seq),
+                k_src=offload.host_k[layer_idx],
+                v_src=offload.host_v[layer_idx],
+                src=slots[start : start + seq].long(),
+                **planes,
+            )
+        else:
+            cached = slab.cursors[layer_idx]
+            if cached:
+                _copy_rows(
+                    k_dst=k,
+                    v_dst=v,
+                    dst=span(start, start + cached),
+                    k_src=offload.slab_k[layer_idx],
+                    v_src=offload.slab_v[layer_idx],
+                    src=span(slab.base, slab.base + cached),
+                    **(
+                        {
+                            "ks_src": offload.slab_ksf[layer_idx],
+                            "vs_src": offload.slab_vsf[layer_idx],
+                            "ks_dst": k_sf,
+                            "vs_dst": v_sf,
+                        }
+                        if quant
+                        else {}
+                    ),
+                )
+            if prior > cached:
+                _copy_rows(
+                    k_dst=k,
+                    v_dst=v,
+                    dst=span(start + cached, start + prior),
+                    k_src=offload.host_k[layer_idx],
+                    v_src=offload.host_v[layer_idx],
+                    src=slots[start + cached : start + prior].long(),
+                    **planes,
+                )
+            if ext:
+                _copy_rows(
+                    k_dst=k,
+                    v_dst=v,
+                    dst=span(start + prior, start + seq),
+                    k_src=offload.dev_k[layer_idx],
+                    v_src=offload.dev_v[layer_idx],
+                    src=(
+                        offload.layout.scratch_base + ext_seen + span(0, ext)
+                    ),
+                    **(
+                        {
+                            "ks_src": offload.dev_ksf[layer_idx],
+                            "vs_src": offload.dev_vsf[layer_idx],
+                            "ks_dst": k_sf,
+                            "vs_dst": v_sf,
+                        }
+                        if quant
+                        else {}
+                    ),
+                )
+            offload.slab_append(
+                layer_idx=layer_idx,
+                slab=slab,
+                packed=(k, v, k_sf, v_sf),
+                # The packed rows NOT yet in the slab start at cached, not
+                # at the request's slice start.
+                packed_start=start + cached,
+                count=seq - cached,
+            )
+            slab.cursors[layer_idx] = seq
+        ext_seen += ext
+        start += seq
+    return k, v, k_sf, v_sf
+
+
 def gather_offloaded_context(
     *,
     backend,
@@ -143,6 +524,13 @@ def gather_offloaded_context(
     pool = backend.token_to_kv_pool
     layer_idx = pool.full_attention_layer_index(layer.layer_id)
     extend_lens = forward_batch.extend_seq_lens
+    slab_on = (
+        offload.slab_rows > 0
+        and not offload.verify
+        and not is_in_breakable_cuda_graph()
+        and not torch.cuda.is_current_stream_capturing()
+        and forward_batch.extend_seq_lens_cpu is not None
+    )
     hot_tail = (
         envs.SGLANG_QSA_OFFLOAD_HOT_TAIL_GATHER.get()
         and not offload.verify
@@ -153,7 +541,14 @@ def gather_offloaded_context(
         and extend_lens is not None
         and extend_lens.numel() == sequence_lens.numel()
     )
-    if hot_tail:
+    if slab_on:
+        k, v, k_sf, v_sf = _gather_prefill_context_slab(
+            offload=offload,
+            layer_idx=layer_idx,
+            slots=slots,
+            forward_batch=forward_batch,
+        )
+    elif hot_tail:
         # The current chunk's rows are in the device mirror scratch right now
         # (store_offloaded_kv wrote them this layer); read them there instead
         # of waiting on their host round-trip. Token (b, p) of the chunk owns
@@ -237,6 +632,19 @@ def forward_offloaded_attention(
     pool = backend.token_to_kv_pool
     offload = backend._kv_offload
     layer_idx = pool.full_attention_layer_index(layer.layer_id)
+    if (
+        offload.slab_rows > 0
+        and layer_idx == 0
+        and forward_batch.forward_mode.is_decode()
+        # Replayed graphs run no Python; decode-only release would miss the
+        # step. Fresh-extend resets (below) are the authoritative reclaim.
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        # These requests left extend: their prefill slabs are dead weight,
+        # decode reads through the ring/LRU. (Idempotent; target verify
+        # keeps the slab, its request is done extending already.)
+        for req in forward_batch.req_pool_indices.tolist():
+            offload.slab_release(int(req))
     metadata = backend._resolve_metadata(forward_batch)
     positions = backend._expand_block_indices(topk_indices, metadata)
     row_requests = backend._row_requests(forward_batch=forward_batch, metadata=metadata)

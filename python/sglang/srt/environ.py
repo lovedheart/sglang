@@ -332,6 +332,30 @@ class Envs:
     # round-tripping them host -> host store -> device over PCIe. Bitwise
     # identical to the all-host gather; 0 restores the all-host path.
     SGLANG_QSA_OFFLOAD_HOT_TAIL_GATHER = EnvBool(True)
+    # Gather only the K/V rows the chunk's top-k actually references instead
+    # of the full packed context: the sparse-prefill kernel reads exactly the
+    # selected rows (it walks ``indices`` per query), so the unreferenced
+    # prefix rows the dense gather stages over PCIe are never touched. A
+    # per-request bitmap gives the union rows and remaps ``indices`` to the
+    # compact layout without changing any query's column order, keeping the
+    # output bit-identical; the host read becomes O(top-k union) per chunk
+    # instead of O(context). Unset restores the dense gather.
+    SGLANG_QSA_OFFLOAD_UNION_GATHER = EnvBool(False)
+    # Log the per-forward union rate (selected / context rows) once per
+    # prefill at INFO. Verbose on busy servers; the rate only matters while
+    # tuning or verifying the union gather above.
+    SGLANG_QSA_OFFLOAD_UNION_GATHER_LOG = EnvBool(False)
+    # Device rows the QSA K/V offload caches chunked-prefill contexts with:
+    # each request keeps its already-computed context rows on the device for
+    # its extend lifetime, so a chunk appends only its own rows instead of
+    # re-gathering the whole prefix from the pinned host over PCIe (that
+    # re-read is O(chunks x prefix); the slab makes it O(L)). Rows are byte
+    # copies of the host store's, so the gather output stays bit-identical;
+    # 0 disables. Size it to (concurrent prefill requests) x (max context
+    # length) rows; a full pool evicts other requests' slabs, which fall
+    # back to the all-host gather for that chunk. 300K rows (~2 GB packed
+    # across the QSA layers) covers 4 concurrent 61K prefills or one 262K.
+    SGLANG_QSA_OFFLOAD_PREFILL_SLAB_ROWS = EnvInt(0)
     # Give the QSA sparse-prefill kernels two warps and a 3-deep pipeline instead of
     # the one-warp tail of the tuning tables.  With one warp Triton has nowhere to put
     # the head_dim-deep QK reduction, so it serialises it; splitting it across two

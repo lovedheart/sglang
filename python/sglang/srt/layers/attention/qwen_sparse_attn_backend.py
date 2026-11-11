@@ -31,6 +31,7 @@ from sglang.srt.layers.attention.qsa.kv_offload_attention import (
     QSAKVGatherSource,
     forward_offloaded_attention,
     gather_offloaded_context,
+    gather_offloaded_context_union,
     store_offloaded_kv,
 )
 from sglang.srt.layers.attention.qsa.metadata import (
@@ -1932,6 +1933,38 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         if self._kv_offload is not None:
+            if (
+                envs.SGLANG_QSA_OFFLOAD_UNION_GATHER.get()
+                and not self._kv_offload.verify
+                # The union's row count is data-dependent; a captured graph
+                # needs the fixed-shape dense gather.
+                and not is_in_breakable_cuda_graph()
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                packed_k, packed_v, cu_seqlens_k, topk_indices = (
+                    gather_offloaded_context_union(
+                        backend=self,
+                        layer=layer,
+                        forward_batch=forward_batch,
+                        topk_indices=topk_indices,
+                        extend_lens=extend_lens,
+                        sequence_lens=sequence_lens,
+                        max_seq=max(sequence_lens, default=1),
+                        output_dtype=q.dtype,
+                    )
+                )
+                output = sparse_gqa_fwd_interface_triton_ck(
+                    q.contiguous(),
+                    self._widen_kv_for_kernel(packed_k, q.dtype),
+                    self._widen_kv_for_kernel(packed_v, q.dtype),
+                    topk_indices,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    sequence_lens_tensor,
+                    layer.scaling,
+                    max_q=max(extend_lens, default=1),
+                )
+                return self._pad_extend_output(output, num_output_rows)
             packed_k, packed_v = gather_offloaded_context(
                 backend=self,
                 layer=layer,

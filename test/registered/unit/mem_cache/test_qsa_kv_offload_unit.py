@@ -17,6 +17,9 @@ import torch
 
 from sglang.srt.arg_groups.qsa_kv_offload_hook import check_qsa_kv_offload_args
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.qsa.kv_offload_attention import (
+    _gather_prefill_context_slab,
+)
 from sglang.srt.mem_cache.qsa_kv_offload import (
     QSAKVHostOffload,
     QSAKVOffloadBudget,
@@ -539,6 +542,173 @@ class TestOffloadResolve(CustomTestCase):
         sim.extend(1, 300)
         with self.assertRaisesRegex(RuntimeError, "cannot hold"):
             sim.step()
+
+
+def _extend_more(sim, req, extra):
+    """One more prefill chunk for ``req``: fresh slots stored into the
+    scratch window, without touching the earlier chunks' rows."""
+    prev = sim.lengths[req]
+    slots = sim._alloc(extra)
+    sim.req_to_token[req, prev : prev + extra] = slots.to(torch.int32)
+    sim.offload.begin_forward(
+        sim.req_to_token, reset_req_pool_indices=torch.tensor([req], device=sim.device)
+    )
+    sim._write(slots, sim.offload.extend_rows(extra))
+    sim.lengths[req] = prev + extra
+
+
+def _fb(reqs, seqs, exts, device):
+    return SimpleNamespace(
+        req_pool_indices=torch.tensor(reqs, dtype=torch.int64, device=device),
+        seq_lens_cpu=seqs,
+        extend_seq_lens_cpu=exts,
+    )
+
+
+class TestPrefillSlab(CustomTestCase):
+    """The chunked-prefill slab gather serves the same bytes as the all-host
+    gather while the cached prefix comes from the device without the host."""
+
+    def _gather_both(self, sim, fb, slots, layer=0):
+        offload = sim.offload
+        k, v, ksf, vsf = _gather_prefill_context_slab(
+            offload=offload, layer_idx=layer, slots=slots, forward_batch=fb
+        )
+        hk, hv, hksf, hvsf = offload.gather_context(layer_idx=layer, slots=slots)
+        self.assertTrue(torch.equal(k, hk))
+        self.assertTrue(torch.equal(v, hv))
+        self.assertEqual(ksf is None, hksf is None)
+        if ksf is not None:
+            self.assertTrue(torch.equal(ksf, hksf))
+            self.assertTrue(torch.equal(vsf, hvsf))
+        return k, v, ksf, vsf
+
+    def test_chunks_match_host_gather_and_serve_from_device(self):
+        for quantized in (False, True):
+            with (
+                self.subTest(quantized=quantized),
+                envs.SGLANG_QSA_OFFLOAD_PREFILL_SLAB_ROWS.override(8192),
+            ):
+                sim = _OffloadSim(rows_per_request=1, seed=11, quantized=quantized)
+                sim.extend(1, 64)
+                seq = 64
+                slots = sim.req_to_token[1, :seq].long()
+                self._gather_both(
+                    sim, _fb([1], [seq], [seq], sim.device), slots
+                )
+                # Chunk 2 with the host store zeroed: the cache in slabsd prefix
+                # must still come out right, proving it was served on the
+                # device. The chunk's own rows come from the scratch.
+                _extend_more(sim, 1, 48)
+                for plane in (sim.offload.host_k, sim.offload.host_v):
+                    plane.zero_()
+                if quantized:
+                    sim.offload.host_ksf.zero_()
+                    sim.offload.host_vsf.zero_()
+                seq = 112
+                slots = sim.req_to_token[1, :seq].long()
+                k, v, ksf, vsf = _gather_prefill_context_slab(
+                    offload=sim.offload,
+                    layer_idx=0,
+                    slots=slots,
+                    forward_batch=_fb([1], [seq], [48], sim.device),
+                )
+                # The whole context (slab-cached prefix + scratch chunk)
+                # matches the reference pool although the host rows are
+                # zeroed: the prefix was served from the device.
+                self.assertTrue(torch.equal(k, sim.ref_k[0][slots]))
+                self.assertTrue(torch.equal(v, sim.ref_v[0][slots]))
+                if quantized:
+                    self.assertTrue(
+                        torch.equal(ksf, sim.ref_ksf[0][slots])
+                    )
+                    self.assertTrue(
+                        torch.equal(vsf, sim.ref_vsf[0][slots])
+                    )
+                slab = sim.offload._slabs[1]
+                # Only layer 0 was gathered; layers advance independently.
+                self.assertEqual(slab.cursors[0], 112)
+                # Chunk 3: chunk 2's append must have staged the *right*
+                # rows (an append off by `cached` only shows up one chunk
+                # later), still with the host store zeroed.
+                _extend_more(sim, 1, 32)
+                seq = 144
+                slots = sim.req_to_token[1, :seq].long()
+                k, v, ksf, vsf = _gather_prefill_context_slab(
+                    offload=sim.offload,
+                    layer_idx=0,
+                    slots=slots,
+                    forward_batch=_fb([1], [seq], [32], sim.device),
+                )
+                self.assertTrue(torch.equal(k, sim.ref_k[0][slots]))
+                self.assertTrue(torch.equal(v, sim.ref_v[0][slots]))
+                if quantized:
+                    self.assertTrue(
+                        torch.equal(ksf, sim.ref_ksf[0][slots])
+                    )
+                    self.assertTrue(
+                        torch.equal(vsf, sim.ref_vsf[0][slots])
+                    )
+
+    def test_layers_share_the_slab_and_chunks_ride(self):
+        # Layers advance independently: a layer whose own cursor still
+        # fits the prior must ride the slab even while another layer's
+        # cursor (ahead, from the same chunk) exceeds it.
+        with envs.SGLANG_QSA_OFFLOAD_PREFILL_SLAB_ROWS.override(8192):
+            sim = _OffloadSim(rows_per_request=1, seed=14)
+            sim.extend(1, 64)
+            slots = sim.req_to_token[1, :64].long()
+            self._gather_both(sim, _fb([1], [64], [64], sim.device), slots)
+            self._gather_both(sim, _fb([1], [64], [64], sim.device), slots, layer=1)
+            slab = sim.offload._slabs[1]
+            self.assertEqual(slab.cursors[:2], [64, 64])
+            _extend_more(sim, 1, 32)
+            seq = 96
+            slots = sim.req_to_token[1, :seq].long()
+            # Layer 1 first: its cursor hits 96. Layer 0 (cursor 64 <= the
+            # new prior 64) must still ride the SAME slab, not re-stage.
+            self._gather_both(
+                sim, _fb([1], [seq], [32], sim.device), slots, layer=1
+            )
+            self._gather_both(sim, _fb([1], [seq], [32], sim.device), slots)
+            self.assertIs(sim.offload._slabs[1], slab)
+            self.assertEqual(slab.cursors[:2], [96, 96])
+
+    def test_two_requests_offsets(self):
+        with envs.SGLANG_QSA_OFFLOAD_PREFILL_SLAB_ROWS.override(8192):
+            sim = _OffloadSim(rows_per_request=1, seed=12)
+            slots_a = sim._alloc(40)
+            slots_b = sim._alloc(24)
+            sim.req_to_token[1, :40] = slots_a.to(torch.int32)
+            sim.req_to_token[2, :24] = slots_b.to(torch.int32)
+            sim.offload.begin_forward(
+                sim.req_to_token,
+                reset_req_pool_indices=torch.tensor([1, 2], device=sim.device),
+            )
+            sim._write(
+                torch.cat([slots_a, slots_b]), sim.offload.extend_rows(64)
+            )
+            slots = torch.cat([slots_a, slots_b])
+            self._gather_both(
+                sim, _fb([1, 2], [40, 24], [40, 24], sim.device), slots, layer=1
+            )
+            self.assertEqual(sim.offload._slabs[2].cursors[1], 24)
+
+    def test_full_pool_gathers_from_host_and_release_returns_rows(self):
+        # Grow demand (4096 rows) exceeds the pool: every reservation fails
+        # and the gather must equal the all-host gather.
+        with envs.SGLANG_QSA_OFFLOAD_PREFILL_SLAB_ROWS.override(64):
+            sim = _OffloadSim(rows_per_request=1, seed=13)
+            sim.extend(1, 64)
+            slots = sim.req_to_token[1, :64].long()
+            self._gather_both(sim, _fb([1], [64], [64], sim.device), slots)
+            self.assertEqual(sim.offload._slabs, {})
+        with envs.SGLANG_QSA_OFFLOAD_PREFILL_SLAB_ROWS.override(64):
+            sim2 = _OffloadSim(rows_per_request=1, seed=13)
+            sim2.extend(1, 8)
+            sim2.offload.slab_release(1)
+            self.assertEqual(sim2.offload._slabs, {})
+            self.assertEqual(sim2.offload._slab_spans, [(0, 64)])
 
 
 if __name__ == "__main__":

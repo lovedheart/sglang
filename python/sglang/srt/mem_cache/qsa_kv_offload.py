@@ -48,6 +48,21 @@ TAIL_BLOCKS = 2
 GB = 1e9
 
 
+class _PrefillSlab(msgspec.Struct):
+    """One request's device-side slab of its prefill context. ``cursors``
+    counts, per layer, the prefix rows already in the slab: layer ``l``'s
+    gather of the next chunk trusts rows below ``cursors[l]`` and appends
+    the rest, so layers advance independently within a chunk."""
+
+    base: int
+    length: int
+    cursors: list[int]
+    # First context row's host slot when the slab was stamped: a reused
+    # request slot with the same cursor depth but a different slot table
+    # is a different tenant, and its rows must not be trusted.
+    slot0: int = -1
+
+
 class QSAKVOffloadLayout(msgspec.Struct, frozen=True):
     """Device-row layout of an offloaded QSA K/V pool."""
 
@@ -396,6 +411,48 @@ class QSAKVHostOffload:
             self._verify_counts = torch.zeros(2, dtype=torch.int64, device=self.device)
         self._arange = torch.arange(
             max(layout.scratch_rows, self.cr), dtype=torch.int64, device=self.device
+        )
+        # Chunked-prefill context slab (see SGLANG_QSA_OFFLOAD_PREFILL_SLAB_ROWS):
+        # a device byte-copy of each extending request's context rows, so the
+        # next chunk appends its rows instead of re-gathering the whole
+        # prefix from the pinned host. Pool exhausted -> that request's chunk
+        # uses the all-host gather; correctness never depends on the slab.
+        self.slab_rows = (
+            0 if verify else envs.SGLANG_QSA_OFFLOAD_PREFILL_SLAB_ROWS.get()
+        )
+        self.slab_grow = max(layout.scratch_rows, 4096)
+        if self.slab_rows > 0:
+
+            def device_planes(shape):
+                return torch.empty(
+                    (self.num_layers, self.slab_rows, *shape),
+                    dtype=dtype,
+                    device=self.device,
+                )
+
+            self.slab_k = device_planes(row_shape)
+            self.slab_v = device_planes(row_shape)
+            self.slab_ksf = device_planes(sf_row_shape) if self.quantized else None
+            self.slab_vsf = device_planes(sf_row_shape) if self.quantized else None
+            logger.info(
+                "QSA K/V offload: prefill slab %d device rows (%.2f GB)",
+                self.slab_rows,
+                (
+                    2 * self.slab_k.numel() * self.slab_k.element_size()
+                    + (
+                        0
+                        if self.slab_ksf is None
+                        else 2 * self.slab_ksf.numel() * self.slab_ksf.element_size()
+                    )
+                )
+                / GB,
+            )
+        else:
+            self.slab_k = self.slab_v = self.slab_ksf = self.slab_vsf = None
+        # req_pool_idx -> slab, and the pool's free spans (base, length).
+        self._slabs: dict[int, _PrefillSlab] = {}
+        self._slab_spans: list[Tuple[int, int]] = (
+            [(0, self.slab_rows)] if self.slab_rows > 0 else []
         )
 
     def mirror(
@@ -922,4 +979,135 @@ class QSAKVHostOffload:
             vs_dst=self.dev_vsf[layer_idx] if self.quantized else None,
             ks_src=self.host_ksf[layer_idx] if self.quantized else None,
             vs_src=self.host_vsf[layer_idx] if self.quantized else None,
+        )
+
+    # -- chunked-prefill context slab (see SGLANG_QSA_OFFLOAD_PREFILL_SLAB_ROWS)
+
+    def slab_reserve(self, req: int, need: int) -> Optional[_PrefillSlab]:
+        """A contiguous slab of ``need`` rows for extending request ``req``,
+        keeping its cached rows (moving them if the slab must grow). None
+        when the pool cannot fit it even after evicting other requests'
+        slabs; the request then gathers from the host and any partial slab
+        it still holds stays valid."""
+        if self.slab_rows <= 0:
+            return None
+        slab = self._slabs.get(req)
+        if slab is not None and slab.length >= need:
+            return slab
+        want = need + self.slab_grow
+        base = self._slab_take(want)
+        if base is None:
+            self._slab_evict_other(req)
+            base = self._slab_take(want)
+        if base is None:
+            return None
+        if slab is not None:
+            cached = max(slab.cursors)
+            for layer_idx in range(self.num_layers):
+                self._slab_move_rows(layer_idx, dst=base, src=slab.base, count=cached)
+            self._slab_put_span(slab.base, slab.length)
+            slab.base = base
+            slab.length = want
+        else:
+            slab = _PrefillSlab(
+                base=base, length=want, cursors=[0] * self.num_layers
+            )
+            self._slabs[req] = slab
+        return slab
+
+    def slab_release(self, req: int) -> None:
+        """Hand back the slab rows of a request that left extend (its decode
+        steps read the pool through the ring/LRU, not the slab)."""
+        slab = self._slabs.pop(req, None)
+        if slab is not None:
+            self._slab_put_span(slab.base, slab.length)
+
+    def slab_append(
+        self,
+        *,
+        layer_idx: int,
+        slab: _PrefillSlab,
+        packed: Tuple[torch.Tensor, ...],
+        packed_start: int,
+        count: int,
+    ) -> None:
+        """Stage ``count`` packed context rows starting at ``packed_start``
+        of this chunk's gather output into the slab behind its cursor for
+        ``layer_idx``; the caller advances the cursor."""
+        if count <= 0:
+            return
+        cursor = slab.cursors[layer_idx]
+        k, v, k_sf, v_sf = packed
+        _copy_rows(
+            k_dst=self.slab_k[layer_idx],
+            v_dst=self.slab_v[layer_idx],
+            dst=torch.arange(
+                slab.base + cursor,
+                slab.base + cursor + count,
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            k_src=k,
+            v_src=v,
+            src=torch.arange(
+                packed_start,
+                packed_start + count,
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            ks_dst=self.slab_ksf[layer_idx] if self.quantized else None,
+            vs_dst=self.slab_vsf[layer_idx] if self.quantized else None,
+            ks_src=k_sf,
+            vs_src=v_sf,
+        )
+
+    def _slab_take(self, need: int) -> Optional[int]:
+        for i, (base, length) in enumerate(self._slab_spans):
+            if length >= need:
+                rest = length - need
+                self._slab_spans[i : i + 1] = [(base + need, rest)] if rest else []
+                return base
+        return None
+
+    def _slab_put_span(self, base: int, length: int) -> None:
+        self._slab_spans.append((base, length))
+        self._slab_spans.sort()
+        merged = []
+        for b, n in self._slab_spans:
+            if merged and merged[-1][0] + merged[-1][1] == b:
+                merged[-1] = (merged[-1][0], merged[-1][1] + n)
+            else:
+                merged.append((b, n))
+        self._slab_spans = merged
+
+    def _slab_evict_other(self, req: int) -> None:
+        # The largest other request's slab is the cheapest way back to free
+        # rows: its next chunk re-gathers from the host once and re-caches.
+        cands = [
+            (max(slab.cursors), other, slab)
+            for other, slab in self._slabs.items()
+            if other != req
+        ]
+        if cands:
+            _, other, _ = max(cands)
+            self.slab_release(other)
+
+    def _slab_move_rows(
+        self, layer_idx: int, *, dst: int, src: int, count: int
+    ) -> None:
+        if count <= 0:
+            return
+        rows_src = torch.arange(src, src + count, dtype=torch.int64, device=self.device)
+        rows_dst = torch.arange(dst, dst + count, dtype=torch.int64, device=self.device)
+        _copy_rows(
+            k_dst=self.slab_k[layer_idx],
+            v_dst=self.slab_v[layer_idx],
+            dst=rows_dst,
+            k_src=self.slab_k[layer_idx],
+            v_src=self.slab_v[layer_idx],
+            src=rows_src,
+            ks_dst=self.slab_ksf[layer_idx] if self.quantized else None,
+            vs_dst=self.slab_vsf[layer_idx] if self.quantized else None,
+            ks_src=self.slab_ksf[layer_idx] if self.quantized else None,
+            vs_src=self.slab_vsf[layer_idx] if self.quantized else None,
         )
