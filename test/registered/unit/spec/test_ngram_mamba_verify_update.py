@@ -248,10 +248,6 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
                 "commit_gdn_replayssm_circular"
             ),
             patch(
-                "sglang.srt.layers.attention.hybrid_linear_attn_backend."
-                "update_ple_state_after_mtp_verify"
-            ),
-            patch(
                 "sglang.kernels.ops.mamba.mamba_state_scatter_triton."
                 "fused_conv_window_scatter_with_mask"
             ) as scatter,
@@ -389,32 +385,48 @@ class TestReplaySSMFoldPleCommit(CustomTestCase):
     SIZE, SPEC, D, CTX = 6, 4, 8, 4
 
     def _make_fold_worker(self, dst_indices, conv_state, context):
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+            ForwardStateSlots,
+        )
+        from sglang.srt.mem_cache.kv.decl import STATE_PART
+        from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, SHORT_CONV_PART
+
         target_worker = MagicMock()
         target_worker.model_runner.model = MagicMock()
-        req_pool = target_worker.model_runner.req_to_token_pool
-        # Upstream moved the mamba pool lookup onto the KV layer router.
-        mamba_pool = (
-            target_worker.model_runner.token_to_kv_pool.layer_router.part_view.return_value
-        )
+        # Upstream moved the pool lookups onto the KV layer router's part views.
+        mamba_pool = MagicMock()
         mamba_pool.replayssm_spec_fold = True
         mamba_pool.replayssm_is_kda = False
         mamba_pool.replayssm_cache_base = None
-        req_pool.get_mamba_indices.return_value = dst_indices
-        req_pool.translate_mamba_indices.side_effect = lambda x: x
-        req_pool.short_conv_pool.conv_state = None
-        req_pool.short_conv_pool.intermediate_conv_state = None
+        short_conv = MagicMock()
+        short_conv.conv_state = None
+        short_conv.intermediate_conv_state = None
         if conv_state is not None:
-            req_pool.short_conv_pool.conv_state = conv_state.unsqueeze(0).unsqueeze(0)
-        req_pool.ngram_pool.context = context
+            short_conv.conv_state = conv_state.unsqueeze(0).unsqueeze(0)
+            short_conv.intermediate_conv_state = conv_state.unsqueeze(0).unsqueeze(0)
+        ngram = MagicMock()
+        ngram.context = context
         # Encode batch row and tree step into the value so both are observable.
         enc = (
             torch.arange(self.SPEC + 1, dtype=torch.int64).view(-1, 1) * 1000
             + torch.arange(self.D, dtype=torch.int64).view(1, -1) * 10
         )
-        req_pool.ngram_pool.intermediate_context = (
+        ngram.intermediate_context = (
             enc.view(self.SPEC + 1, self.D, 1)
             .expand(self.SPEC + 1, self.D, self.CTX)
             .contiguous()
+        )
+        parts = {
+            STATE_PART: mamba_pool,
+            SHORT_CONV_PART: short_conv,
+            NGRAM_PART: ngram,
+        }
+        target_worker.model_runner.token_to_kv_pool.layer_router.part_view.side_effect = (
+            parts.get
+        )
+        # The fold path resolves persistent state slots via the attn backend.
+        target_worker.model_runner.attn_backend.forward_state_slots.side_effect = (
+            lambda _bs, track: ForwardStateSlots(working=dst_indices, track=track)
         )
         return target_worker
 
