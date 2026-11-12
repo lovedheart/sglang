@@ -35,7 +35,6 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-from sglang.srt.model_executor.runner import get_is_capture_mode
 
 logger = logging.getLogger(__name__)
 
@@ -230,7 +229,6 @@ class QSAIndexer(MultiPlatformOp):
                 qsa_index_q_norm_rope_store,
             )
 
-            self._ensure_rope_cache_for(positions)
             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
                 qk,
@@ -453,36 +451,6 @@ class QSAIndexer(MultiPlatformOp):
             return positions[0]
         return positions
 
-    def _ensure_rope_cache_for(self, positions: torch.Tensor) -> None:
-        """Grow the shared RoPE table only when it cannot cover the model.
-
-        A table of ``max_position_embeddings`` rows already covers every
-        position the model can emit, and
-        ``reserve_rope_cache_for_long_sequences`` pre-expands it past that for
-        any longer context (plus the speculative margin) at startup, so the
-        serving case is a host-side comparison.  Reading the position maximum
-        back costs a round-trip per layer and per call site, so growth falls
-        back to it only for a table that really is too short.
-
-        A table that claims coverage is still checked on the device: an out-of
-        range position is a caller bug, and the assert turns what would be a
-        silent out-of-bounds cache read into a loud failure without paying a
-        synchronization.
-        """
-
-        if get_is_capture_mode():
-            return
-        ensure = getattr(self.rotary_emb, "_ensure_cos_sin_cache_length", None)
-        if not callable(ensure):
-            return
-        cache_length = int(self.rotary_emb.cos_sin_cache.shape[0])
-        if cache_length >= int(
-            getattr(self.rotary_emb, "max_position_embeddings", cache_length)
-        ):
-            if positions.numel():
-                torch._assert_async(positions.max() < cache_length)
-            return
-        ensure(int(positions.max().item()))
 
     def apply_rope(self, positions: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.numel() == 0:
@@ -493,8 +461,6 @@ class QSAIndexer(MultiPlatformOp):
         )
         if num_positions != tensor.shape[0]:
             raise ValueError("QSA RoPE positions must match the token dimension")
-        self._ensure_rope_cache_for(positions)
-
         # Let the exact Qwen4-Exp RoPE instance compose regular or three-axis
         # multimodal positions.  Its public cache view repeats cos/sin to the
         # full rotary width; apply_rotary_emb consumes one half.
@@ -730,8 +696,6 @@ class QSAIndexer(MultiPlatformOp):
         )
         # Use the compressed-cache dtype for Q. Leaving cache_loc unset defers
         # the ring store until raw local K has been gathered into global order.
-        # _ensure_rope_cache_for checks coverage on the host, so going through
-        # the normal path costs no device sync per layer.
         q, token_k, _ = self.project_qk(
             hidden_states,
             positions,
