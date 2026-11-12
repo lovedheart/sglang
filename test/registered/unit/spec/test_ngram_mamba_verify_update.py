@@ -421,9 +421,8 @@ class TestReplaySSMFoldPleCommit(CustomTestCase):
             SHORT_CONV_PART: short_conv,
             NGRAM_PART: ngram,
         }
-        target_worker.model_runner.token_to_kv_pool.layer_router.part_view.side_effect = (
-            parts.get
-        )
+        router = target_worker.model_runner.token_to_kv_pool.layer_router
+        router.part_view.side_effect = parts.get
         # The fold path resolves persistent state slots via the attn backend.
         target_worker.model_runner.attn_backend.forward_state_slots.side_effect = (
             lambda _bs, track: ForwardStateSlots(working=dst_indices, track=track)
