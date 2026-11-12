@@ -305,10 +305,13 @@ def contract_for(runner) -> RunnerContract:
         backend is not None
         and backend.is_marlin()
         and not backend.is_experimental_sgl_marlin()
-    ):
+    ) or (backend is not None and backend.is_sm12x_nvfp4_bf16()):
+        # The SM12x W4A16 kernel is row-local like Marlin's: a format runs waves over
+        # its entries the same way (``formats.ModelOptNvfp4Sm12xFormat``).
         return MARLIN
     raise RuntimeError(
-        "Paged experts: requires the triton or Marlin MoE runner, the layer's method uses "
+        "Paged experts: requires the triton, Marlin or SM12x NVFP4 MoE runner, the "
+        "layer's method uses "
         f"{getattr(backend, 'value', None)}; select one with --moe-runner-backend if its "
         "quantization method supports it"
     )

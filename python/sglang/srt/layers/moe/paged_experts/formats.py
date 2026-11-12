@@ -393,6 +393,49 @@ class ModelOptNvfp4Format(ExpertFormat):
         )
 
 
+class _Sm12xPagedRunnerMethod:
+    """Runs waves through the SM12x W4A16 fused kernel, which always sums the top-k
+    (router-weighted) entries itself: fold each routed entry into its own row with top-k 1,
+    which leaves each row the entry's weighted output, and hand back the entries as
+    ``[tokens, top_k, hidden]`` for the contract to sum."""
+
+    def __init__(self, base_method):
+        self.base_method = base_method
+
+    def apply(self, layer, dispatch_output):
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        topk_output = dispatch_output.topk_output
+        tokens, top_k = topk_output.topk_ids.shape
+        wave = dispatch_output
+        if top_k > 1:
+            wave = dispatch_output._replace(
+                hidden_states=dispatch_output.hidden_states.repeat_interleave(top_k, 0),
+                topk_output=topk_output._replace(
+                    topk_ids=topk_output.topk_ids.reshape(-1, 1),
+                    topk_weights=topk_output.topk_weights.reshape(-1, 1),
+                ),
+            )
+        out = self.base_method.apply(layer=layer, dispatch_output=wave).hidden_states
+        return StandardCombineInput(hidden_states=out.view(tokens, top_k, -1))
+
+
+class ModelOptNvfp4Sm12xFormat(ModelOptNvfp4Format):
+    label = "ModelOpt NVFP4 (SM12x W4A16)"
+
+    @classmethod
+    def supports(cls, base_method, scheme) -> bool:
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        return (
+            super().supports(base_method, scheme)
+            and get_moe_runner_backend().is_sm12x_nvfp4_bf16()
+        )
+
+    def runner_method(self, base_method):
+        return _Sm12xPagedRunnerMethod(base_method)
+
+
 class CompressedTensorsWNA16Format(ExpertFormat):
     label = "compressed-tensors W4A16/W8A16"
     unpaged = ("w13_weight_shape", "w2_weight_shape")
@@ -465,6 +508,8 @@ FORMATS = (
     AwqFormat,
     Mxfp4Format,
     Fp8Mxfp4ExpertsFormat,
+    # First among the ModelOpt NVFP4 formats: it matches the same method on the SM12x runner.
+    ModelOptNvfp4Sm12xFormat,
     ModelOptNvfp4Format,
     CompressedTensorsWNA16Format,
     CompressedTensorsNvfp4Format,

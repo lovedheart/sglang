@@ -1162,11 +1162,13 @@ class TestFormats(CustomTestCase):
 
         self.assertIs(contract_for(runner(MoeRunnerBackend.TRITON)), TRITON)
         self.assertIs(contract_for(runner(MoeRunnerBackend.MARLIN)), MARLIN)
+        # SM12x W4A16 is row-local like Marlin's, so its waves use the same contract.
+        self.assertIs(contract_for(runner(MoeRunnerBackend.SM12X_NVFP4_BF16)), MARLIN)
         # This sums the top-k outputs inside the kernel, so waves cannot be exact.
         backend = MoeRunnerBackend.FLASHINFER_CUTLASS
         with self.assertRaisesRegex(RuntimeError, backend.value):
             contract_for(runner(backend))
-        with self.assertRaisesRegex(RuntimeError, "triton or Marlin"):
+        with self.assertRaisesRegex(RuntimeError, "triton, Marlin or SM12x"):
             contract_for(None)
 
 
