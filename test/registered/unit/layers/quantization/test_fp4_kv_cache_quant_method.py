@@ -46,7 +46,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         for target_dtype_str in ("nvfp4", "fp4_mx_block16"):
             resolved, dtype = configure_kv_cache_dtype(
                 server_args_kv_cache_dtype=target_dtype_str,
-                model=None,
+                quant_config=None,
                 model_dtype=torch.bfloat16,
                 is_draft_worker=True,
                 is_dflash=False,
@@ -58,7 +58,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
             # The target itself keeps FP4.
             _, dtype_t = configure_kv_cache_dtype(
                 server_args_kv_cache_dtype=target_dtype_str,
-                model=None,
+                quant_config=None,
                 model_dtype=torch.bfloat16,
                 is_draft_worker=False,
                 is_dflash=False,
@@ -68,7 +68,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         # An explicit draft dtype still overrides the pin.
         resolved, dtype = configure_kv_cache_dtype(
             server_args_kv_cache_dtype="nvfp4",
-            model=None,
+            quant_config=None,
             model_dtype=torch.bfloat16,
             is_draft_worker=True,
             is_dflash=False,
