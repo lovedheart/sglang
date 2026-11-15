@@ -78,6 +78,10 @@ def branching_checkpoint_depth(
 
 
 class MambaComponent(TreeComponent):
+    # Class-level defaults: mock/test harnesses build components with
+    # object.__new__ and exercise tier-aware paths without __init__.
+    _int8_host_tier: Optional[bool] = None
+    _ram_ckpts_issued: int = 0
     component_type = ComponentType.MAMBA
     family = TREE_STATE
     # Subclasses that skip this __init__ (MLX auxiliary state) keep the LRU walk.
@@ -131,10 +135,16 @@ class MambaComponent(TreeComponent):
         """Whether the int8 checkpoint pool has a RAM tier (the offload
         feature): RAM checkpoints are tree values in the host slot."""
         if self._int8_host_tier is None:
-            self._int8_host_tier = False
-            if self.quantizes_checkpoints:
-                storage, sub_pool = self._state()
-                self._int8_host_tier = storage.checkpoint_pool(sub_pool).host_slots > 0
+            from sglang.srt.mem_cache.kv_cache_configurator import (
+                int8_ckpt_offload,
+            )
+
+            try:
+                # The flag pair implies the int8 pool exists and is tiered.
+                self._int8_host_tier = int8_ckpt_offload()
+            except ValueError:
+                # No server-args context (bare component tests): no tiers.
+                self._int8_host_tier = False
         return self._int8_host_tier
 
     def ram_checkpoint_slots(self) -> tuple[int, int]:

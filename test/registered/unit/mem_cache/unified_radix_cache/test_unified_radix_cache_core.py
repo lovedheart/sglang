@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
+from sglang.srt.mem_cache.mamba_checkpoint_pool import MambaCheckpointPool
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
@@ -1962,6 +1963,18 @@ class TestUnifiedRadixCacheInt8MambaCkptOffload(
         kv_size=64,
         max_context_len=64,
     )
+
+    def setUp(self):
+        # Keep unit tests free of pinned-host-registration side effects: a
+        # leaked cudaHostRegister range makes a later HiCache host pool
+        # silently unpinned. The pinned path is covered by the GPU e2e.
+        patcher = mock.patch.object(
+            MambaCheckpointPool,
+            "_alloc_host",
+            lambda self, shape, dtype: torch.empty(shape, dtype=dtype, device="cpu"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _finish_and_release(self, cache, allocator, req_to_token_pool, tokens):
         req = self._make_req(req_to_token_pool, tokens)
