@@ -118,6 +118,30 @@ class MambaComponent(TreeComponent):
         self.host_only_checkpoint = host_only_mamba_checkpoint()
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
+        # int8 checkpoint pool with a RAM tier (tiered offload); None = unqueried.
+        self._int8_host_tier: Optional[bool] = None
+        # RAM-tier checkpoint slots currently held (promotes, tree-owned, or
+        # not-yet-committed inserts); backs the pool's RAM-tier invariant.
+        self._ram_ckpts_issued = 0
+
+    def _ckpt_host_tier(self) -> bool:
+        """Whether the int8 checkpoint pool has a RAM tier (the offload
+        feature): RAM checkpoints are tree values in the host slot."""
+        if self._int8_host_tier is None:
+            self._int8_host_tier = False
+            if self.quantizes_checkpoints:
+                storage, sub_pool = self._state()
+                self._int8_host_tier = (
+                    storage.checkpoint_pool(sub_pool).host_slots > 0
+                )
+        return self._int8_host_tier
+
+    def ram_checkpoint_slots(self) -> tuple[int, int]:
+        """(RAM checkpoint slots held, RAM tier capacity); (0, 0) without one."""
+        if not self._ckpt_host_tier():
+            return (0, 0)
+        storage, sub_pool = self._state()
+        return self._ram_ckpts_issued, storage.checkpoint_pool(sub_pool).host_slots
 
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
         data = node.component_data[self.component_type]
@@ -173,9 +197,13 @@ class MambaComponent(TreeComponent):
             case LRURefreshPhase.WALKDOWN:
                 return
             case LRURefreshPhase.MATCH_END:
-                if node.component_data[ct].value is not None:
+                cd = node.component_data[ct]
+                if cd.value is not None:
                     self.tree_core.lru_lists[ct].reset_node_mru(node)
                     self._cost_mark_used(node)
+                elif cd.host_value is not None and self._ckpt_host_tier():
+                    # A RAM-checkpoint hit: keep it hot in the RAM tier's LRU.
+                    self.tree_core.host_lru_lists[ct].reset_node_mru(node)
             case LRURefreshPhase.INSERT_END:
                 return
             case _:
@@ -187,7 +215,11 @@ class MambaComponent(TreeComponent):
         ct = self.component_type
         # Host-only checkpoints never occupy a GPU slot. Counting the host
         # value as a device-prefix match keeps Full KV indices reachable.
-        host_counts_as_device = self._mamba_host_only_checkpoint()
+        # The same holds for tiered int8 checkpoints: the RAM slot IS the
+        # node's checkpoint, reachable by promotion.
+        host_counts_as_device = self._mamba_host_only_checkpoint() or (
+            self._ckpt_host_tier()
+        )
         if match_device_only and not host_counts_as_device:
             return lambda node: node.component_data[ct].value is not None
 
@@ -235,6 +267,8 @@ class MambaComponent(TreeComponent):
         src_index = self.tree_core.get_component_device_value(
             result.best_match_node, self.component_type
         )
+        if src_index is None and self._ckpt_host_tier():
+            src_index = self._promote_match_checkpoint(result.best_match_node)
         if src_index is None:
             # A source from an earlier match of an unadmitted request may have
             # been evicted and its slot reused since; never carry it over.
@@ -266,6 +300,29 @@ class MambaComponent(TreeComponent):
 
     def _mamba_host_only_checkpoint(self) -> bool:
         return self.host_only_checkpoint
+
+    def _promote_match_checkpoint(self, best_match_node):
+        """Serve a RAM-tier checkpoint hit: copy it back to the GPU checkpoint
+        tier and hand the request that slot as its COW source (the deferred
+        load_to_active dequantizes it, waiting the promotion event)."""
+        host_value = self.tree_core.get_component_host_value(
+            best_match_node, self.component_type
+        )
+        if host_value is None:
+            return None
+        storage, sub_pool = self._state()
+        pool = storage.checkpoint_pool(sub_pool)
+        gpu_slot = pool.alloc_device_slot()
+        if gpu_slot is None:
+            # The GPU tier is at capacity: a device-tier eviction frees one.
+            self.cache.evict(EvictParams(mamba_num=1))
+            gpu_slot = pool.alloc_device_slot()
+            assert gpu_slot is not None, (
+                "Can not alloc GPU int8 checkpoint slot to promote a RAM "
+                "checkpoint"
+            )
+        pool.promote(int(host_value.reshape(-1)[0].item()), int(gpu_slot[0].item()))
+        return gpu_slot
 
     def _copy_mamba_slot_to_host(
         self, insert_params: InsertParams, slot: torch.Tensor
@@ -920,14 +977,30 @@ class MambaComponent(TreeComponent):
             # allocation demand reads: free one cached state outright.
             self.cache.evict(EvictParams(mamba_num=1))
             slot = storage.take_checkpoint_slot(sub_pool)
+            if slot is None and self._ckpt_host_tier():
+                # Total (GPU + RAM) capacity is exhausted and every device
+                # slot is pinned: discard the LRU RAM checkpoint.
+                self.cache.evict_host(1, ComponentType.MAMBA)
+                slot = storage.take_checkpoint_slot(sub_pool)
             assert slot is not None, "Can not alloc int8 mamba checkpoint slot"
         return slot
 
-    def _commit_int8_checkpoint(self, active_slots: torch.Tensor) -> torch.Tensor:
+    def _commit_int8_checkpoint(
+        self, active_slots: torch.Tensor, insert_params: InsertParams
+    ) -> None:
+        """Quantize an active slot into the tiered checkpoint pool and bind the
+        resulting id onto ``insert_params`` under the owning value slot (GPU ->
+        device value, RAM -> host value)."""
         ckpt_slot = self._alloc_int8_ckpt_slot()
         storage, sub_pool = self._state()
+        pool = storage.checkpoint_pool(sub_pool)
+        is_ram = pool.is_host_slot(int(ckpt_slot.reshape(-1)[0].item()))
+        if is_ram:
+            self._ram_ckpts_issued += 1
+            insert_params.mamba_host_value = ckpt_slot
+        else:
+            insert_params.mamba_value = ckpt_slot
         storage.store_checkpoint(sub_pool, active_slots, ckpt_slot)
-        return ckpt_slot
 
     def _free_mamba_value(self, mamba_value: torch.Tensor) -> None:
         storage, sub_pool = self._state()
@@ -1017,7 +1090,7 @@ class MambaComponent(TreeComponent):
                 self._stash_host_checkpoint_source(insert_params, active_value)
                 return cache_len
             if self.quantizes_checkpoints:
-                insert_params.mamba_value = self._commit_int8_checkpoint(active_value)
+                self._commit_int8_checkpoint(active_value, insert_params)
             else:
                 insert_params.mamba_value = active_value
             return cache_len
@@ -1047,11 +1120,11 @@ class MambaComponent(TreeComponent):
                         return 0
                     storage, sub_pool = self._state()
                     src_active = storage.donate_tracking_slot(sub_pool, req, new_slot)
-                    mamba_value_donated = self._commit_int8_checkpoint(src_active)
+                    self._commit_int8_checkpoint(src_active, insert_params)
                     storage.free_state_slots(sub_pool, src_active)
                 else:
-                    mamba_value_donated = self._commit_int8_checkpoint(
-                        req.kv.mamba_pool_idx.view(-1)
+                    self._commit_int8_checkpoint(
+                        req.kv.mamba_pool_idx.view(-1), insert_params
                     )
             elif self.cache.enable_mamba_extra_buffer:
                 new_slot = self._try_alloc_mamba_slot(req)
@@ -1061,6 +1134,7 @@ class MambaComponent(TreeComponent):
                 mamba_value_donated = storage.donate_tracking_slot(
                     sub_pool, req, new_slot
                 )
+                insert_params.mamba_value = mamba_value_donated
             else:
                 mamba_value_donated = self._try_alloc_mamba_slot(req)
                 if mamba_value_donated is None:
@@ -1069,7 +1143,7 @@ class MambaComponent(TreeComponent):
                 storage.copy_state(
                     sub_pool, req.kv.mamba_pool_idx.unsqueeze(0), mamba_value_donated
                 )
-            insert_params.mamba_value = mamba_value_donated
+                insert_params.mamba_value = mamba_value_donated
             return cache_len
 
     def cleanup_after_caching_req(
@@ -1079,7 +1153,7 @@ class MambaComponent(TreeComponent):
         insert_result: Optional[InsertResult] = None,
         insert_params: Optional[InsertParams] = None,
     ) -> None:
-        if self._mamba_host_only_checkpoint():
+        if self._mamba_host_only_checkpoint() or self._ckpt_host_tier():
             self._release_unused_host_checkpoint(insert_result, insert_params)
         if is_finished:
             mamba_value_inserted = (
@@ -1478,6 +1552,14 @@ class MambaComponent(TreeComponent):
             host_lru.cursor_end()
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
+        if self.quantizes_checkpoints and self._ckpt_host_tier():
+            # RAM-tier checkpoint ids live in the checkpoint pool's allocator,
+            # not the HiCache host pool group.
+            storage, sub_pool = self._state()
+            for host_value in host_values:
+                self._ram_ckpts_issued -= 1
+                storage.free_checkpoints(sub_pool, host_value)
+            return
         if self._mamba_pool_host is None:
             return
         for host_value in host_values:

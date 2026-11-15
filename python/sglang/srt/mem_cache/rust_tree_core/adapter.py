@@ -579,6 +579,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         has_mamba = TREE_STATE in families
         from sglang.srt.mem_cache.kv_cache_configurator import (
             host_only_mamba_checkpoint,
+            int8_ckpt_offload,
         )
 
         mamba_max_states_per_path = (
@@ -618,7 +619,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                     else None
                 ),
                 mamba_host_only_checkpoint=(
-                    host_only_mamba_checkpoint() if has_mamba else False
+                    # A RAM checkpoint (host-only mode or the tiered int8 pool)
+                    # is a tree value in the host slot that matches.
+                    (host_only_mamba_checkpoint() or int8_ckpt_offload())
+                    if has_mamba
+                    else False
                 ),
                 # The joint Full/SWA LRU, kept only where uses_joint_lru holds.
                 joint_lru=uses_joint_lru(params, self.tree_components),
@@ -1418,6 +1423,13 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId, component_type: ComponentType
     ) -> Optional[torch.Tensor]:
         return self._binding.get_component_device_value(
+            node_id, self._ids.core(component_type)
+        )
+
+    def get_component_host_value(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> Optional[torch.Tensor]:
+        return self._binding.get_component_host_value(
             node_id, self._ids.core(component_type)
         )
 

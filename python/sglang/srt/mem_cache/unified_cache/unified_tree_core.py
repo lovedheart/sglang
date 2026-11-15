@@ -3372,6 +3372,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """The component's device value on the node, or None if evicted."""
         return self.node_by_id(node_id).component_data[component_type].value
 
+    def get_component_host_value(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> Optional[torch.Tensor]:
+        """The component's host value on the node, or None if absent."""
+        return self.node_by_id(node_id).component_data[component_type].host_value
+
     def component_has_host_value_only(
         self, node_id: NodeId, component_type: ComponentType
     ) -> bool:
@@ -3419,7 +3425,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         expected_hst_leaves: set[UnifiedTreeNode] = set()
         expected_duplicates: set[UnifiedTreeNode] = set()
         mamba = self.components_by_type.get(ComponentType.MAMBA)
-        host_only_mamba = mamba is not None and mamba._mamba_host_only_checkpoint()
+        host_only_mamba = mamba is not None and (
+            mamba._mamba_host_only_checkpoint() or mamba._ckpt_host_tier()
+        )
 
         for node in all_nodes:
             if node is self.root_node:

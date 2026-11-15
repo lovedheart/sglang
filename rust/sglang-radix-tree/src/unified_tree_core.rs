@@ -5458,6 +5458,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(self.arena.try_device_value(node_id, component_type))
     }
 
+    /// A component's host value on a node, if set.
+    pub fn get_component_host_value(
+        &self,
+        node_id: NodeId,
+        component_type: ComponentType,
+    ) -> Result<Option<&Tensor>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        self.assert_component_enabled_(component_type);
+        Ok(self.arena.node(node_id).try_host_value(component_type))
+    }
+
     /// Whether the component's data is device-evicted but host-backed.
     pub fn component_has_host_value_only(
         &self,

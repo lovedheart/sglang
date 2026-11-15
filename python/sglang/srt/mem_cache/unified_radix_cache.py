@@ -4391,6 +4391,14 @@ class UnifiedRadixCache(BasePrefixCache):
             return False
         return comp._mamba_host_only_checkpoint()
 
+    def mamba_ram_checkpoint_slots(self) -> tuple[int, int]:
+        """(RAM checkpoint slots held, RAM tier capacity) of the tiered int8
+        checkpoint pool; (0, 0) without the tier."""
+        comp = self.components.get(ComponentType.MAMBA)
+        if comp is None:
+            return (0, 0)
+        return comp.ram_checkpoint_slots()
+
     # ---- HiCache: Scheduler Entry Points ----
 
     @rank_consensus(same_params=["params.host_hit_length"])

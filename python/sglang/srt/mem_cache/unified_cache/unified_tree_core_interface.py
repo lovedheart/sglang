@@ -844,6 +844,13 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def get_component_host_value(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> Optional[torch.Tensor]:
+        """The component's host value on the node, or None if absent."""
+        ...
+
+    @abstractmethod
     def component_has_host_value_only(
         self, node_id: NodeId, component_type: ComponentType
     ) -> bool:

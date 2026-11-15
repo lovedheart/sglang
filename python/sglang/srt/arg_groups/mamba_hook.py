@@ -102,6 +102,23 @@ def handle_int8_mamba_checkpoint(server_args: Any):
             "--enable-unified-memory: the unified pool keeps no int8 checkpoint "
             "pool, so the flag would have no effect. Disable one of them."
         )
+    if cfg.enable_int8_mamba_checkpoint_offload:
+        if cfg.int8_mamba_ckpt_host_size is None or cfg.int8_mamba_ckpt_host_size <= 0:
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint-offload requires a positive "
+                "--int8-mamba-ckpt-host-size (GiB of pinned RAM for the "
+                "checkpoint RAM tier)."
+            )
+        if cfg.mamba_radix_cache_strategy not in ("auto", "no_buffer", "extra_buffer"):
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint-offload does not support "
+                f"--mamba-radix-cache-strategy={cfg.mamba_radix_cache_strategy!r}."
+            )
+    elif cfg.int8_mamba_ckpt_host_size is not None:
+        raise ValueError(
+            "--int8-mamba-ckpt-host-size requires "
+            "--enable-int8-mamba-checkpoint-offload."
+        )
 
 
 def _platform_supports_mamba_cache_extra_buffer() -> bool:

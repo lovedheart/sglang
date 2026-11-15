@@ -43,6 +43,16 @@ the ``no_buffer`` donate (copy_from) or the ``extra_buffer`` ping-pong track
 buffer (spec path), both converge on "an active slot becomes the cached
 ``mamba_value``" — which is exactly the (store_from_active) hook here. Slot
 lifecycle is owned by the caller via the embedded ``MambaSlotAllocator``.
+
+With ``host_slots > 0`` the pool spans two tiers as ONE logical pool: GPU
+checkpoint slots (allocator ids ``[1, num_slots]``) and pinned-RAM checkpoint
+slots (ids ``(num_slots, num_slots + host_slots]``, the allocator's host tier).
+Both tiers store the identical int8 format; a RAM store quantizes into a GPU
+staging row and D2H-copies the planes unchanged, and a match on a RAM
+checkpoint is served by ``promote`` (async H2D of one RAM slot into a GPU
+slot), which the regular ``load_to_active`` dequantization then consumes.
+``host_slots`` capacity is headroom too; the ACTIVE bf16 state pool is never
+counted against it.
 """
 
 from __future__ import annotations
@@ -73,6 +83,9 @@ class Int8CheckpointStore:
     ``scale_dtype`` should match the source state's dtype (bf16 / fp16 / fp32) so
     that quantize and dequantize use the identical scale — it is NOT required to
     be bf16.
+
+    ``buffer_factory(shape, dtype)``, when given, allocates the planes (the RAM
+    tier passes a pinned-memory allocator; nothing else should need it).
     """
 
     QMAX = 127
@@ -87,6 +100,7 @@ class Int8CheckpointStore:
         head_k_dim: int,
         device: str,
         scale_dtype: torch.dtype = torch.bfloat16,
+        buffer_factory=None,
     ):
         self.num_layers = num_layers
         self.num_slots = num_slots
@@ -94,23 +108,14 @@ class Int8CheckpointStore:
         self.d_v = head_v_dim
         self.d_k = head_k_dim
         self.device = device
-        self.qdata = torch.empty(
-            num_layers,
-            num_slots,
-            num_heads,
-            head_v_dim,
-            head_k_dim,
-            dtype=torch.int8,
-            device=device,
+        alloc = buffer_factory or (
+            lambda shape, dtype: torch.empty(shape, dtype=dtype, device=device)
         )
-        self.scale = torch.empty(
-            num_layers,
-            num_slots,
-            num_heads,
-            1,
-            head_k_dim,
-            dtype=scale_dtype,
-            device=device,
+        self.qdata = alloc(
+            (num_layers, num_slots, num_heads, head_v_dim, head_k_dim), torch.int8
+        )
+        self.scale = alloc(
+            (num_layers, num_slots, num_heads, 1, head_k_dim), scale_dtype
         )
 
     # ---- (de)quant math (also usable standalone for probes/tests) ----
@@ -198,12 +203,20 @@ class MambaCheckpointPool:
         device: str,
         temporal_dtype: Optional[torch.dtype] = None,
         side_states: Optional[List[tuple]] = None,
+        host_slots: int = 0,
     ):
         self.num_slots = num_slots
+        self.host_slots = host_slots
         self.device = device
+        # The last GPU row is a private staging reserve for RAM stores (used
+        # only with a host tier): counted in neither tier's free list, so a
+        # logical id never maps to it.
+        self.staging_row = num_slots + 1
+        gpu_rows = num_slots + 1 + (1 if host_slots > 0 else 0)
         self.temporal = Int8CheckpointStore(
             num_layers=num_layers,
-            num_slots=num_slots + 1,  # slot 0 reserved (matches MambaSlotAllocator)
+            # the store's slot dim IS the row count: slot 0 + one per slot (+ staging)
+            num_slots=gpu_rows,
             num_heads=num_heads,
             head_v_dim=head_v_dim,
             head_k_dim=head_k_dim,
@@ -218,7 +231,7 @@ class MambaCheckpointPool:
         # tensor in the State
         self.conv = [
             torch.empty(
-                (num_layers, num_slots + 1) + tuple(shape),
+                (num_layers, gpu_rows) + tuple(shape),
                 dtype=conv_dtype,
                 device=device,
             )
@@ -235,14 +248,101 @@ class MambaCheckpointPool:
             if src is None:
                 continue
             shape = list(src.shape)
-            shape[slot_dim] = num_slots + 1
+            shape[slot_dim] = gpu_rows
             mirror = torch.zeros(shape, dtype=src.dtype, device=src.device)
             self.sides.append((mirror, src, slot_dim))
-        self.allocator = MambaSlotAllocator(size=num_slots, device=device)
+        self.allocator = MambaSlotAllocator(
+            size=num_slots, device=device, host_slots=host_slots
+        )
+        # RAM tier: the identical planes in pinned host memory, one row per RAM
+        # slot plus a dummy row 0 (RAM logical id r maps to host row r-num_slots).
+        self.host_temporal = None
+        self.host_conv = []
+        self.host_sides = []
+        # Pool-owned copy stream for the tier crossings; H2D events recorded
+        # here are waited on by load_to_active before the dequantize.
+        self._copy_stream = None
+        self._staging_busy_event = None
+        self._pending_promotions: list[tuple[int, object]] = []
+        if host_slots > 0:
+            self._build_host_tier(
+                num_layers=num_layers,
+                num_heads=num_heads,
+                head_v_dim=head_v_dim,
+                head_k_dim=head_k_dim,
+                scale_dtype=(
+                    temporal_dtype if temporal_dtype is not None else torch.bfloat16
+                ),
+            )
+
+    def _alloc_host(self, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
+        if not torch.cuda.is_available():
+            # CPU/mock pools (unit tests): pinning needs a CUDA context.
+            return torch.empty(shape, dtype=dtype, device="cpu")
+        from sglang.srt.mem_cache.pool_host.common import (
+            HostTensorAllocator,
+            alloc_with_host_register,
+        )
+
+        return alloc_with_host_register(
+            dims=tuple(shape),
+            dtype=dtype,
+            device="cpu",
+            pin_memory=True,
+            allocator=HostTensorAllocator(),
+        )
+
+    def _build_host_tier(
+        self, *, num_layers, num_heads, head_v_dim, head_k_dim, scale_dtype
+    ):
+        rows = self.host_slots + 1
+        self.host_temporal = Int8CheckpointStore(
+            num_layers=num_layers,
+            num_slots=rows,
+            num_heads=num_heads,
+            head_v_dim=head_v_dim,
+            head_k_dim=head_k_dim,
+            device="cpu",
+            scale_dtype=scale_dtype,
+            buffer_factory=self._alloc_host,
+        )
+        # Host rows are per RAM slot (+ dummy row 0), not per GPU slot: rebuild
+        # the shapes from the GPU planes' per-row slices.
+        self.host_conv = [
+            self._alloc_host((c.shape[0], rows) + tuple(c.shape[2:]), c.dtype)
+            for c in self.conv
+        ]
+        self.host_sides = []
+        for m, _, dim in self.sides:
+            shape = list(m.shape)
+            shape[dim] = rows
+            self.host_sides.append((self._alloc_host(tuple(shape), m.dtype), dim))
+        if isinstance(self.device, str) and self.device.startswith("cuda"):
+            self._copy_stream = torch.cuda.Stream()
+
+    # ---- tier routing ----
+
+    def is_host_slot(self, slot_id: int) -> bool:
+        return self.host_slots > 0 and slot_id > self.num_slots
+
+    # RAM logical id r indexes host row r - num_slots (host row 0 is a dummy).
+    def host_row(self, logical_id: int) -> int:
+        return logical_id - self.num_slots
+
+    def ckpt_slot_bytes(self) -> int:
+        """Bytes of one checkpoint (all planes), for sizing the RAM tier."""
+        rows = self.temporal.qdata.shape[1]
+        return self._gpu_bytes() // rows
+
+    def _gpu_bytes(self) -> int:
+        conv_bytes = sum(c.numel() * c.element_size() for c in self.conv)
+        side_bytes = sum(m.numel() * m.element_size() for m, _, _ in self.sides)
+        return self.temporal.mem_usage_bytes() + conv_bytes + side_bytes
 
     # ---- lifecycle (delegates to the embedded allocator) ----
 
     def alloc(self, n: int = 1):
+        self._drain_promotions()
         return self.allocator.alloc(n)
 
     def free(self, slots: torch.Tensor):
@@ -251,16 +351,55 @@ class MambaCheckpointPool:
     def available_size(self) -> int:
         return self.allocator.available_size()
 
+    def device_available_size(self) -> int:
+        return len(self.allocator.free_slots)
+
+    def host_available_size(self) -> int:
+        return len(self.allocator.free_host_slots)
+
+    def num_pending_promotions(self) -> int:
+        """GPU slots held by in-flight RAM->GPU promotions (uncached until
+        their event retires and the drain frees them)."""
+        return len(self._pending_promotions)
+
+    def _drain_promotions(self) -> None:
+        """Return promoted GPU slots whose H2D has completed."""
+        if not self._pending_promotions:
+            return
+        still_pending = []
+        for slot, event in self._pending_promotions:
+            if event is None or event.query():
+                self.allocator.free(torch.tensor([slot], dtype=torch.int64))
+            else:
+                still_pending.append((slot, event))
+        self._pending_promotions = still_pending
+
     def clear(self) -> None:
-        """Release every checkpoint slot (radix flush/reset). The int8 qdata is
-        left as-is; slots are reused/overwritten on the next store."""
+        """Release every checkpoint slot of both tiers (radix flush/reset) and
+        drop pending-transfer bookkeeping. The int8 qdata is left as-is; slots
+        are reused/overwritten on the next store."""
+        self._pending_promotions = []
+        self._staging_busy_event = None
         self.allocator.clear()
 
     # ---- state transfer between the active MambaPool and this store ----
 
     def store_from_active(self, active_mamba_pool, active_slots, ckpt_slots) -> None:
         """Quantize temporal + copy conv from the active pool into checkpoint slots
-        (the radix donate / cache-store)."""
+        (the radix donate / cache-store). A RAM-tier destination quantizes into the
+        GPU staging row and D2H-copies the int8 planes unchanged; the RAM slot is
+        safe to publish because every later reader chains on the pool copy
+        stream."""
+        ckpt_id = int(ckpt_slots.reshape(-1)[0].item())
+        if self.host_slots > 0 and self.staging_row == ckpt_id:
+            self._quantize_to_rows(active_mamba_pool, active_slots, ckpt_slots)
+            return
+        if self.host_slots > 0 and ckpt_id > self.num_slots:
+            self._store_to_host(active_mamba_pool, active_slots, ckpt_id)
+            return
+        self._quantize_to_rows(active_mamba_pool, active_slots, ckpt_slots)
+
+    def _quantize_to_rows(self, active_mamba_pool, active_slots, ckpt_slots) -> None:
         cache = active_mamba_pool.mamba_cache
         self.temporal.store_from_pool(cache.temporal, active_slots, ckpt_slots)
         for i, c in enumerate(self.conv):
@@ -268,15 +407,114 @@ class MambaCheckpointPool:
         for mirror, src, dim in self.sides:
             mirror.index_copy_(dim, ckpt_slots, src.index_select(dim, active_slots))
 
+    def _store_to_host(self, active_mamba_pool, active_slots, host_logical) -> None:
+        staging = torch.tensor([self.staging_row], dtype=torch.int64)
+        if self._staging_busy_event is not None:
+            # The previous RAM store's D2H still reads the staging row; do not
+            # overwrite it before that copy retires (stream-ordered, no sync).
+            torch.cuda.current_stream().wait_event(self._staging_busy_event)
+        self.store_from_active(active_mamba_pool, active_slots, staging)
+        if self._copy_stream is None:
+            # CPU/mock pools: plain copies, already complete.
+            self._copy_staging_to_host(self.host_row(host_logical))
+            return
+        self._staging_busy_event = torch.cuda.Event()
+        with torch.cuda.stream(self._copy_stream):
+            self._copy_stream.wait_stream(torch.cuda.current_stream())
+            self._copy_staging_to_host(self.host_row(host_logical))
+            self._staging_busy_event.record(self._copy_stream)
+
+    def _copy_staging_to_host(self, h_row: int) -> None:
+        st = self.temporal
+        ht = self.host_temporal
+        staging = torch.tensor(
+            [self.staging_row], dtype=torch.int64, device=self.conv[0].device
+        ) if self.conv else torch.tensor([self.staging_row], dtype=torch.int64)
+        ht.qdata[:, h_row].copy_(st.qdata[:, self.staging_row], non_blocking=True)
+        ht.scale[:, h_row].copy_(st.scale[:, self.staging_row], non_blocking=True)
+        host_idx = torch.tensor([h_row], dtype=torch.int64)
+        for hc, c in zip(self.host_conv, self.conv):
+            hc[:, h_row].copy_(c[:, self.staging_row], non_blocking=True)
+        for (hm, dim), (m, _, _) in zip(self.host_sides, self.sides):
+            hm.index_copy_(dim, host_idx, m.index_select(dim, staging.to(m.device)))
+
+    def alloc_device_slot(self) -> Optional[torch.Tensor]:
+        """One GPU-tier checkpoint id, or None: promotions must land on the
+        GPU tier, so they never fall through to the RAM tier."""
+        self._drain_promotions()
+        if len(self.allocator.free_slots) == 0:
+            return None
+        return self.allocator.free_slots[:1]
+
+    def promote(self, host_logical: int, device_logical: int) -> None:
+        """Copy one RAM checkpoint into a GPU checkpoint slot (async H2D on the
+        pool copy stream). The caller owns ``device_logical`` (taken from the
+        GPU tier); ``load_to_active`` waits the recorded event before
+        dequantizing it, and the slot returns to the free list once done."""
+        assert self.is_host_slot(host_logical), (
+            f"promote() wants a RAM checkpoint id, got {host_logical}"
+        )
+        assert not self.is_host_slot(device_logical), (
+            f"promote() destination must be a GPU checkpoint id, "
+            f"got {device_logical}"
+        )
+        h_row = self.host_row(host_logical)
+        if self._copy_stream is None:
+            self._copy_host_to_device(h_row, device_logical)
+            self._pending_promotions.append((device_logical, None))
+            return
+        event = torch.cuda.Event()
+        with torch.cuda.stream(self._copy_stream):
+            self._copy_stream.wait_stream(torch.cuda.current_stream())
+            self._copy_host_to_device(h_row, device_logical)
+            event.record(self._copy_stream)
+        self._pending_promotions.append((device_logical, event))
+
+    def _copy_host_to_device(self, h_row: int, gpu_id: int) -> None:
+        st = self.temporal
+        ht = self.host_temporal
+        st.qdata[:, gpu_id].copy_(ht.qdata[:, h_row], non_blocking=True)
+        st.scale[:, gpu_id].copy_(ht.scale[:, h_row], non_blocking=True)
+        for c, hc in zip(self.conv, self.host_conv):
+            c[:, gpu_id].copy_(hc[:, h_row], non_blocking=True)
+        for (hm, dim), (m, _, _) in zip(self.host_sides, self.sides):
+            # index_copy_/index_select want indices on the tensor's own device.
+            m.index_copy_(
+                dim,
+                torch.tensor([gpu_id], dtype=torch.int64, device=m.device),
+                hm.index_select(
+                    dim, torch.tensor([h_row], dtype=torch.int64, device=hm.device)
+                ),
+            )
+
     def load_to_active(self, active_mamba_pool, ckpt_slots, active_slots) -> None:
-        """Dequantize temporal + copy conv from checkpoint slots into the active pool
-        (the cache-hit copy-on-write)."""
+        """Dequantize temporal + copy conv from GPU checkpoint slots into the
+        active pool (the cache-hit copy-on-write). RAM checkpoints must be
+        promoted first; promoted slots wait their H2D event (stream-ordered)."""
+        ids = ckpt_slots.reshape(-1)
+        assert self.host_slots == 0 or bool((ids <= self.num_slots).all()), (
+            "load_to_active got a RAM checkpoint id; promote it to a GPU "
+            "checkpoint first"
+        )
+        self._wait_promotions(ckpt_slots)
         cache = active_mamba_pool.mamba_cache
         self.temporal.copy_to_pool(cache.temporal, ckpt_slots, active_slots)
         for i, c in enumerate(self.conv):
             cache.conv[i][:, active_slots] = c[:, ckpt_slots].to(cache.conv[i].dtype)
         for mirror, src, dim in self.sides:
             src.index_copy_(dim, active_slots, mirror.index_select(dim, ckpt_slots))
+
+    def _wait_promotions(self, ckpt_slots: torch.Tensor) -> None:
+        """Order the forward stream after any in-flight H2D of the source slots."""
+        if not self._pending_promotions or self._copy_stream is None:
+            return
+        promoted = {slot for slot, _ in self._pending_promotions}
+        if not any(int(s) in promoted for s in ckpt_slots.reshape(-1).tolist()):
+            return
+        stream = torch.cuda.current_stream()
+        for slot, event in self._pending_promotions:
+            if slot in promoted and event is not None:
+                stream.wait_event(event)
 
     @staticmethod
     def estimate_mem_usage_bytes(
@@ -290,12 +528,16 @@ class MambaCheckpointPool:
         conv_dtype: torch.dtype,
         temporal_dtype: torch.dtype,
         side_states: Optional[List[tuple]] = None,
+        staging_row: bool = False,
     ) -> dict:
         """Estimate the pool's HBM footprint (bytes) WITHOUT allocating, so a
         caller can check it against free memory before construction. Mirrors the
         real layout: int8 qdata + per-(head,k) scale + bf16 conv windows +
-        mirrored side-state rows, including the reserved slot 0."""
-        slots = num_slots + 1  # slot 0 reserved (matches MambaSlotAllocator)
+        mirrored side-state rows, including the reserved slot 0 (plus the RAM
+        tier's private staging row when ``staging_row``)."""
+        # Slot 0 is reserved (matches MambaSlotAllocator); the staging row is
+        # the RAM tier's private quantize buffer.
+        slots = num_slots + 1 + (1 if staging_row else 0)
         scale_isz = torch.empty((), dtype=temporal_dtype).element_size()
         conv_isz = torch.empty((), dtype=conv_dtype).element_size()
         qdata = num_layers * slots * num_heads * head_v_dim * head_k_dim  # int8 = 1B
@@ -323,12 +565,11 @@ class MambaCheckpointPool:
             "conv": conv,
             "sides": sides,
             "total": qdata + scale + conv + sides,
+            "per_row": qdata // slots + scale // slots + conv // slots + sides // slots,
         }
 
     def mem_usage_bytes(self) -> int:
-        conv_bytes = sum(c.numel() * c.element_size() for c in self.conv)
-        side_bytes = sum(m.numel() * m.element_size() for m, _, _ in self.sides)
-        return self.temporal.mem_usage_bytes() + conv_bytes + side_bytes
+        return self._gpu_bytes()
 
 
 def maybe_init_int8_mamba_checkpoint_pool(
@@ -362,6 +603,7 @@ def maybe_init_int8_mamba_checkpoint_pool(
     GB = 1 << 30
     H, d_v, d_k = cache_params.shape.temporal
     ckpt_size = mamba.int8_mamba_ckpt_size or (2 * mamba_size)
+    offload = bool(mamba.enable_int8_mamba_checkpoint_offload)
     kwargs = dict(
         num_layers=len(mamba_layer_ids),
         num_slots=ckpt_size,
@@ -374,7 +616,14 @@ def maybe_init_int8_mamba_checkpoint_pool(
         side_states=[t for t in side_states or [] if t is not None],
     )
 
-    est = MambaCheckpointPool.estimate_mem_usage_bytes(**kwargs)
+    est = MambaCheckpointPool.estimate_mem_usage_bytes(**kwargs, staging_row=offload)
+    host_slots = 0
+    host_bytes = 0
+    if offload:
+        host_gib = mamba.int8_mamba_ckpt_host_size
+        per_slot = est["per_row"]
+        host_slots = int(host_gib * GB) // per_slot
+        host_bytes = host_slots * per_slot
     free_bytes = None
     if isinstance(device, str) and device.startswith("cuda"):
         try:
@@ -389,6 +638,11 @@ def maybe_init_int8_mamba_checkpoint_pool(
         + f"); active mamba "
         f"pool {mamba_size} slots"
         + (f"; free HBM {free_bytes / GB:.2f}GB" if free_bytes is not None else "")
+        + (
+            f"; RAM tier {host_slots} slots ({host_bytes / GB:.2f}GB pinned)"
+            if offload
+            else ""
+        )
     )
     if free_bytes is not None and est["total"] >= free_bytes:
         raise RuntimeError(
@@ -396,14 +650,34 @@ def maybe_init_int8_mamba_checkpoint_pool(
             f"{free_bytes / GB:.2f}GB HBM is free. Lower --int8-mamba-ckpt-size "
             f"(currently {ckpt_size}) or --mem-fraction-static."
         )
+    if offload:
+        if host_slots <= 0:
+            raise RuntimeError(
+                f"--int8-mamba-ckpt-host-size={mamba.int8_mamba_ckpt_host_size}GiB "
+                f"does not fit one {est['per_row'] / (1 << 20):.1f}MiB checkpoint; "
+                f"raise it."
+            )
+        import psutil
 
-    pool = MambaCheckpointPool(device=device, **kwargs)
+        free_host = psutil.virtual_memory().available
+        if host_bytes >= free_host:
+            raise RuntimeError(
+                f"int8 mamba checkpoint RAM tier needs ~{host_bytes / GB:.2f}GB "
+                f"pinned but only {free_host / GB:.2f}GB RAM is free. Lower "
+                f"--int8-mamba-ckpt-host-size (currently "
+                f"{mamba.int8_mamba_ckpt_host_size})."
+            )
+
+    pool = MambaCheckpointPool(device=device, host_slots=host_slots, **kwargs)
     # NOTE: this pool's HBM is NOT subtracted from the KV-cache budget
     # (max_total_num_tokens); it is allocated from --mem-fraction-static headroom.
     # The estimate check above guards against an oversized pool; accounting it in
-    # the KV budget is a follow-up.
+    # the KV budget is a follow-up. The RAM tier is headroom of the same kind:
+    # pinned at boot, never counted as active-state capacity.
     logger.warning(
-        f"int8 mamba checkpoint pool ({est['total'] / GB:.2f}GB) is allocated from "
+        f"int8 mamba checkpoint pool ({est['total'] / GB:.2f}GB"
+        + (f" + RAM tier {host_bytes / GB:.2f}GB" if offload else "")
+        + f") is allocated from "
         f"--mem-fraction-static headroom and is not reflected in "
         f"max_total_num_tokens; ensure headroom covers it."
     )
