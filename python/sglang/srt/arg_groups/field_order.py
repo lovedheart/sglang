@@ -349,8 +349,6 @@ POSITIONAL_FIELD_ORDER = (
     "mamba_track_interval",
     "enable_int8_mamba_checkpoint",
     "int8_mamba_ckpt_size",
-    "enable_int8_mamba_checkpoint_offload",
-    "int8_mamba_ckpt_host_size",
     "linear_attn_backend",
     "linear_attn_decode_backend",
     "linear_attn_prefill_backend",
@@ -579,5 +577,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_qsa_kv_offload",
     "qsa_kv_offload_host_size",
     "qsa_kv_offload_hot_blocks",
+    "enable_int8_mamba_checkpoint_offload",
+    "int8_mamba_ckpt_host_size",
 )
 # fmt: on

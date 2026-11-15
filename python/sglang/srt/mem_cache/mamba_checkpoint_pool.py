@@ -369,7 +369,11 @@ class MambaCheckpointPool:
         still_pending = []
         for slot, event in self._pending_promotions:
             if event is None or event.query():
-                self.allocator.free(torch.tensor([slot], dtype=torch.int64))
+                self.allocator.free(
+                    torch.tensor(
+                        [slot], dtype=torch.int64, device=self.allocator.device
+                    )
+                )
             else:
                 still_pending.append((slot, event))
         self._pending_promotions = still_pending
@@ -391,9 +395,6 @@ class MambaCheckpointPool:
         safe to publish because every later reader chains on the pool copy
         stream."""
         ckpt_id = int(ckpt_slots.reshape(-1)[0].item())
-        if self.host_slots > 0 and self.staging_row == ckpt_id:
-            self._quantize_to_rows(active_mamba_pool, active_slots, ckpt_slots)
-            return
         if self.host_slots > 0 and ckpt_id > self.num_slots:
             self._store_to_host(active_mamba_pool, active_slots, ckpt_id)
             return
@@ -408,12 +409,16 @@ class MambaCheckpointPool:
             mirror.index_copy_(dim, ckpt_slots, src.index_select(dim, active_slots))
 
     def _store_to_host(self, active_mamba_pool, active_slots, host_logical) -> None:
-        staging = torch.tensor([self.staging_row], dtype=torch.int64)
+        staging = torch.tensor(
+            [self.staging_row], dtype=torch.int64, device=self.temporal.qdata.device
+        )
         if self._staging_busy_event is not None:
             # The previous RAM store's D2H still reads the staging row; do not
             # overwrite it before that copy retires (stream-ordered, no sync).
             torch.cuda.current_stream().wait_event(self._staging_busy_event)
-        self.store_from_active(active_mamba_pool, active_slots, staging)
+        # Quantize into the private staging row (a GPU row addressed by no
+        # logical id, so this cannot recurse back into _store_to_host).
+        self._quantize_to_rows(active_mamba_pool, active_slots, staging)
         if self._copy_stream is None:
             # CPU/mock pools: plain copies, already complete.
             self._copy_staging_to_host(self.host_row(host_logical))
@@ -427,9 +432,13 @@ class MambaCheckpointPool:
     def _copy_staging_to_host(self, h_row: int) -> None:
         st = self.temporal
         ht = self.host_temporal
-        staging = torch.tensor(
-            [self.staging_row], dtype=torch.int64, device=self.conv[0].device
-        ) if self.conv else torch.tensor([self.staging_row], dtype=torch.int64)
+        staging = (
+            torch.tensor(
+                [self.staging_row], dtype=torch.int64, device=self.conv[0].device
+            )
+            if self.conv
+            else torch.tensor([self.staging_row], dtype=torch.int64)
+        )
         ht.qdata[:, h_row].copy_(st.qdata[:, self.staging_row], non_blocking=True)
         ht.scale[:, h_row].copy_(st.scale[:, self.staging_row], non_blocking=True)
         host_idx = torch.tensor([h_row], dtype=torch.int64)
@@ -442,9 +451,11 @@ class MambaCheckpointPool:
         """One GPU-tier checkpoint id, or None: promotions must land on the
         GPU tier, so they never fall through to the RAM tier."""
         self._drain_promotions()
-        if len(self.allocator.free_slots) == 0:
+        if self.allocator.free_slots.numel() == 0:
             return None
-        return self.allocator.free_slots[:1]
+        slot = self.allocator.free_slots[-1:]
+        self.allocator.free_slots = self.allocator.free_slots[:-1]
+        return slot
 
     def promote(self, host_logical: int, device_logical: int) -> None:
         """Copy one RAM checkpoint into a GPU checkpoint slot (async H2D on the
@@ -455,8 +466,7 @@ class MambaCheckpointPool:
             f"promote() wants a RAM checkpoint id, got {host_logical}"
         )
         assert not self.is_host_slot(device_logical), (
-            f"promote() destination must be a GPU checkpoint id, "
-            f"got {device_logical}"
+            f"promote() destination must be a GPU checkpoint id, got {device_logical}"
         )
         h_row = self.host_row(host_logical)
         if self._copy_stream is None:
@@ -620,10 +630,8 @@ def maybe_init_int8_mamba_checkpoint_pool(
     host_slots = 0
     host_bytes = 0
     if offload:
-        host_gib = mamba.int8_mamba_ckpt_host_size
-        per_slot = est["per_row"]
-        host_slots = int(host_gib * GB) // per_slot
-        host_bytes = host_slots * per_slot
+        host_slots = int(mamba.int8_mamba_ckpt_host_size)
+        host_bytes = host_slots * est["per_row"]
     free_bytes = None
     if isinstance(device, str) and device.startswith("cuda"):
         try:
@@ -653,9 +661,8 @@ def maybe_init_int8_mamba_checkpoint_pool(
     if offload:
         if host_slots <= 0:
             raise RuntimeError(
-                f"--int8-mamba-ckpt-host-size={mamba.int8_mamba_ckpt_host_size}GiB "
-                f"does not fit one {est['per_row'] / (1 << 20):.1f}MiB checkpoint; "
-                f"raise it."
+                "--int8-mamba-ckpt-host-size must be a positive number of RAM "
+                f"tier slots (got {mamba.int8_mamba_ckpt_host_size})."
             )
         import psutil
 

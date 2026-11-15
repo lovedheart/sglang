@@ -643,8 +643,9 @@ class ExecMamba(msgspec.Struct):
     ] = False
     int8_mamba_ckpt_host_size: A[
         Optional[int],
-        "Pinned host memory (GiB) for the int8 mamba checkpoint RAM tier; required "
-        "positive with --enable-int8-mamba-checkpoint-offload.",
+        "Number of pinned-RAM checkpoint slots in the RAM tier of the int8 mamba "
+        "checkpoint pool; required positive with "
+        "--enable-int8-mamba-checkpoint-offload.",
     ] = None
     linear_attn_backend: A[
         str,

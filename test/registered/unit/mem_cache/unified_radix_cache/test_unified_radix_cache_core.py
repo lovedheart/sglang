@@ -1945,6 +1945,86 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(
         self.assertEqual(cache.mamba_evictable_size(), capacity)
 
 
+class TestUnifiedRadixCacheInt8MambaCkptOffload(
+    UnifiedRadixCacheInt8MambaCheckpointFixtures, CustomTestCase
+):
+    """One logical checkpoint pool (GPU tier + RAM tier): inserts spill to RAM
+    instead of evicting cached GPU checkpoints, a RAM-only hit promotes back to
+    a GPU slot, and total exhaustion discards without asserting."""
+
+    cfg = CacheConfig(
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        enable_int8_mamba_checkpoint=True,
+        int8_mamba_ckpt_size=4,
+        int8_mamba_ckpt_host_size=4,
+        mamba_cache_size=8,  # active pool (checkpoints live in the ckpt pool)
+        kv_size=64,
+        max_context_len=64,
+    )
+
+    def _finish_and_release(self, cache, allocator, req_to_token_pool, tokens):
+        req = self._make_req(req_to_token_pool, tokens)
+        kv_indices = allocator.alloc(len(tokens))
+        self.assertIsNotNone(kv_indices)
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
+        )
+        req.last_node = cache.root_node_handle()
+        finish_req(cache, req, req.owned_kv_len())
+        req_to_token_pool.free(req)
+
+    def test_spill_promote_and_soak_on_both_cores(self):
+        for backend in ("python", "rust"):
+            with self.subTest(backend=backend):
+                cache, allocator, pool = build_fixture(
+                    self.cfg, tree_core_backend=backend
+                )
+                ckpt = pool.mamba_ckpt_pool
+                self.assertEqual((ckpt.num_slots, ckpt.host_slots), (4, 4))
+
+                # Fill the GPU tier: pure cached checkpoints, no RAM yet.
+                for i in range(4):
+                    self._finish_and_release(cache, allocator, pool, [100 + i, 2, 3, 4])
+                self.assertEqual(ckpt.device_available_size(), 0)
+                self.assertEqual(ckpt.host_available_size(), 4)
+                self.assertEqual(cache.mamba_evictable_size(), 4)
+
+                # 5th insert spills to RAM: no device eviction, no assert.
+                self._finish_and_release(cache, allocator, pool, [7, 8, 9, 10])
+                self.assertEqual(ckpt.device_available_size(), 0)
+                self.assertEqual(ckpt.host_available_size(), 3)
+                self.assertEqual(cache.mamba_evictable_size(), 4)
+                self.assertEqual(cache.mamba_ram_checkpoint_slots(), (1, 4))
+                cache.sanity_check()
+
+                # A match on the RAM-only checkpoint counts as a device hit and
+                # promotes back to a GPU-tier slot for COW.
+                tokens = [7, 8, 9, 10]
+                req2 = self._make_req(pool, tokens)
+                m = cache.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(array("q", tokens)), cow_mamba=True, req=req2
+                    )
+                )
+                self.assertEqual(m.device_prefix_len, len(tokens))
+                src = int(req2.kv.mamba_cow_src_index.reshape(-1)[0])
+                self.assertTrue(1 <= src <= ckpt.num_slots)
+                self.assertEqual(ckpt.num_pending_promotions(), 1)
+                pool.free(req2)
+                ckpt._drain_promotions()
+                cache.sanity_check()
+
+                # Soak past total (GPU + RAM) capacity: inserts keep evicting
+                # the device LRU and discarding RAM checkpoints, never raising.
+                for i in range(6):
+                    self._finish_and_release(cache, allocator, pool, [200 + i, 5, 6, 7])
+                held, ram_total = cache.mamba_ram_checkpoint_slots()
+                self.assertEqual(held + ckpt.host_available_size(), ram_total)
+                self.assertLessEqual(cache.mamba_evictable_size(), ckpt.num_slots)
+                cache.sanity_check()
+
+
 def _component_with_cache(component_type, cache):
     component = object.__new__(COMPONENT_REGISTRY[FAMILY_OF[component_type]])
     component.cache = cache

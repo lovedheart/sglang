@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import logging
 import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
@@ -63,6 +64,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+logger = logging.getLogger(__name__)
 
 
 def branching_checkpoint_depth(
@@ -131,9 +134,7 @@ class MambaComponent(TreeComponent):
             self._int8_host_tier = False
             if self.quantizes_checkpoints:
                 storage, sub_pool = self._state()
-                self._int8_host_tier = (
-                    storage.checkpoint_pool(sub_pool).host_slots > 0
-                )
+                self._int8_host_tier = storage.checkpoint_pool(sub_pool).host_slots > 0
         return self._int8_host_tier
 
     def ram_checkpoint_slots(self) -> tuple[int, int]:
@@ -318,10 +319,14 @@ class MambaComponent(TreeComponent):
             self.cache.evict(EvictParams(mamba_num=1))
             gpu_slot = pool.alloc_device_slot()
             assert gpu_slot is not None, (
-                "Can not alloc GPU int8 checkpoint slot to promote a RAM "
-                "checkpoint"
+                "Can not alloc GPU int8 checkpoint slot to promote a RAM checkpoint"
             )
         pool.promote(int(host_value.reshape(-1)[0].item()), int(gpu_slot[0].item()))
+        logger.debug(
+            "int8 checkpoint promoted: RAM slot %d -> GPU slot %d",
+            int(host_value.reshape(-1)[0].item()),
+            int(gpu_slot[0].item()),
+        )
         return gpu_slot
 
     def _copy_mamba_slot_to_host(
@@ -513,7 +518,9 @@ class MambaComponent(TreeComponent):
             return
 
         ct = self.component_type
-        host_only = self._mamba_host_only_checkpoint()
+        # RAM-tier checkpoints are tree values too, so they count toward the
+        # per-path cap exactly like host-only checkpoints do.
+        host_only = self._mamba_host_only_checkpoint() or self._ckpt_host_tier()
         holders = []
         node = tail
         while node is not None and node is not self.tree_core.root_node:
@@ -998,6 +1005,10 @@ class MambaComponent(TreeComponent):
         if is_ram:
             self._ram_ckpts_issued += 1
             insert_params.mamba_host_value = ckpt_slot
+            logger.debug(
+                "int8 checkpoint spilled to RAM slot %d",
+                int(ckpt_slot.reshape(-1)[0].item()),
+            )
         else:
             insert_params.mamba_value = ckpt_slot
         storage.store_checkpoint(sub_pool, active_slots, ckpt_slot)
