@@ -154,6 +154,12 @@ class MambaComponent(TreeComponent):
         storage, sub_pool = self._state()
         return self._ram_ckpts_issued, storage.checkpoint_pool(sub_pool).host_slots
 
+    def on_cache_reset(self) -> None:
+        # The whole-cache flush clears the checkpoint pool wholesale (no
+        # per-value frees reach free_host_values), so the ledger must be
+        # zeroed in step with it or the RAM-tier invariant false-positives.
+        self._ram_ckpts_issued = 0
+
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
         data = node.component_data[self.component_type]
         return data.value is not None and data.host_value is None

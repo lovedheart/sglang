@@ -504,6 +504,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self._discard_restore_backups()
         self.tree_core.reset()
         self.session_refs.reset()
+        # Nodes are dropped without per-value frees; the pools are cleared
+        # wholesale elsewhere, so component slot ledgers zero out now.
+        for component in self.components.values():
+            component.on_cache_reset()
 
         # Reset Controller.
         self.session.slots.clear()

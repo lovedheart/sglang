@@ -2037,6 +2037,18 @@ class TestUnifiedRadixCacheInt8MambaCkptOffload(
                 self.assertLessEqual(cache.mamba_evictable_size(), ckpt.num_slots)
                 cache.sanity_check()
 
+    def test_flush_clears_the_ram_checkpoint_ledger(self):
+        # Cache flush drops nodes without per-value frees; the RAM ledger must
+        # zero out with the tree or the FLUSH-phase pool invariant false-
+        # positives and kills the scheduler.
+        cache, allocator, pool = build_fixture(self.cfg, tree_core_backend="python")
+        for i in range(5):  # 4 fill the GPU tier, the 5th spills to RAM
+            self._finish_and_release(cache, allocator, pool, [300 + i, 2, 3, 4])
+        self.assertEqual(cache.mamba_ram_checkpoint_slots()[0], 1)
+        cache.reset()
+        self.assertEqual(cache.mamba_ram_checkpoint_slots()[0], 0)
+        self.assertEqual(cache.mamba_evictable_size(), 0)
+
 
 def _component_with_cache(component_type, cache):
     component = object.__new__(COMPONENT_REGISTRY[FAMILY_OF[component_type]])
