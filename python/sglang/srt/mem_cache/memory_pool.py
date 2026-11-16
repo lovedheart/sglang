@@ -1602,6 +1602,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_allocator=self.mamba_allocator,
             device=device,
             track_slots=(
+                # Worst-case per-request footprint: working row + the full
+                # ping-pong buffer (lazy starts smaller and grows into it;
+                # wake restores whatever a park actually stored).
                 self.mamba_ping_pong_track_buffer_size
                 if enable_mamba_extra_buffer
                 else 0

@@ -1592,26 +1592,19 @@ class TestMambaStateSwapCompatibility(unittest.TestCase):
             handle_mamba_state_swap(server_args)
 
     def test_accepts_radix_cache_on_with_int8(self):
-        handle_mamba_state_swap(
-            ServerArgs(
-                model_path="dummy",
-                enable_mamba_state_swap=True,
-                mamba_swap_size=4,
-                enable_int8_mamba_checkpoint=True,
-                mamba_radix_cache_strategy="no_buffer",
-            )
-        )
-
-    def test_rejects_radix_cache_on_with_int8_but_extra_buffer(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            enable_mamba_state_swap=True,
-            mamba_swap_size=4,
-            enable_int8_mamba_checkpoint=True,
-            mamba_radix_cache_strategy="extra_buffer",
-        )
-        with self.assertRaisesRegex(ValueError, "no_buffer"):
-            handle_mamba_state_swap(server_args)
+        # V2.5: every built-in strategy is accepted with int8 — park/wake
+        # carries the ping-pong tracking rows with the parked request.
+        for strategy in ("no_buffer", "extra_buffer", "extra_buffer_lazy"):
+            with self.subTest(strategy=strategy):
+                handle_mamba_state_swap(
+                    ServerArgs(
+                        model_path="dummy",
+                        enable_mamba_state_swap=True,
+                        mamba_swap_size=4,
+                        enable_int8_mamba_checkpoint=True,
+                        mamba_radix_cache_strategy=strategy,
+                    )
+                )
 
     def test_rejects_speculative_decoding(self):
         server_args = ServerArgs(

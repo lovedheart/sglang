@@ -653,9 +653,10 @@ class ExecMamba(msgspec.Struct):
         "slots (rotating who holds an active GPU state slot) so "
         "max-running-requests can exceed the active mamba pool; woken requests "
         "resume decode without re-prefill. Requires a positive --mamba-swap-size "
-        "and --disable-radix-cache, or --enable-int8-mamba-checkpoint with "
-        "--mamba-radix-cache-strategy no_buffer (parked requests must be able to "
-        "release their whole active state footprint).",
+        "and --disable-radix-cache, or --enable-int8-mamba-checkpoint with the "
+        "radix cache on (any --mamba-radix-cache-strategy: parked requests "
+        "release their whole active footprint, ping-pong tracking rows "
+        "included).",
     ] = False
     mamba_swap_size: A[
         Optional[int],

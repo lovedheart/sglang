@@ -3344,10 +3344,10 @@ class KVCacheConfigurator:
             ratio = self._calculate_mamba_ratio()
             # Virtual SSM slots: with the state-swap tier on, a parked
             # request lives in a pinned swap row, so the concurrency bound
-            # follows the combined capacity. Both configs the swap tier
-            # allows (radix off, or radix on with int8 checkpoints +
-            # no_buffer) keep one live slot per request, so the ratio
-            # term is exact.
+            # follows the combined capacity. Parked records keep the same
+            # per-request slot economics as decode (the whole footprint
+            # moves, nothing multiplies across the park boundary), so the
+            # ratio term stays exact.
             mamba = get_exec().mamba
             swap_size = mamba.mamba_swap_size if mamba.enable_mamba_state_swap else 0
             mamba_cap = (get_schedule().max_mamba_cache_size + swap_size) // ratio

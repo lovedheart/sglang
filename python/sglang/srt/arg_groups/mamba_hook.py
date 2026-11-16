@@ -155,11 +155,12 @@ def handle_mamba_state_swap(server_args: Any):
         )
     if not cfg.disable_radix_cache:
         # Slot economics: a parked request must release its whole active
-        # footprint, so radix-on swap needs the 1-slot-per-request config.
-        # v2 opens radix-on when int8 checkpointing quantizes the tree's
-        # checkpoints into the dedicated int8 pool — the radix then owns
-        # zero active fp rows (P0a forensics) — but only with no_buffer,
-        # since ping-pong tracking slots are not parked.
+        # footprint, so radix-on swap needs the tree to own zero active fp
+        # rows. int8 checkpointing provides that (P0a forensics), and the
+        # V2.5 rotation parks the ping-pong rows too, so all built-in
+        # strategies can pay: no_buffer parks 1 row, extra_buffer parks
+        # 2-3 (working + tracking), extra_buffer_lazy parks what exists
+        # (tracking rows allocate lazily and shrink the record meanwhile).
         if not cfg.enable_int8_mamba_checkpoint:
             raise ValueError(
                 "--enable-mamba-state-swap with the radix cache enabled "
@@ -168,14 +169,6 @@ def handle_mamba_state_swap(server_args: Any):
                 "tree, so a parked request can release its whole active "
                 "footprint. Disable the radix cache or enable int8 "
                 "checkpoints."
-            )
-        if cfg.mamba_radix_cache_strategy != "no_buffer":
-            raise ValueError(
-                "--enable-mamba-state-swap with the radix cache enabled "
-                "requires --mamba-radix-cache-strategy no_buffer: "
-                "ping-pong tracking slots are not parked, so the swap "
-                "rotation cannot pay. Set "
-                "--mamba-radix-cache-strategy no_buffer."
             )
     if cfg.speculative_algorithm is not None:
         raise ValueError(
