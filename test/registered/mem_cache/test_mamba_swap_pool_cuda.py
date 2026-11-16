@@ -36,9 +36,19 @@ def _fake_mamba_pool(device):
         )
     ]
     return SimpleNamespace(
-        mamba_cache=SimpleNamespace(temporal=temporal, conv=conv),
+        mamba_cache=SimpleNamespace(
+            temporal=temporal,
+            conv=conv,
+            replayssm_d=None,
+            replayssm_k=None,
+            replayssm_g=None,
+            replayssm_rawv=None,
+            replayssm_rawk=None,
+            replayssm_beta=None,
+        ),
         enable_linear_replayssm=False,
         enable_linear_replayssm_spec=False,
+        replayssm_write_pos=None,
         _slot_siblings=[],
     )
 

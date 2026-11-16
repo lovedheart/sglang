@@ -45,11 +45,21 @@ class _FakeSibling:
 def _fake_mamba_pool(siblings=()):
     temporal = torch.zeros(L, ACTIVE_SLOTS, H, V, K, dtype=torch.bfloat16)
     conv = [torch.zeros(L, ACTIVE_SLOTS, 2, *CONV_SHAPE, dtype=torch.bfloat16)]
-    cache = SimpleNamespace(temporal=temporal, conv=conv)
+    cache = SimpleNamespace(
+        temporal=temporal,
+        conv=conv,
+        replayssm_d=None,
+        replayssm_k=None,
+        replayssm_g=None,
+        replayssm_rawv=None,
+        replayssm_rawk=None,
+        replayssm_beta=None,
+    )
     return SimpleNamespace(
         mamba_cache=cache,
         enable_linear_replayssm=False,
         enable_linear_replayssm_spec=False,
+        replayssm_write_pos=None,
         _slot_siblings=list(siblings),
     )
 

@@ -52,6 +52,7 @@ from typing import Any, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
@@ -81,13 +82,18 @@ class MambaSwapPool:
         mamba_allocator,
         swap_slots: int,
         device: str,
+        allow_replayssm: bool = False,
     ):
-        # Park/wake round-trips the raw state rows; under ReplaySSM the
-        # decode ring's flush/cursor state is not slot-local, so v1 refuses.
+        # ReplaySSM adds slot-indexed ring planes (and, in plain decode mode,
+        # a slot-indexed write cursor) to the parked state. Capture is cheap
+        # and exact; the -spec row-keyed cursors live in req rows that park
+        # keeps, so they need no record. ``allow_replayssm`` is the V2-P0b
+        # spike switch — production gating stays in the mamba arg hook until
+        # the swap-v2 P4 gate passes.
         if (
             mamba_pool.enable_linear_replayssm
             or mamba_pool.enable_linear_replayssm_spec
-        ):
+        ) and not allow_replayssm:
             raise ValueError(
                 "--enable-mamba-state-swap does not support the ReplaySSM "
                 "ring buffers yet; disable one of them."
@@ -108,6 +114,31 @@ class MambaSwapPool:
             self._alloc_host((c.shape[0], swap_slots + 1) + tuple(c.shape[2:]), c.dtype)
             for c in cache.conv
         ]
+        # ReplaySSM ring planes: [num_layers, num_slots, ...], slot-indexed
+        # like temporal/conv, so a parked row is exactly complete state.
+        self._ring_planes = [
+            plane
+            for plane in (
+                cache.replayssm_d,
+                cache.replayssm_k,
+                cache.replayssm_g,
+                cache.replayssm_rawv,
+                cache.replayssm_rawk,
+                cache.replayssm_beta,
+            )
+            if plane is not None
+        ]
+        self.host_ring = [
+            self._alloc_host((p.shape[0], swap_slots + 1) + tuple(p.shape[2:]), p.dtype)
+            for p in self._ring_planes
+        ]
+        # Plain-decode write cursor is slot-indexed; the -spec cursor triple
+        # is req-row-indexed and survives parking with the request row.
+        self.host_write_pos = (
+            self._alloc_host((swap_slots + 1,), torch.int32)
+            if mamba_pool.replayssm_write_pos is not None
+            else None
+        )
         # Slot siblings ride the retraction copy path verbatim.
         self._siblings = list(mamba_pool._slot_siblings)
 
@@ -271,12 +302,25 @@ class MambaSwapPool:
             )
             for dst, src in zip(cache.conv, self.host_conv):
                 dst[:, active_slot].copy_(src[:, row], non_blocking=True)
+            for dst, src in zip(self._ring_planes, self.host_ring):
+                dst[:, active_slot].copy_(src[:, row], non_blocking=True)
+            if self.host_write_pos is not None:
+                self.mamba_pool.replayssm_write_pos[active_slot].copy_(
+                    self.host_write_pos[row], non_blocking=True
+                )
         else:
             self.host_temporal[:, row].copy_(
                 cache.temporal[:, active_slot], non_blocking=True
             )
             for dst, src in zip(self.host_conv, cache.conv):
                 dst[:, row].copy_(src[:, active_slot], non_blocking=True)
+            for dst, src in zip(self.host_ring, self._ring_planes):
+                dst[:, row].copy_(src[:, active_slot], non_blocking=True)
+            if self.host_write_pos is not None:
+                self.host_write_pos[row].copy_(
+                    self.mamba_pool.replayssm_write_pos[active_slot],
+                    non_blocking=True,
+                )
 
 
 def maybe_init_mamba_state_swap_pool(
@@ -303,6 +347,7 @@ def maybe_init_mamba_state_swap_pool(
         mamba_allocator=mamba_allocator,
         swap_slots=mamba.mamba_swap_size,
         device=device,
+        allow_replayssm=envs.SGLANG_TEST_MAMBA_SWAP_ALLOW_REPLAYSSM.get(),
     )
     logger.info(
         "mamba swap pool: %d parked slots (%.2fGB pinned)",

@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.environ import envs
 from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
@@ -168,7 +169,9 @@ def handle_mamba_state_swap(server_args: Any):
             "--enable-mamba-state-swap is not supported with speculative "
             "decoding: draft-state slots are not parked. Disable one of them."
         )
-    if cfg.enable_linear_replayssm or cfg.enable_linear_replayssm_spec:
+    if (cfg.enable_linear_replayssm or cfg.enable_linear_replayssm_spec) and (
+        not envs.SGLANG_TEST_MAMBA_SWAP_ALLOW_REPLAYSSM.get()
+    ):
         raise ValueError(
             "--enable-mamba-state-swap is not supported with the ReplaySSM "
             "ring buffers: park/wake round-trips raw state rows only. "
