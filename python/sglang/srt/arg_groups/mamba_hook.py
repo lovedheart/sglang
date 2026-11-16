@@ -171,9 +171,19 @@ def handle_mamba_state_swap(server_args: Any):
                 "checkpoints."
             )
     if cfg.speculative_algorithm is not None:
-        raise ValueError(
-            "--enable-mamba-state-swap is not supported with speculative "
-            "decoding: draft-state slots are not parked. Disable one of them."
+        # The swap tier stores the TARGET model's state rows. The verify
+        # intermediates live in fixed per-request buffers (spec_state rows
+        # indexed by the req-pool row, which a parked request keeps), so a
+        # wake resumes the verify chain cleanly. A draft that keeps its own
+        # recurrent state reads rows the record does not carry: a woken
+        # request runs on stale draft state. That costs acceptance rate, not
+        # correctness — the target still verifies every draft token.
+        logger.warning(
+            "--enable-mamba-state-swap with speculative decoding: parked "
+            "records carry only target-model state, so a woken request "
+            "resumes with stale draft state (if its draft keeps any). "
+            "Outputs stay correct (target-verified); acceptance for woken "
+            "requests may drop."
         )
     if cfg.enable_linear_replayssm_spec:
         # Plain ReplaySSM rings ride in the parked record (swap-v2 P0b/P4);

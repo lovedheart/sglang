@@ -1606,17 +1606,23 @@ class TestMambaStateSwapCompatibility(unittest.TestCase):
                     )
                 )
 
-    def test_rejects_speculative_decoding(self):
+    def test_accepts_speculative_decoding_with_warning(self):
+        # Swap stores target-model state only; a woken request's draft state
+        # (if the draft keeps any) is stale, which costs acceptance rate but
+        # never correctness. Accepted with a warning instead of rejected.
         server_args = ServerArgs(
             model_path="dummy",
             enable_mamba_state_swap=True,
             mamba_swap_size=4,
-            speculative_algorithm="DFLASH",
-            speculative_draft_model_path="/local/draft",
-            disable_radix_cache=True,
+            speculative_algorithm="EAGLE",
+            enable_int8_mamba_checkpoint=True,
         )
-        with self.assertRaisesRegex(ValueError, "speculative"):
+        with self.assertLogs(level="WARNING") as logs:
             handle_mamba_state_swap(server_args)
+        self.assertTrue(
+            any("draft state" in msg for msg in logs.output),
+            f"expected a draft-state warning, got {logs.output}",
+        )
 
     def test_plain_pair_is_accepted(self):
         handle_mamba_state_swap(
