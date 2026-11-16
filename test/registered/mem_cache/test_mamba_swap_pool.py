@@ -138,12 +138,35 @@ class TestMambaSwapPool(unittest.TestCase):
         self.assertEqual(swap.num_parked(), 0)
         self.assertEqual(swap.available_size(), 3)
 
-    def test_row_count_must_match_the_record(self):
+    def test_row_count_must_fit_the_record(self):
+        # V2.5: records are variable width up to rows_per_record (lazy
+        # requests park fewer rows until the second tracking slot exists).
         swap = self._swap_rpr(2)
         with self.assertRaises(ValueError):
-            swap.park(1)
-        with self.assertRaises(ValueError):
             swap.park([1, 2, 3])
+        with self.assertRaises(ValueError):
+            swap.park([])
+
+    def test_park_fewer_rows_than_the_record_holds(self):
+        swap = self._swap_rpr(2)
+        pool = swap.mamba_pool
+        _write_state(pool, 1, 0.5)
+        swap_id = swap.park([1])  # lazy shape: main only, track still -1
+        self.assertEqual(swap.parked_num_rows(swap_id), 1)
+        # One record consumed one swap id regardless of row count.
+        self.assertEqual(swap.available_size(), 2)
+        swap.wake(swap_id, [3])
+        self.assertTrue((pool.mamba_cache.temporal[:, 3] == 0.5).all())
+        self.assertEqual(swap.available_size(), 3)
+
+    def test_wake_row_count_must_match_the_parked_set(self):
+        swap = self._swap_rpr(2)
+        swap_id = swap.park([1])
+        with self.assertRaises(ValueError):
+            swap.wake(swap_id, [3, 4])
+        # The failed wake left the record intact for a correct retry.
+        self.assertEqual(swap.parked_num_rows(swap_id), 1)
+        swap.wake(swap_id, [3])
 
     def test_park_frees_the_active_slot(self):
         swap = self._swap()
@@ -197,16 +220,23 @@ class TestMambaSwapPool(unittest.TestCase):
         self.assertEqual(swap.num_parked(), 0)
         self.assertEqual(swap.available_size(), 3)
 
-    def test_rejects_replayssm_pool(self):
+    def test_plain_replayssm_rings_round_trip(self):
+        # swap-v2 P0b: plain ReplaySSM is supported; the ring planes are
+        # slot-indexed so they park and wake with the state row.
         pool = _fake_mamba_pool()
         pool.enable_linear_replayssm = True
-        with self.assertRaisesRegex(ValueError, "ReplaySSM"):
-            MambaSwapPool(
-                mamba_pool=pool,
-                mamba_allocator=None,
-                swap_slots=2,
-                device="cpu",
-            )
+        pool.mamba_cache.replayssm_d = torch.zeros(2, ACTIVE_SLOTS, 4)
+        swap = MambaSwapPool(
+            mamba_pool=pool,
+            mamba_allocator=MambaSlotAllocator(ACTIVE_SLOTS - 1, "cpu"),
+            swap_slots=2,
+            device="cpu",
+        )
+        pool.mamba_cache.replayssm_d[:, 3] = 7.0
+        swap_id = swap.park(3)
+        pool.mamba_cache.replayssm_d[:, 3] = -1.0
+        swap.wake(swap_id, 1)
+        self.assertTrue((pool.mamba_cache.replayssm_d[:, 1] == 7.0).all())
 
     def test_plane_bytes_match_active_pool_density(self):
         swap = self._swap(swap_slots=3)

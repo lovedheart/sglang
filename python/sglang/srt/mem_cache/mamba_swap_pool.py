@@ -58,13 +58,15 @@ logger = logging.getLogger(__name__)
 
 
 class _ParkedSlot:
-    """One parked state: the D2H completion event plus sibling payloads."""
+    """One parked state: the D2H completion event, sibling payloads, and the
+    row count the record was parked with (wake must restore the same set)."""
 
-    __slots__ = ("event", "sibling_data")
+    __slots__ = ("event", "sibling_data", "num_rows")
 
-    def __init__(self, event: Optional[Any], sibling_data: List[Any]):
+    def __init__(self, event: Optional[Any], sibling_data: List[Any], num_rows: int):
         self.event = event
         self.sibling_data = sibling_data
+        self.num_rows = num_rows
 
 
 class MambaSwapPool:
@@ -92,10 +94,12 @@ class MambaSwapPool:
         self.mamba_allocator = mamba_allocator
         self.swap_slots = swap_slots
         self.device = device
-        # V2-P1 record v2: one swap id parks a ROW SET (e.g. the main slot
-        # plus ping-pong tracking slots), copied under one fence pair. All
-        # records are uniform: `rows_per_record` host rows each, record r
-        # owning host rows [r * rpr, (r + 1) * rpr); rows_per_record=1 is
+        # V2-P1 record v2, V2.5 variable width: one swap id parks a ROW SET
+        # (the main slot plus the request's allocated ping-pong rows), copied
+        # under one fence pair. Records reserve `rows_per_record` host rows
+        # each (record r owning host rows [r * rpr, (r + 1) * rpr)) but may
+        # park FEWER rows (lazy tracking allocates its second row mid-life);
+        # wake must restore exactly the parked count. rows_per_record=1 is
         # the v1 byte layout.
         self.rows_per_record = rows_per_record
         host_rows = (swap_slots + 1) * rows_per_record
@@ -190,12 +194,18 @@ class MambaSwapPool:
 
     def _norm_slots(self, active_slots) -> List[int]:
         slots = [active_slots] if isinstance(active_slots, int) else list(active_slots)
-        if len(slots) != self.rows_per_record:
+        if not 1 <= len(slots) <= self.rows_per_record:
             raise ValueError(
-                f"swap record takes exactly {self.rows_per_record} active "
+                f"swap record takes 1..{self.rows_per_record} active "
                 f"slot(s), got {slots}"
             )
         return slots
+
+    def parked_num_rows(self, swap_id: int) -> Optional[int]:
+        """Rows the record was parked with, or None if not parked. The
+        scheduler must wake with exactly this many freshly allocated slots."""
+        record = self._parked.get(swap_id)
+        return None if record is None else record.num_rows
 
     def park(self, active_slots, *, order_streams=()) -> Optional[int]:
         """Copy the active row set's state into the pinned record rows and
@@ -207,6 +217,7 @@ class MambaSwapPool:
         be freed to the sync-free allocator immediately. All rows of the
         set share the one fence pair, so the record is atomic."""
         slots = self._norm_slots(active_slots)
+        assert len(set(slots)) == len(slots), f"duplicate rows in record: {slots}"
         if not self.free_ids:
             return None
         swap_id = self.free_ids.pop(0)
@@ -239,7 +250,9 @@ class MambaSwapPool:
                 event.record(self._copy_stream)
 
         self._parked[swap_id] = _ParkedSlot(
-            event if self._copy_stream is not None else None, sibling_data
+            event if self._copy_stream is not None else None,
+            sibling_data,
+            len(slots),
         )
         if self._copy_stream is not None:
             # Order future writes to the rows (a new owner's prefill) after
@@ -259,8 +272,14 @@ class MambaSwapPool:
         stream in ``order_streams`` (the forward's candidates) is fenced
         after the H2D before this returns. The swap record is recycled: a
         later park reusing the rows fences behind this H2D the same way."""
+        record = self._parked[swap_id]
         slots = self._norm_slots(active_slots)
-        record = self._parked.pop(swap_id)
+        if len(slots) != record.num_rows:
+            raise ValueError(
+                f"swap record {swap_id} was parked with {record.num_rows} "
+                f"row(s), waking into {len(slots)}: {slots}"
+            )
+        self._parked.pop(swap_id)
         cache = self.mamba_pool.mamba_cache
         idx = torch.tensor(slots, dtype=torch.int64, device=self.device)
         rows = [swap_id * self.rows_per_record + j for j in range(len(slots))]
@@ -354,10 +373,14 @@ def maybe_init_mamba_state_swap_pool(
     mamba_pool,
     mamba_allocator,
     device: str,
+    track_slots: int = 0,
 ):
     """Build the swap pool from the flags, or None when disabled. The flag
     pair ``--enable-mamba-state-swap`` / ``--mamba-swap-size`` is presence-
-    validated in the arg_groups mamba hook."""
+    validated in the arg_groups mamba hook. ``track_slots`` is the ping-pong
+    buffer size (0 without extra buffers); a record reserves one row per
+    working+tracking slot so a fully grown request fits, and lazy requests
+    park fewer rows until their second tracking slot exists."""
     mamba = None
     try:
         mamba = get_exec().mamba
@@ -373,10 +396,12 @@ def maybe_init_mamba_state_swap_pool(
         mamba_allocator=mamba_allocator,
         swap_slots=mamba.mamba_swap_size,
         device=device,
+        rows_per_record=1 + track_slots,
     )
     logger.info(
-        "mamba swap pool: %d parked slots (%.2fGB pinned)",
+        "mamba swap pool: %d parked records x %d row(s) (%.2fGB pinned)",
         mamba.mamba_swap_size,
+        pool.rows_per_record,
         pool.total_bytes() / (1 << 30),
     )
     return pool

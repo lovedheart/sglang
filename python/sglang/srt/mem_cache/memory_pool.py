@@ -1601,6 +1601,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_pool=self.mamba_pool,
             mamba_allocator=self.mamba_allocator,
             device=device,
+            track_slots=(
+                self.mamba_ping_pong_track_buffer_size
+                if enable_mamba_extra_buffer
+                else 0
+            ),
         )
 
         self.device = device
