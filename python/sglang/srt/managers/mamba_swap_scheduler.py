@@ -232,11 +232,14 @@ class MambaSwapScheduler:
         if req.kv.mamba_cow_src_index is not None:
             return False
         # Defensive: tracking rows beyond record capacity (a config drift)
-        # would spill into the neighbour record's host rows.
-        buf = req.kv.mamba_ping_pong_track_buffer
+        # would spill into the neighbour record's host rows. Host-side
+        # count: wants_park probes this per candidate per step, and a
+        # device .item() there is a per-step stream sync.
+        empty = req.kv.mamba_ping_pong_empty
         if (
-            buf is not None
-            and 1 + int((buf != -1).sum().item()) > self.swap_pool.rows_per_record
+            empty is not None
+            and 1 + sum(1 for is_empty in empty if not is_empty)
+            > self.swap_pool.rows_per_record
         ):
             return False
         woken = req.kv.mamba_swap_woken_iter
@@ -325,25 +328,44 @@ class MambaSwapScheduler:
     # ===== Wake =====
 
     def _wake_next(self) -> Optional[Req]:
-        """Take the longest-parked request, give it fresh active rows for
-        its whole record, and move it back to the running list; the caller
-        merges it into decode. Returns None (staying parked) if the rows
-        vanished between the free check and the alloc — same-tick retire or
-        an admit racing ahead."""
-        req = next(iter(self.parked_reqs))
+        """Wake the first (longest-parked) record that fits the currently
+        free rows; the caller merges it into decode. V2.5 records have
+        variable width (lazy tracking grows), so a strict longest-parked
+        pick would head-of-line-starve behind a too-wide record while
+        narrow releases trickle in: first-fit keeps the rotation moving.
+        Returns None (everything stays parked) when no record fits — with
+        a mixed-width parked set that is normal churn, not an emergency.
+        """
+        free = self.state.slots.available_size()
+        for req in self.parked_reqs:
+            n = self.swap_pool.parked_num_rows(req.kv.mamba_swap_id)
+            if n is None:
+                raise RuntimeError(
+                    f"mamba swap: parked req {req.rid} names lost record "
+                    f"{req.kv.mamba_swap_id}"
+                )
+            if n <= free:
+                return self._wake(req, n)
+        if free > 0:
+            logger.debug(
+                "mamba swap: %d parked record(s), none fits %d free row(s)",
+                len(self.parked_reqs),
+                free,
+            )
+        return None
+
+    def _wake(self, req: Req, n: int) -> Optional[Req]:
+        """Give the parked request n fresh active rows and move it back to
+        the running list. Returns None (staying parked) if the rows
+        vanished between the fit check and the alloc — same-tick retire or
+        an admit racing ahead; that would mean broken accounting, so it
+        stays loud."""
         swap_id = req.kv.mamba_swap_id
-        n = self.swap_pool.parked_num_rows(swap_id)
         slot = self.state.slots.alloc(n)
         if slot is None:
-            # Graceful defer: the free check only proved ≥1 row, and a V2.5
-            # record may own more rows than any single release reopened.
-            # Reaching this every tick would starve the rotation — keep it
-            # visible.
             logger.warning(
-                "mamba swap: wake deferred for %s (%d free active slot(s), "
-                "record wants %d)",
+                "mamba swap: wake deferred for %s (record wants %d rows)",
                 req.rid,
-                self.state.slots.available_size(),
                 n,
             )
             return None

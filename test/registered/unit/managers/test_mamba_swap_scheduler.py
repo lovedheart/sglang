@@ -361,10 +361,10 @@ class TestMambaSwapTrackedRotation(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        temporal = torch.zeros(L, 6, 4, 8, 8, dtype=torch.bfloat16)
-        conv = [torch.zeros(L, 6, 2, 4, 8, dtype=torch.bfloat16)]
+        temporal = torch.zeros(L, 7, 4, 8, 8, dtype=torch.bfloat16)
+        conv = [torch.zeros(L, 7, 2, 4, 8, dtype=torch.bfloat16)]
         self.cleared = []
-        mamba_pool = SimpleNamespace(
+        self.mamba_pool = SimpleNamespace(
             mamba_cache=SimpleNamespace(
                 temporal=temporal,
                 conv=conv,
@@ -387,7 +387,7 @@ class TestMambaSwapTrackedRotation(unittest.TestCase):
         self.slots = MambaSlotAllocator(4, "cpu")
         self.table = _FakeTableV25()
         self.swap_pool = MambaSwapPool(
-            mamba_pool=mamba_pool,
+            mamba_pool=self.mamba_pool,
             mamba_allocator=self.slots,
             swap_slots=3,
             device="cpu",
@@ -399,7 +399,7 @@ class TestMambaSwapTrackedRotation(unittest.TestCase):
             swap_pool=self.swap_pool,
             state=SimpleNamespace(
                 slots=self.slots,
-                pool=mamba_pool,
+                pool=self.mamba_pool,
                 # Mirror of StateStorage.pending_request_slots.
                 pending_request_slots=lambda table, req: (
                     int(not req.kv.holds_mamba)
@@ -488,6 +488,66 @@ class TestMambaSwapTrackedRotation(unittest.TestCase):
         # Both the needs_clear buffer row and the queued donate row name the
         # same track row; the forward-path drain dedups the same way.
         self.assertEqual(sorted(self.cleared[0].tolist()), [track_row, track_row])
+
+    def test_wake_first_fit_skips_a_too_wide_record(self):
+        # M3 (ocr): with variable-width records the longest-parked record
+        # may not fit the currently free rows; wake must reach past it to
+        # the first record that fits instead of stalling.
+        pool6 = MambaSlotAllocator(6, "cpu")
+        big_pool = MambaSwapPool(
+            mamba_pool=self.mamba_pool,
+            mamba_allocator=pool6,
+            swap_slots=3,
+            device="cpu",
+            rows_per_record=3,
+        )
+        running = KeyedReqList(ListKind.DECODING)
+        parked = IndexedReqList(ListKind.MAMBA_PARKED)
+        sched = MambaSwapScheduler(
+            swap_pool=big_pool,
+            state=SimpleNamespace(
+                slots=pool6,
+                pool=self.mamba_pool,
+                pending_request_slots=self.swap.state.pending_request_slots,
+            ),
+            table=self.table,
+            running_reqs=running,
+            parked_reqs=parked,
+            order_streams=(),
+            wake_quantum=4,
+        )
+        wide, narrow = _FakeReq("wide"), _FakeReq("narrow")
+        wide.kv.req_pool_idx, narrow.kv.req_pool_idx = 6, 7
+        w_rows = pool6.alloc(3)
+        wide.kv.mamba_pool_idx = w_rows[0]
+        wide.kv.mamba_ping_pong_track_buffer = w_rows[1:]
+        wide.kv.mamba_ping_pong_empty = [False, False]
+        n_rows = pool6.alloc(2)
+        narrow.kv.mamba_pool_idx = n_rows[0]
+        narrow.kv.mamba_ping_pong_track_buffer = n_rows[1:]
+        narrow.kv.mamba_ping_pong_empty = [False, True]
+        move([wide, narrow], running)
+        batch = _FakeRunningBatch([wide, narrow])
+        sched._park(batch, wide)  # 3 rows
+        sched._park(batch, narrow)  # 2 rows; all six rows free now
+        held = pool6.alloc(4)  # an admit spends four rows, two stay free
+        woke = sched.on_step_boundary(_FakeRunningBatch([]), waiting_count=0)
+        self.assertEqual(woke, [narrow])  # wide (3) cannot fit the 2 free
+        self.assertIn(wide, parked)
+        self.assertIsNotNone(wide.kv.mamba_swap_id)
+        # Release the admit's rows and the wide record wakes too.
+        pool6.free(held)
+        woke = sched.on_step_boundary(_FakeRunningBatch([]), waiting_count=0)
+        self.assertEqual(woke, [wide])
+        self.assertEqual(len(parked), 0)
+
+    def test_cow_src_still_excludes_a_tracked_victim(self):
+        # A CoW source remains a hard exclusion (transient clears are not).
+        r0, r1 = self._tracked_req("e0"), self._tracked_req("e1")
+        r0.kv.mamba_cow_src_index = torch.tensor([0])
+        batch = _FakeRunningBatch([r0, r1])
+        self.swap.on_step_boundary(batch, waiting_count=1)
+        self.assertIs(next(iter(self.parked)), r1)
 
     def test_admission_slots_price_the_footprint(self):
         fresh = _FakeReq("q0")

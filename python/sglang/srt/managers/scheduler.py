@@ -4835,11 +4835,18 @@ class Scheduler(
                     req.host_hit_is_storage = False
 
             # Price the admission before the match: on a split pool the match
-            # itself takes the slot as its copy-on-write destination.
+            # itself takes the working row as its copy-on-write destination,
+            # which would make a post-match price read zero for exactly the
+            # requests that spend a row. Extra-buffer configs also take their
+            # initial tracking rows, so the price can exceed one row.
             needs_state_slot = state_slot_budget is not None and not req.kv.holds_mamba
-            if needs_state_slot and state_slot_budget <= 0:
-                # No active state slot for this admission; the swap rotation
-                # (or a finish) reopens one at the next step boundary.
+            state_slot_price = (
+                self.mamba_swap.admission_slots(req) if needs_state_slot else 0
+            )
+            if needs_state_slot and state_slot_budget < state_slot_price:
+                # Not enough active state rows for this admission; the swap
+                # rotation (or a finish) reopens capacity at the next step
+                # boundary.
                 break
             # On a shared memory the match takes no state slot: admission prices
             # it, and the slot is bound with the row. A request this pass leaves
@@ -4864,10 +4871,9 @@ class Scheduler(
                         self._drop_unadmitted_match(req)
                     continue
             if needs_state_slot:
-                # Price the whole admission: extra-buffer configs take the
-                # working row plus their initial tracking rows, and the
-                # park/wake rotation moves those rows with the request.
-                state_slot_budget -= self.mamba_swap.admission_slots(req)
+                # Charge the pre-match price: the match (when there is one)
+                # already spent the working row out of the same budget.
+                state_slot_budget -= state_slot_price
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

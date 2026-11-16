@@ -660,8 +660,10 @@ class ExecMamba(msgspec.Struct):
     ] = False
     mamba_swap_size: A[
         Optional[int],
-        "Number of pinned-RAM mamba state-swap slots (parked requests); required "
-        "positive with --enable-mamba-state-swap.",
+        "Number of pinned-RAM mamba state-swap records (parked requests); "
+        "required positive with --enable-mamba-state-swap. Each record pins "
+        "one row per working+tracking state slot, so extra-buffer configs "
+        "pin multiple rows per parked request.",
     ] = None
     linear_attn_backend: A[
         str,

@@ -187,9 +187,6 @@ class MambaSwapPool:
             planes.append(self.host_write_pos)
         return sum(p.numel() * p.element_size() for p in planes)
 
-    def is_parked(self, swap_id: int) -> bool:
-        return swap_id in self._parked
-
     # ===== Park / wake =====
 
     def _norm_slots(self, active_slots) -> List[int]:
