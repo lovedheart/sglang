@@ -3342,15 +3342,17 @@ class KVCacheConfigurator:
         capped_by_mamba = False
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
-            # Virtual SSM slots: with the state-swap tier on, a parked
-            # request lives in a pinned swap row, so the concurrency bound
-            # follows the combined capacity. Parked records keep the same
-            # per-request slot economics as decode (the whole footprint
-            # moves, nothing multiplies across the park boundary), so the
-            # ratio term stays exact.
+            # Virtual SSM slots: a request is resident (holding one
+            # footprint of active rows, pool // ratio of them fit) or
+            # parked (a pinned RAM record holding ZERO active rows; wake
+            # refits against the freed rows). So each swap record buys one
+            # more live request regardless of its width, and the bound is
+            # pool // ratio + swap_size — pricing parked records at
+            # ratio active rows would under-admit exactly the
+            # extra_buffer configs the tier exists for.
             mamba = get_exec().mamba
             swap_size = mamba.mamba_swap_size if mamba.enable_mamba_state_swap else 0
-            mamba_cap = (get_schedule().max_mamba_cache_size + swap_size) // ratio
+            mamba_cap = get_schedule().max_mamba_cache_size // ratio + swap_size
             if swap_size and not get_memory().disable_radix_cache:
                 logger.info(
                     "swap v2: radix-on mode, active=%d swap=%d, %d live "
