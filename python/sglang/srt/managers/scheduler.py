@@ -4280,6 +4280,9 @@ class Scheduler(
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.model_config.vocab_size
         )
+        # Per-request mm list, like prepare_for_extend builds; merge_batch
+        # concatenates it and crashes on None.
+        batch.multimodal_inputs = [r.multimodal_inputs for r in reqs]
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
