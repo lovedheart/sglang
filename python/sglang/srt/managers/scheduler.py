@@ -517,6 +517,10 @@ class Scheduler(
     # Set by maybe_init_rust_server; a watchdog timeout reads it to dump. A
     # class-level default, so it reads as None before __init__ gets that far.
     rust_server: Optional[RustServer] = None
+    # Virtual SSM slots: built by init_mamba_swap; class-level defaults so
+    # request_lists()/get_next_batch_to_run read None when it never ran.
+    mamba_swap: Optional[MambaSwapScheduler] = None
+    mamba_parked_reqs: Optional[IndexedReqList] = None
     # The alignment a truncated prefill chunk is cut to; None leaves it free.
     truncation_align_size: Optional[int] = None
 

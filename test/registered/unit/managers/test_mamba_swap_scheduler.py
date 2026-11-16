@@ -20,6 +20,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.mamba_swap_pool import MambaSwapPool
@@ -33,12 +34,15 @@ L = 2
 class _FakeReq:
     """Identity-hashable stand-in: the real Req is hashable by identity."""
 
+    # Class attribute: only move()/the retirer set instance ownership, and the
+    # list-edit audit forbids owner_list assignments outside those modules.
+    owner_list = None
+
     def __init__(self, rid):
         self.rid = rid
         self.kv = ReqKvInfo()
         self.session = None
         self.beam_group = None
-        self.owner_list = None
 
 
 class _FakeRunningBatch:
@@ -100,7 +104,7 @@ class TestMambaSwapRotation(unittest.TestCase):
         req = _FakeReq(rid)
         req.kv.req_pool_idx = len(self.running_reqs) + 1
         req.kv.mamba_pool_idx = self.slots.alloc(1)[0]
-        self.running_reqs._join([req])
+        move([req], self.running_reqs)
         return req
 
     def _running_batch(self, reqs):
