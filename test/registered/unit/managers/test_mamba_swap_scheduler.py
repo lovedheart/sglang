@@ -240,10 +240,17 @@ class TestMambaSwapRotation(unittest.TestCase):
 
     def test_wants_park_tracks_the_park_branch(self):
         # The overlap loop calls wants_park to decide early result
-        # processing; it must agree with the tick's park precondition.
+        # processing; it must agree with the tick's park precondition,
+        # including whether any victim is parkable at all.
         batch = self._running_batch([self._req("r0"), self._req("r1")])
         self.assertFalse(self.swap.wants_park(batch, waiting_count=0))
         self.assertTrue(self.swap.wants_park(batch, waiting_count=1))
+        # Nothing parkable (session states): overlap must stay enabled.
+        for r in batch.reqs:
+            r.session = object()
+        self.assertFalse(self.swap.wants_park(batch, waiting_count=1))
+        for r in batch.reqs:
+            r.session = None
         self.swap.on_step_boundary(batch, waiting_count=1)
         # A slot freed by the park: nothing more to park this tick.
         self.assertFalse(self.swap.wants_park(batch, waiting_count=1))

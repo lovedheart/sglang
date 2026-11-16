@@ -78,16 +78,21 @@ class MambaSwapScheduler:
         self._debug_scan = envs.SGLANG_DEBUG_MEMORY_POOL.get()
 
     def wants_park(self, running_batch: ScheduleBatch, waiting_count: int) -> bool:
-        """Whether the next tick would want to park: the conditions of the
-        park branch, evaluated cheaply. The overlap loop asks this before
-        scheduling so the in-flight decode step gets committed first —
-        parking a victim whose step result is still unprocessed would drop
-        that step's sampled token from its output (see _parkable)."""
+        """Whether the next tick would want to park AND can actually park:
+        the park-branch conditions plus a parkable victim. The overlap loop
+        calls this to decide early result processing — parking a victim
+        whose step result is still unprocessed would drop that step's
+        sampled token from its output (see _parkable) — so the commit must
+        land first; the victim check keeps permanently infeasible rotations
+        (session/beam sets, wake-quantum windows) from silently disabling
+        overlap for nothing. Must not mutate; unlike _select_victim it does
+        not advance the rotor."""
         return (
             waiting_count > 0
             and self.state.slots.available_size() == 0
             and running_batch.batch_size() >= 2
             and self.swap_pool.available_size() > 0
+            and any(self._parkable(r) for r in running_batch.reqs)
         )
 
     def on_step_boundary(
