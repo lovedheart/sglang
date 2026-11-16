@@ -1569,7 +1569,11 @@ class TestMambaStateSwapCompatibility(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
             handle_mamba_state_swap(server_args)
 
-    def test_rejects_spec_replayssm(self):
+    def test_accepts_spec_replayssm_static(self):
+        # Static -spec layouts park completely: GDN's ring+cursors are
+        # request-row keyed (park keeps the row), KDA's fold ring is slot
+        # keyed (the record copies it and fold-every-commit keeps the
+        # temporal row current). Accepted with a wake-verify warning.
         server_args = ServerArgs(
             model_path="dummy",
             enable_mamba_state_swap=True,
@@ -1577,8 +1581,28 @@ class TestMambaStateSwapCompatibility(unittest.TestCase):
             disable_radix_cache=True,
             enable_linear_replayssm_spec=True,
         )
-        with self.assertRaisesRegex(ValueError, "ReplaySSM"):
+        with self.assertLogs(level="WARNING") as logs:
             handle_mamba_state_swap(server_args)
+        self.assertTrue(
+            any("-spec ring" in msg for msg in logs.output),
+            f"expected a -spec ring warning, got {logs.output}",
+        )
+
+    def test_rejects_spec_replayssm_ragged(self):
+        # The ragged ring-write layouts index the ring outside the request
+        # row / mamba slot the swap tier parks with: still rejected.
+        from sglang.srt.environ import envs
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_mamba_state_swap=True,
+            mamba_swap_size=4,
+            disable_radix_cache=True,
+            enable_linear_replayssm_spec=True,
+        )
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+            with self.assertRaisesRegex(ValueError, "static verify layout"):
+                handle_mamba_state_swap(server_args)
 
     def test_rejects_radix_cache_on_without_int8(self):
         """Plain radix state caching keeps active fp slots a parked request

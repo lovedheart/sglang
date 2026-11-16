@@ -88,8 +88,9 @@ class MambaSwapPool:
         # ReplaySSM adds slot-indexed ring planes (and, in plain decode mode,
         # a slot-indexed write cursor) to the parked state. Capture is cheap
         # and exact; the -spec row-keyed cursors live in req rows that park
-        # keeps, so they need no record. -spec rings are rejected upstream in
-        # the mamba arg hook (they ride on speculative decoding).
+        # keeps, so they need no record. The arg hook admits -spec only in
+        # the static verify layout, whose rings are request-row or slot keyed
+        # (both park-complete) and GPU-verified under rotation.
         self.mamba_pool = mamba_pool
         self.mamba_allocator = mamba_allocator
         self.swap_slots = swap_slots

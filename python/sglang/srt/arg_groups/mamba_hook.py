@@ -186,14 +186,28 @@ def handle_mamba_state_swap(server_args: Any):
             "requests may drop."
         )
     if cfg.enable_linear_replayssm_spec:
-        # Plain ReplaySSM rings ride in the parked record (swap-v2 P0b/P4).
-        # The -spec rings are request-keyed verify-round state that no record
-        # layout carries, so this rejection stays even though plain
-        # speculative decoding is now accepted above.
-        raise ValueError(
-            "--enable-mamba-state-swap is not supported with the ReplaySSM "
-            "-spec ring buffers: the speculative-decode ring state is not "
-            "parked. Disable one of them."
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "--enable-mamba-state-swap with --enable-linear-replayssm-spec "
+                "supports only the static verify layout "
+                "(SGLANG_RAGGED_VERIFY_MODE=static): the ragged ring-write "
+                "layouts index the ring outside the request row / mamba slot "
+                "the swap tier parks with, and are unverified under swap."
+            )
+        # The static chain layouts park cleanly: the GDN -spec ring and its
+        # cursors are request-row keyed (park keeps the row), and the KDA
+        # fold ring is mamba-slot keyed (the record copies the ring planes,
+        # fold-every-commit keeps `temporal` current). See MambaSwapPool.
+        logger.warning(
+            "--enable-mamba-state-swap with --enable-linear-replayssm-spec: "
+            "the -spec ring rides the parked request (request-keyed ring) or "
+            "its parked slot (KDA fold ring); verify that woken requests "
+            "still accept drafts on a rotation-heavy workload."
         )
     if cfg.disaggregation_mode != "null":
         raise ValueError(
