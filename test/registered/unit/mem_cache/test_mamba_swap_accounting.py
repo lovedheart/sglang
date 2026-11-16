@@ -70,7 +70,7 @@ class TestSwapReleaseExactlyOnce(unittest.TestCase):
         swap = _swap_pool()
         swap_id = 1  # take the id out of circulation like park() would
         swap.free_ids = [2]
-        swap._parked[swap_id] = _ParkedSlot(None, [])
+        swap._parked[swap_id] = _ParkedSlot(None, [], 1)
         kv = ReqKvInfo(kv_allocated_len=0)
         kv.mamba_swap_id = swap_id
         req = SimpleNamespace(kv=kv, rid="r0")
@@ -91,7 +91,7 @@ class TestSwapReleaseExactlyOnce(unittest.TestCase):
     def test_release_of_unparked_req_is_untouched(self):
         swap = _swap_pool()
         swap_id = 1
-        swap._parked[swap_id] = _ParkedSlot(None, [])
+        swap._parked[swap_id] = _ParkedSlot(None, [], 1)
         kv = ReqKvInfo(kv_allocated_len=0)
         req = SimpleNamespace(kv=kv, rid="r1")
 

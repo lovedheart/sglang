@@ -405,6 +405,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         swap_pool = tree_cache.token_to_kv_pool_allocator.state.swap_pool
         swap_pool.drop(req.kv.mamba_swap_id)
         req.kv.mamba_swap_id = None
+        req.kv.mamba_swap_track_positions = None
         req.kv.mamba_state_released_via_swap = True
     try:
         _release_kv_cache_inner(req, tree_cache, checkpoint=checkpoint)

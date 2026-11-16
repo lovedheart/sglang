@@ -4864,7 +4864,10 @@ class Scheduler(
                         self._drop_unadmitted_match(req)
                     continue
             if needs_state_slot:
-                state_slot_budget -= 1
+                # Price the whole admission: extra-buffer configs take the
+                # working row plus their initial tracking rows, and the
+                # park/wake rotation moves those rows with the request.
+                state_slot_budget -= self.mamba_swap.admission_slots(req)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

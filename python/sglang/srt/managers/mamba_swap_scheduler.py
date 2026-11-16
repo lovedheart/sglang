@@ -31,6 +31,8 @@ from __future__ import annotations
 import logging
 from typing import List, Optional, Sequence
 
+import torch
+
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -154,8 +156,10 @@ class MambaSwapScheduler:
 
     def _check_parked_ownership(self) -> None:
         """Invariant 1 (debug builds): a parked request holds no active
-        row — slot, ping-pong buffer, CoW source or deferred clear — and
-        owns exactly one live, distinct swap record.
+        row — working row, CoW source or deferred clear — and owns exactly
+        one live, distinct swap record whose row count matches its ping-pong
+        buffer (parked ping-pong entries keep their freed ids; wake rebinds
+        them, so staleness is fine but a count drift is not).
 
         Runs at the step boundary, where the scheduler is the single
         writer; the idle memory-pool checker cannot host this scan
@@ -167,19 +171,31 @@ class MambaSwapScheduler:
             problems = []
             if kv.mamba_pool_idx is not None:
                 problems.append(f"row={int(kv.mamba_pool_idx.reshape(-1)[0])}")
-            if kv.mamba_ping_pong_track_buffer is not None:
-                problems.append("ping_pong")
             if kv.mamba_cow_src_index is not None:
                 problems.append("cow_src")
             if kv.mamba_slot_clear_queue:
                 problems.append("clear_queue")
             swap_id = kv.mamba_swap_id
-            if swap_id is None or not self.swap_pool.is_parked(swap_id):
+            record_rows = (
+                None if swap_id is None else self.swap_pool.parked_num_rows(swap_id)
+            )
+            if record_rows is None:
                 problems.append(f"record={swap_id}")
             elif swap_id in seen_ids:
                 problems.append(f"dup_record={swap_id}")
             else:
                 seen_ids.add(swap_id)
+                buf = kv.mamba_ping_pong_track_buffer
+                # Parked buffer entries are exactly the record's track rows
+                # (the working row is record row 0, never in the buffer).
+                n_track = 0 if buf is None else int((buf != -1).sum().item())
+                positions = kv.mamba_swap_track_positions
+                if record_rows != 1 + n_track:
+                    problems.append(f"record_rows={record_rows} vs track={n_track}")
+                if n_track > 0 and not positions:
+                    problems.append("no_positions")
+                elif positions is not None and len(positions) != n_track:
+                    problems.append("positions")
             if problems:
                 raise RuntimeError(
                     f"mamba swap invariant 1 violated: rid={req.rid} "
@@ -209,13 +225,18 @@ class MambaSwapScheduler:
             return False
         if req.session is not None or req.beam_group is not None:
             return False
-        # Park/wake round-trips the main row only. Anything with state beyond
-        # that row (radix CoW source, deferred clear, ping-pong tracking) is
-        # not movable by this path; skip rather than silently discard it.
+        # The radix CoW source names a tree row this request's working copy
+        # is still pending a copy from: dropping it would strand that row.
+        # Ping-pong rows and deferred clears ARE movable now (V2.5): the
+        # park drains the clears and copies every allocated row.
+        if req.kv.mamba_cow_src_index is not None:
+            return False
+        # Defensive: tracking rows beyond record capacity (a config drift)
+        # would spill into the neighbour record's host rows.
+        buf = req.kv.mamba_ping_pong_track_buffer
         if (
-            req.kv.mamba_cow_src_index is not None
-            or req.kv.mamba_slot_clear_queue is not None
-            or req.kv.mamba_ping_pong_track_buffer is not None
+            buf is not None
+            and 1 + int((buf != -1).sum().item()) > self.swap_pool.rows_per_record
         ):
             return False
         woken = req.kv.mamba_swap_woken_iter
@@ -231,15 +252,18 @@ class MambaSwapScheduler:
         return transient_ok and self._victim_eligible(req, step=self.step)
 
     def _park(self, running_batch: ScheduleBatch, req: Req) -> None:
-        active_slot = int(req.kv.mamba_pool_idx.reshape(-1)[0])
-        swap_id = self.swap_pool.park(active_slot, order_streams=self.order_streams)
+        self._drain_pending_clears(req)
+        slots, positions = self._park_rows(req)
+        swap_id = self.swap_pool.park(slots, order_streams=self.order_streams)
         if swap_id is None:
             return
         req.kv.mamba_swap_id = swap_id
-        # The state now lives in the swap tier; the active slot bookkeeping
-        # goes with it. The request keeps its token pages and its req row.
-        # _parkable guarantees no CoW source, deferred clear or ping-pong
-        # buffer survived here, so there is nothing else to hand back.
+        req.kv.mamba_swap_track_positions = positions
+        # The state now lives in the swap tier; the active rows' bookkeeping
+        # goes with it. The request keeps its token pages and its req row;
+        # the ping-pong buffer entries keep the freed ids until wake rebinds
+        # them. _victim_eligible kept the CoW source out of this set, so the
+        # only obligations discharged here are the parked rows themselves.
         req.kv.mamba_pool_idx = None
         req.kv.mamba_needs_clear = False
         move([req], self.parked_reqs)
@@ -247,37 +271,96 @@ class MambaSwapScheduler:
         running_batch.batch_is_full = False
         self.num_parks += 1
         logger.debug(
-            "mamba swap: parked %s (swap slot %d, freed active slot %d)",
+            "mamba swap: parked %s (swap slot %d, freed active slots %s)",
             req.rid,
             swap_id,
-            active_slot,
+            slots,
         )
+
+    def _park_rows(self, req: Req):
+        """The request's active row set: the working row first, then each
+        allocated ping-pong row with its buffer position. -1 entries are
+        lazy's unallocated second slot; they park with the request, not as
+        rows."""
+        slots = [int(req.kv.mamba_pool_idx.reshape(-1)[0])]
+        positions: List[int] = []
+        buf = req.kv.mamba_ping_pong_track_buffer
+        if buf is not None:
+            for pos, slot in enumerate(buf.tolist()):
+                if slot != -1:
+                    slots.append(int(slot))
+                    positions.append(pos)
+        return slots, positions
+
+    def _drain_pending_clears(self, req: Req) -> None:
+        """Run a request's deferred mamba clears now, before the D2H, so the
+        parked record holds zeroed scratch rows and no clear bookkeeping
+        outlives the park (which would require wake to remap slot ids).
+        Queued donate-swaps and freshly recycled ping-pong rows all park
+        inside the record; the working row needs no clear because wake
+        overwrites it whole from the record (v1 dropped that flag the same
+        way). Safe at a step boundary: no forward is in flight to race."""
+        kv = req.kv
+        rows = []
+        if kv.mamba_ping_pong_needs_clear:
+            buf = kv.mamba_ping_pong_track_buffer
+            if buf is not None:
+                fresh = buf[buf != -1]
+                if fresh.numel() > 0:
+                    rows.append(fresh)
+            kv.mamba_ping_pong_needs_clear = False
+        if kv.mamba_slot_clear_queue:
+            rows.extend(kv.mamba_slot_clear_queue)
+            kv.mamba_slot_clear_queue = None
+        if rows:
+            self.state.pool.clear_slots(torch.cat(rows))
+
+    def admission_slots(self, req: Req) -> int:
+        """Active slots an admission will take from the state pool: its
+        working row plus initial tracking rows (extra-buffer configs).
+        Matches StateStorage.acquire; lazy mid-life growth beyond the
+        initial rows is best-effort (alloc failure degrades the track)."""
+        return self.state.pending_request_slots(self.table, req)
 
     # ===== Wake =====
 
     def _wake_next(self) -> Optional[Req]:
-        """Take the longest-parked request, give it a fresh active slot, and
-        move it back to the running list; the caller merges it into decode.
-        Returns None (staying parked) if the slot vanished between the free
-        check and the alloc — same-tick retire or an admit racing ahead."""
+        """Take the longest-parked request, give it fresh active rows for
+        its whole record, and move it back to the running list; the caller
+        merges it into decode. Returns None (staying parked) if the rows
+        vanished between the free check and the alloc — same-tick retire or
+        an admit racing ahead."""
         req = next(iter(self.parked_reqs))
-        slot = self.state.slots.alloc(1)
+        swap_id = req.kv.mamba_swap_id
+        n = self.swap_pool.parked_num_rows(swap_id)
+        slot = self.state.slots.alloc(n)
         if slot is None:
-            # Unreachable in single-writer discipline (the caller saw a free
-            # slot this tick); if it fires, slot accounting is broken and the
-            # rotation is stalling — keep it visible.
+            # Graceful defer: the free check only proved ≥1 row, and a V2.5
+            # record may own more rows than any single release reopened.
+            # Reaching this every tick would starve the rotation — keep it
+            # visible.
             logger.warning(
-                "mamba swap: wake deferred for %s (no free active slot)", req.rid
+                "mamba swap: wake deferred for %s (%d free active slot(s), "
+                "record wants %d)",
+                req.rid,
+                self.state.slots.available_size(),
+                n,
             )
             return None
-        swap_id = req.kv.mamba_swap_id
-        self.swap_pool.wake(swap_id, int(slot[0]), order_streams=self.order_streams)
+        self.swap_pool.wake(
+            swap_id, [int(x) for x in slot], order_streams=self.order_streams
+        )
         req.kv.mamba_pool_idx = slot[0]
         req.kv.mamba_swap_id = None
         req.kv.mamba_swap_woken_iter = self.step
-        # The table maps rows to slots; the woken request gets a new slot.
+        # The table maps rows to slots; the woken request gets new slots.
         self.table.req_index_to_mamba_index_mapping[req.kv.req_pool_idx] = int(slot[0])
+        # Rebind the ping-pong positions (sets the device-side mapping and
+        # empties flags alongside the request-held buffer).
+        for i, pos in enumerate(req.kv.mamba_swap_track_positions or ()):
+            self.table.set_mamba_ping_pong_slot(req, pos, slot[i + 1])
+        req.kv.mamba_swap_track_positions = None
         move([req], self.running_reqs)
         self.num_wakes += 1
-        logger.debug("mamba swap: woke %s into active slot %d", req.rid, int(slot[0]))
+        logger.debug("mamba swap: woke %s into active slots %s", req.rid, slot.tolist())
         return req

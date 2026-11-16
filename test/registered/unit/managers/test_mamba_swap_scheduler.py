@@ -24,7 +24,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     move,
 )
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
-from sglang.srt.mem_cache.mamba_swap_pool import MambaSwapPool
+from sglang.srt.mem_cache.mamba_swap_pool import MambaSwapPool, _ParkedSlot
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -317,11 +317,193 @@ class TestMambaSwapRotation(unittest.TestCase):
         other = self._req("r2")
         other.kv.mamba_pool_idx = None
         move([other], self.parked)
-        self.swap_pool._parked[42] = True
+        # A minimal real record shape: one row, CPU fence-free.
+        self.swap_pool._parked[42] = _ParkedSlot(None, [], 1)
         victim.kv.mamba_swap_id = 42
         other.kv.mamba_swap_id = 42
         with self.assertRaisesRegex(RuntimeError, "dup_record=42"):
             self.swap._check_parked_ownership()
+
+
+class _FakeTableV25:
+    """The extra-buffer slice of HybridReqToTokenPool the rotation touches,
+    mirroring set_mamba_ping_pong_slot's device-mapping maintenance."""
+
+    def __init__(self):
+        self.req_index_to_mamba_index_mapping = torch.zeros(8, dtype=torch.int32)
+        self.req_index_to_mamba_ping_pong_track_buffer_mapping = torch.zeros(
+            8, 2, dtype=torch.int32
+        )
+        self.enable_mamba_extra_buffer = True
+        self.mamba_initial_tracking_slots = 1
+        self.mamba_ping_pong_track_buffer_size = 2
+
+    def set_mamba_ping_pong_slot(self, req, idx, value):
+        if torch.is_tensor(value):
+            req.kv.mamba_ping_pong_track_buffer[idx] = value
+        else:
+            req.kv.mamba_ping_pong_track_buffer[idx].fill_(-1)
+        self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.kv.req_pool_idx] = (
+            req.kv.mamba_ping_pong_track_buffer
+        )
+        req.kv.mamba_ping_pong_empty[idx] = not torch.is_tensor(value)
+
+
+class TestMambaSwapTrackedRotation(unittest.TestCase):
+    """V2.5: park/wake with ping-pong tracking rows (extra_buffer configs)."""
+
+    def setUp(self):
+        patcher = mock.patch.object(
+            MambaSwapPool,
+            "_alloc_host",
+            lambda self, shape, dtype: torch.zeros(shape, dtype=dtype, device="cpu"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        temporal = torch.zeros(L, 6, 4, 8, 8, dtype=torch.bfloat16)
+        conv = [torch.zeros(L, 6, 2, 4, 8, dtype=torch.bfloat16)]
+        self.cleared = []
+        mamba_pool = SimpleNamespace(
+            mamba_cache=SimpleNamespace(
+                temporal=temporal,
+                conv=conv,
+                replayssm_d=None,
+                replayssm_k=None,
+                replayssm_g=None,
+                replayssm_rawv=None,
+                replayssm_rawk=None,
+                replayssm_beta=None,
+            ),
+            enable_linear_replayssm=False,
+            enable_linear_replayssm_spec=False,
+            replayssm_request_ring=False,
+            replayssm_write_pos=None,
+            _slot_siblings=[],
+            # Records the drain (the real impl zeroes the rows on the
+            # forward stream; the rows leave via park either way).
+            clear_slots=self.cleared.append,
+        )
+        self.slots = MambaSlotAllocator(4, "cpu")
+        self.table = _FakeTableV25()
+        self.swap_pool = MambaSwapPool(
+            mamba_pool=mamba_pool,
+            mamba_allocator=self.slots,
+            swap_slots=3,
+            device="cpu",
+            rows_per_record=2,
+        )
+        self.running_reqs = KeyedReqList(ListKind.DECODING)
+        self.parked = IndexedReqList(ListKind.MAMBA_PARKED)
+        self.swap = MambaSwapScheduler(
+            swap_pool=self.swap_pool,
+            state=SimpleNamespace(
+                slots=self.slots,
+                pool=mamba_pool,
+                # Mirror of StateStorage.pending_request_slots.
+                pending_request_slots=lambda table, req: (
+                    int(not req.kv.holds_mamba)
+                    + (
+                        table.mamba_initial_tracking_slots
+                        if table.enable_mamba_extra_buffer
+                        and req.kv.mamba_ping_pong_track_buffer is None
+                        else 0
+                    )
+                ),
+            ),
+            table=self.table,
+            running_reqs=self.running_reqs,
+            parked_reqs=self.parked,
+            order_streams=(),
+            wake_quantum=4,
+        )
+
+    def _tracked_req(self, rid):
+        req = _FakeReq(rid)
+        req.kv.req_pool_idx = len(self.running_reqs) + 1
+        # acquire(): working row first, then the initial tracking row; the
+        # buffer is the lazy shape [row, -1] until the second row exists.
+        pair = self.slots.alloc(2)
+        req.kv.mamba_pool_idx = pair[0]
+        buf = pair.new_full((2,), -1)
+        buf[0] = pair[1]
+        req.kv.mamba_ping_pong_track_buffer = buf
+        req.kv.mamba_ping_pong_empty = [False, True]
+        move([req], self.running_reqs)
+        return req
+
+    def test_tracked_park_wake_rebinds_the_track_row(self):
+        r0, r1 = self._tracked_req("r0"), self._tracked_req("r1")
+        old_track = int(r0.kv.mamba_ping_pong_track_buffer[0])
+        batch = _FakeRunningBatch([r0, r1])
+        self.swap.on_step_boundary(batch, waiting_count=1)
+        victim = next(iter(self.parked))
+        self.assertIs(victim, r0)
+        self.assertEqual(self.swap_pool.parked_num_rows(victim.kv.mamba_swap_id), 2)
+        self.assertIsNone(victim.kv.mamba_pool_idx)
+        self.assertEqual(victim.kv.mamba_swap_track_positions, [0])
+        # The parked buffer carries the lazy shape unchanged.
+        self.assertEqual(
+            victim.kv.mamba_ping_pong_track_buffer.tolist(), [old_track, -1]
+        )
+        # A record-complete parked req passes the invariant scan.
+        self.swap._check_parked_ownership()
+
+        woke = self.swap.on_step_boundary(batch, waiting_count=0)
+        self.assertEqual(woke, [victim])
+        self.assertIsNone(victim.kv.mamba_swap_id)
+        self.assertIsNone(victim.kv.mamba_swap_track_positions)
+        new_main = int(victim.kv.mamba_pool_idx)
+        new_track = victim.kv.mamba_ping_pong_track_buffer.tolist()
+        self.assertEqual(
+            new_main,
+            int(self.table.req_index_to_mamba_index_mapping[victim.kv.req_pool_idx]),
+        )
+        self.assertEqual(
+            new_track,
+            self.table.req_index_to_mamba_ping_pong_track_buffer_mapping[
+                victim.kv.req_pool_idx
+            ].tolist(),
+        )
+        # Main and track are distinct rows (an atomic two-row alloc).
+        self.assertNotIn(new_main, new_track)
+        self.assertEqual(victim.kv.mamba_ping_pong_empty, [False, True])
+        self.assertEqual(self.slots.available_size(), 0)
+
+    def test_park_drains_queued_clears(self):
+        req = self._tracked_req("r0")
+        other = self._tracked_req("r1")
+        # A donate swap staged a clear on the swapped-in track row, plus the
+        # hand-out flag over the whole buffer.
+        track_row = int(req.kv.mamba_ping_pong_track_buffer[0])
+        req.kv.mamba_slot_clear_queue = [torch.tensor([track_row], dtype=torch.int32)]
+        req.kv.mamba_ping_pong_needs_clear = True
+        batch = _FakeRunningBatch([req, other])
+        self.swap.on_step_boundary(batch, waiting_count=1)
+        # Whichever victim was picked, no clear bookkeeping survives a park.
+        for parked_req in self.parked:
+            self.assertIsNone(parked_req.kv.mamba_slot_clear_queue)
+            self.assertFalse(parked_req.kv.mamba_ping_pong_needs_clear)
+        self.assertEqual(len(self.cleared), 1)
+        # Both the needs_clear buffer row and the queued donate row name the
+        # same track row; the forward-path drain dedups the same way.
+        self.assertEqual(sorted(self.cleared[0].tolist()), [track_row, track_row])
+
+    def test_admission_slots_price_the_footprint(self):
+        fresh = _FakeReq("q0")
+        self.assertEqual(self.swap.admission_slots(fresh), 2)
+        # A tracked request holds both rows already: nothing pending.
+        held = self._tracked_req("q1")
+        self.assertEqual(self.swap.admission_slots(held), 0)
+
+    def test_wants_park_accepts_tracked_running_set(self):
+        # V2.5 lifted v1's ping-pong exclusion: a fully tracked running set
+        # is parkable, so the overlap handshake stays honest for it.
+        r0, r1 = self._tracked_req("t0"), self._tracked_req("t1")
+        batch = _FakeRunningBatch([r0, r1])
+        self.assertTrue(
+            self.swap.wants_park(batch, 1, at_step=self.swap.predicted_tick_step)
+        )
 
 
 if __name__ == "__main__":

@@ -310,6 +310,11 @@ class ReqKvInfo:
     # Parked state-swap: id in MambaSwapPool while this request is parked
     # (holds no active state slot); None otherwise. Dropped at release.
     mamba_swap_id: Optional[int] = None
+    # Ping-pong buffer positions whose rows are inside the parked record
+    # (record row 0 is the working slot). Parked entries keep their old,
+    # freed ids; wake rebinds these positions to the fresh rows. None
+    # unless parked, empty for a record without tracking rows.
+    mamba_swap_track_positions: Optional[List[int]] = None
     # Decode-step stamp of the last wake; the park policy protects a freshly
     # woken request from being re-parked before it made progress.
     mamba_swap_woken_iter: int = -1
