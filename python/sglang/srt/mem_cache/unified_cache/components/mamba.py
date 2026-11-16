@@ -342,11 +342,13 @@ class MambaComponent(TreeComponent):
             assert gpu_slot is not None, (
                 "Can not alloc GPU int8 checkpoint slot to promote a RAM checkpoint"
             )
-        pool.promote(int(host_value.reshape(-1)[0].item()), int(gpu_slot[0].item()))
+        # Read the two ids once: torch .item() is a host round-trip and must
+        # not ride in eager logger.debug args.
+        ram_id = int(host_value.reshape(-1)[0].item())
+        gpu_id = int(gpu_slot[0].item())
+        pool.promote(ram_id, gpu_id)
         logger.debug(
-            "int8 checkpoint promoted: RAM slot %d -> GPU slot %d",
-            int(host_value.reshape(-1)[0].item()),
-            int(gpu_slot[0].item()),
+            "int8 checkpoint promoted: RAM slot %d -> GPU slot %d", ram_id, gpu_id
         )
         return gpu_slot
 

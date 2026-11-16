@@ -377,6 +377,14 @@ class MambaCheckpointPool:
         still_pending = []
         for slot, event in self._pending_promotions:
             if slot in wanted:
+                if event is not None:
+                    # The promotion's H2D on the copy stream may still be in
+                    # flight. Order the consumer (current) stream after it
+                    # BEFORE the row re-enters the sync-free free list: the
+                    # next alloc hands this row to a quantize/H2D that must
+                    # not race the still-running copy (same reason clear()
+                    # drains the copy stream).
+                    torch.cuda.current_stream().wait_event(event)
                 self.allocator.free(
                     torch.tensor(
                         [slot], dtype=torch.int64, device=self.allocator.device
@@ -465,8 +473,12 @@ class MambaCheckpointPool:
         for (hm, dim), (m, _, _) in zip(self.host_sides, self.sides):
             # index_copy_ wants same-device value; stage through the GPU copy
             # first, then move the selected rows across the device boundary.
+            # The D2H must be SYNC: the fresh CPU temp is pageable, and a
+            # non-blocking copy_ can leave it unfinished when the host
+            # index_copy_ below reads it (spilled side rows land as stale
+            # data/zeros).
             rows = m.index_select(dim, staging.to(m.device))
-            hm.index_copy_(dim, host_idx, rows.to(hm.device, non_blocking=True))
+            hm.index_copy_(dim, host_idx, rows.to(hm.device))
 
     def alloc_device_slot(self) -> Optional[torch.Tensor]:
         """One GPU-tier checkpoint id, or None: promotions must land on the
@@ -517,13 +529,16 @@ class MambaCheckpointPool:
         for (hm, dim), (m, _, _) in zip(self.host_sides, self.sides):
             # index_copy_/index_select want indices on the tensor's own device;
             # the VALUE must also be same-device, so move the selected row.
+            # The H2D must be SYNC: the CPU temp is pageable, and a
+            # non-blocking copy could let its memory be recycled (CPU caching
+            # allocator) before the DMA has read it.
             rows = hm.index_select(
                 dim, torch.tensor([h_row], dtype=torch.int64, device=hm.device)
             )
             m.index_copy_(
                 dim,
                 torch.tensor([gpu_id], dtype=torch.int64, device=m.device),
-                rows.to(m.device, non_blocking=True),
+                rows.to(m.device),
             )
 
     def load_to_active(self, active_mamba_pool, ckpt_slots, active_slots) -> None:

@@ -365,6 +365,17 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 if tree_core.arena.has_device_value(node_id, MAMBA) {
                     tree_core.device_lru_list_mut(MAMBA).reset_node_mru(node_id);
                     self.cost_mark_used_(tree_core, node_id);
+                } else if self.mamba_host_only_checkpoint
+                    && tree_core.arena.node(node_id).has_host_value(MAMBA)
+                {
+                    // A host-tier checkpoint hit (host-only mode, or a tiered
+                    // int8 RAM checkpoint): keep it hot in the host LRU. An
+                    // admitted match's host lock may have DELISTED the node,
+                    // so the refresh must not assume membership.
+                    let host_lru = tree_core.host_lru_list_mut(MAMBA);
+                    if host_lru.in_list(Some(node_id)) {
+                        host_lru.reset_node_mru(node_id);
+                    }
                 }
             }
             LRURefreshPhase::InsertEnd => {}
