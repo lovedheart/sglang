@@ -385,6 +385,12 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
+    if req.kv.mamba_swap_id is not None:
+        # A parked request's swap slot is the last copy of its state: the
+        # request is ending, so drop it (every retire path funnels here).
+        swap_pool = tree_cache.token_to_kv_pool_allocator.state.swap_pool
+        swap_pool.drop(req.kv.mamba_swap_id)
+        req.kv.mamba_swap_id = None
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
         assert tree_cache.supports_mamba(), (

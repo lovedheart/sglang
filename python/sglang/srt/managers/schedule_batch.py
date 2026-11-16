@@ -307,6 +307,12 @@ class ReqKvInfo:
     # slot-specific: keep whatever the buffer already holds and clear only
     # these slots on the next extend forward.
     mamba_slot_clear_queue: Optional[List[torch.Tensor]] = None
+    # Parked state-swap: id in MambaSwapPool while this request is parked
+    # (holds no active state slot); None otherwise. Dropped at release.
+    mamba_swap_id: Optional[int] = None
+    # Decode-step stamp of the last wake; the park policy protects a freshly
+    # woken request from being re-parked before it made progress.
+    mamba_swap_woken_iter: int = -1
 
     def window_dead_lo(self, page_size: int) -> int:
         # Lowest position this request may free itself in any window: above the
