@@ -647,6 +647,18 @@ class ExecMamba(msgspec.Struct):
         "checkpoint pool; required positive with "
         "--enable-int8-mamba-checkpoint-offload.",
     ] = None
+    enable_mamba_state_swap: A[
+        bool,
+        "Park idle requests' exact bf16 recurrent states into pinned-RAM swap "
+        "slots (freeing their active GPU state slot) so max-running-requests can "
+        "exceed the active mamba pool; woken requests resume decode without "
+        "re-prefill. Requires a positive --mamba-swap-size.",
+    ] = False
+    mamba_swap_size: A[
+        Optional[int],
+        "Number of pinned-RAM mamba state-swap slots (parked requests); required "
+        "positive with --enable-mamba-state-swap.",
+    ] = None
     linear_attn_backend: A[
         str,
         Arg(

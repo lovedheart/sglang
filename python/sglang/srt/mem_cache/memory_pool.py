@@ -396,6 +396,7 @@ class ReqToTokenPool:
     mamba_pool: Optional[MambaPool] = None
     mamba_allocator = None
     mamba_ckpt_pool = None
+    mamba_swap_pool = None
     state: Optional[StateStorage] = None
     # Whether a row names its request's state slot (the hybrid tables).
     holds_state_slots: bool = False
@@ -1589,6 +1590,19 @@ class HybridReqToTokenPool(ReqToTokenPool):
             ],
         )
 
+        # Optional pinned-RAM state-swap pool: parked (idle) requests keep
+        # their exact bf16 state here and give the active slot back, so
+        # logical concurrency can exceed the active pool.
+        from sglang.srt.mem_cache.mamba_swap_pool import (
+            maybe_init_mamba_state_swap_pool,
+        )
+
+        self.mamba_swap_pool = maybe_init_mamba_state_swap_pool(
+            mamba_pool=self.mamba_pool,
+            mamba_allocator=self.mamba_allocator,
+            device=device,
+        )
+
         self.device = device
         req_pool_size = self.req_to_token.shape[0]
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
@@ -1687,6 +1701,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
     @mamba_ckpt_pool.setter
     def mamba_ckpt_pool(self, value) -> None:
         self.state.ckpt_pool = value
+
+    @property
+    def mamba_swap_pool(self):
+        return self.state.swap_pool
+
+    @mamba_swap_pool.setter
+    def mamba_swap_pool(self, value) -> None:
+        self.state.swap_pool = value
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]

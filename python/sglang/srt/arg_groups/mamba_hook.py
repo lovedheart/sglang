@@ -130,6 +130,48 @@ def handle_int8_mamba_checkpoint(server_args: Any):
         )
 
 
+def handle_mamba_state_swap(server_args: Any):
+    cfg = resolving_view(server_args)
+    if not cfg.enable_mamba_state_swap:
+        if cfg.mamba_swap_size is not None:
+            raise ValueError("--mamba-swap-size requires --enable-mamba-state-swap.")
+        return
+    if cfg.mamba_swap_size is None or cfg.mamba_swap_size <= 0:
+        raise ValueError(
+            "--enable-mamba-state-swap requires a positive --mamba-swap-size "
+            "(number of pinned-RAM parked-state slots)."
+        )
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "--enable-mamba-state-swap is not supported together with "
+            "--enable-unified-memory: the unified pool keeps no separate "
+            "active-slot allocator to park into. Disable one of them."
+        )
+    if cfg.radix_cache_backend is not None:
+        raise ValueError(
+            "--enable-mamba-state-swap only supports the built-in mamba radix "
+            f"cache; --radix-cache-backend={cfg.radix_cache_backend!r} is not "
+            "swap-aware. Omit --radix-cache-backend."
+        )
+    if cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "--enable-mamba-state-swap is not supported with speculative "
+            "decoding: draft-state slots are not parked. Disable one of them."
+        )
+    if cfg.enable_linear_replayssm:
+        raise ValueError(
+            "--enable-mamba-state-swap is not supported with the ReplaySSM "
+            "ring buffers: park/wake round-trips raw state rows only. "
+            "Disable one of them."
+        )
+    if cfg.disaggregation_mode != "null":
+        raise ValueError(
+            "--enable-mamba-state-swap is not supported with PD "
+            "disaggregation (--disaggregation-mode="
+            f"{cfg.disaggregation_mode!r}). Disable one of them."
+        )
+
+
 def _platform_supports_mamba_cache_extra_buffer() -> bool:
     if current_platform.is_out_of_tree():
         return current_platform.support_mamba_cache_extra_buffer()

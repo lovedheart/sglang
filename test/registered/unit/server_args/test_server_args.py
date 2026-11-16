@@ -59,6 +59,7 @@ from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 from sglang.srt.arg_groups.mamba_hook import (
     handle_int8_mamba_checkpoint,
     handle_mamba_backend,
+    handle_mamba_state_swap,
 )
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
@@ -1543,6 +1544,46 @@ class TestInt8MambaCheckpointCompatibility(unittest.TestCase):
         """An inverted condition here would reject every unified launch."""
         handle_int8_mamba_checkpoint(
             ServerArgs(model_path="dummy", enable_unified_memory=True)
+        )
+
+
+class TestMambaStateSwapCompatibility(unittest.TestCase):
+    def test_requires_swap_size(self):
+        server_args = ServerArgs(model_path="dummy", enable_mamba_state_swap=True)
+        with self.assertRaisesRegex(ValueError, "--mamba-swap-size"):
+            handle_mamba_state_swap(server_args)
+
+    def test_rejects_size_without_flag(self):
+        server_args = ServerArgs(model_path="dummy", mamba_swap_size=4)
+        with self.assertRaisesRegex(ValueError, "--enable-mamba-state-swap"):
+            handle_mamba_state_swap(server_args)
+
+    def test_rejects_unified_memory(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_mamba_state_swap=True,
+            mamba_swap_size=4,
+            enable_unified_memory=True,
+        )
+        with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
+            handle_mamba_state_swap(server_args)
+
+    def test_rejects_speculative_decoding(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_mamba_state_swap=True,
+            mamba_swap_size=4,
+            speculative_algorithm="DFLASH",
+            speculative_draft_model_path="/local/draft",
+        )
+        with self.assertRaisesRegex(ValueError, "speculative"):
+            handle_mamba_state_swap(server_args)
+
+    def test_plain_pair_is_accepted(self):
+        handle_mamba_state_swap(
+            ServerArgs(
+                model_path="dummy", enable_mamba_state_swap=True, mamba_swap_size=4
+            )
         )
 
 

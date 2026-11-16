@@ -38,6 +38,7 @@ class StateStorage:
         short_conv_pool,
         ngram_pool,
         ckpt_pool=None,
+        swap_pool=None,
     ):
         self.sub_pool = sub_pool
         self.pool = pool
@@ -48,6 +49,9 @@ class StateStorage:
         self.short_conv_pool = short_conv_pool
         self.ngram_pool = ngram_pool
         self.ckpt_pool = ckpt_pool
+        # Pinned-RAM store for parked (swapped-out) recurrent states; set by
+        # the hybrid table once the swap pool is built.
+        self.swap_pool = swap_pool
 
     @classmethod
     def empty(cls, sub_pool: str) -> StateStorage:
