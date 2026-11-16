@@ -4815,6 +4815,13 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
+            # Price the admission before the match: on a split pool the match
+            # itself takes the slot as its copy-on-write destination.
+            needs_state_slot = state_slot_budget is not None and not req.kv.holds_mamba
+            if needs_state_slot and state_slot_budget <= 0:
+                # No active state slot for this admission; the swap rotation
+                # (or a finish) reopens one at the next step boundary.
+                break
             # On a shared memory the match takes no state slot: admission prices
             # it, and the slot is bound with the row. A request this pass leaves
             # queued drops the copy its match staged.
@@ -4837,19 +4844,7 @@ class Scheduler(
                     if defer_cow_slot:
                         self._drop_unadmitted_match(req)
                     continue
-            if (
-                state_slot_budget is not None
-                and not req.kv.holds_mamba
-                and state_slot_budget <= 0
-            ):
-                # No active state slot for this admission; the swap rotation
-                # (or a finish) reopens one at the next step boundary.
-                break
-            if (
-                state_slot_budget is not None
-                and not req.kv.holds_mamba
-                and state_slot_budget > 0
-            ):
+            if needs_state_slot:
                 state_slot_budget -= 1
             res = adder.add_one_req(
                 req,
