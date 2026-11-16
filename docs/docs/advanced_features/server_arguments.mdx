@@ -2108,7 +2108,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-mamba-state-swap`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Park running requests' exact bf16 recurrent states into pinned-RAM swap slots (rotating who holds an active GPU state slot) so <code>--max-running-requests</code> can exceed the active mamba pool; woken requests resume decode without re-prefill. Requires a positive <code>--mamba-swap-size</code> and <code>--disable-radix-cache</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Park running requests' exact bf16 recurrent states into pinned-RAM swap slots (rotating who holds an active GPU state slot) so <code>--max-running-requests</code> can exceed the active mamba pool; woken requests resume decode without re-prefill. Requires a positive <code>--mamba-swap-size</code> and <code>--disable-radix-cache</code>, or <code>--enable-int8-mamba-checkpoint</code> with <code>--mamba-radix-cache-strategy no_buffer</code> (parked requests must be able to release their whole active state footprint).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: bool</td>
     </tr>
