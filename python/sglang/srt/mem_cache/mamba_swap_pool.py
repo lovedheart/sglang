@@ -167,9 +167,12 @@ class MambaSwapPool:
                 (sibling, sibling.get_cpu_slots(idx)) for sibling in self._siblings
             ]
         else:
+            # Captured before entering the copy stream: the *caller's* current
+            # stream is a producer, not the copy stream itself.
+            producers = self._producers(order_streams)
             with torch.cuda.stream(self._copy_stream):
                 # Fence behind every stream that may still touch the row.
-                for stream in self._producers(order_streams):
+                for stream in producers:
                     self._copy_stream.wait_stream(stream)
                 self._copy_planes(cache, active_slot, swap_id, to_device=False)
                 # Sibling rows ride the retraction copy path, on the copy
@@ -186,7 +189,7 @@ class MambaSwapPool:
         if self._copy_stream is not None:
             # Order future writes to the row (a new owner's prefill) after
             # the D2H that still reads it (the promotion-release lesson).
-            for stream in self._producers(order_streams):
+            for stream in producers:
                 stream.wait_event(self._parked[swap_id].event)
 
         if self.mamba_allocator is not None:
@@ -214,14 +217,15 @@ class MambaSwapPool:
             self.free_ids.append(swap_id)
             return
         event = torch.cuda.Event()
+        producers = self._producers(order_streams)
         with torch.cuda.stream(self._copy_stream):
-            for stream in self._producers(order_streams):
+            for stream in producers:
                 self._copy_stream.wait_stream(stream)
             self._copy_planes(cache, active_slot, swap_id, to_device=True)
             for sibling, data in record.sibling_data:
                 sibling.load_cpu_slots(data, idx)
             event.record(self._copy_stream)
-        for stream in self._producers(order_streams):
+        for stream in producers:
             stream.wait_event(event)
         self.free_ids.append(swap_id)
 

@@ -1569,6 +1569,17 @@ class TestMambaStateSwapCompatibility(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
             handle_mamba_state_swap(server_args)
 
+    def test_rejects_spec_replayssm(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_mamba_state_swap=True,
+            mamba_swap_size=4,
+            disable_radix_cache=True,
+            enable_linear_replayssm_spec=True,
+        )
+        with self.assertRaisesRegex(ValueError, "ReplaySSM"):
+            handle_mamba_state_swap(server_args)
+
     def test_rejects_radix_cache_on(self):
         """v1 parked states cannot release ping-pong tracking slots, so the
         rotation needs the one-slot-per-request radix-off config."""

@@ -1398,6 +1398,12 @@ class Scheduler(
     def init_mamba_swap(self) -> None:
         """Virtual SSM slots: the park/wake rotation over the active mamba
         state pool, when a swap pool was built (see MambaSwapPool)."""
+        if self.mamba_parked_reqs is not None:
+            # Re-init (role switch): retire the old parked set first, or its
+            # swap slots never come back. The retirer funnels each through
+            # release_kv_cache, which drops the swap slot with the KV.
+            for req in list(self.mamba_parked_reqs):
+                self.request_retirer.abort(req, finished_reason=None)
         self.mamba_swap: Optional[MambaSwapScheduler] = None
         self.mamba_parked_reqs: Optional[IndexedReqList] = None
         swap_pool = self.req_to_token_pool.mamba_swap_pool
@@ -4727,6 +4733,15 @@ class Scheduler(
         mamba_allocator = self.token_to_kv_pool_allocator.state_slots
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        # Virtual SSM slots lift the max-running-vs-pool clamp, and this
+        # allocator does not charge prefill for state, so an admission here
+        # must budget a free active slot itself. The swap rotation frees at
+        # most one per step boundary, so waiting on it is progress, not full.
+        state_slot_budget = (
+            mamba_allocator.available_size()
+            if (self.mamba_swap is not None and mamba_allocator is not None)
+            else None
+        )
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # A parked chunk found no budget in this pass: admit no one ahead of it,
         # so no batch carries a chunked request it does not run.
@@ -4819,6 +4834,20 @@ class Scheduler(
                     if defer_cow_slot:
                         self._drop_unadmitted_match(req)
                     continue
+            if (
+                state_slot_budget is not None
+                and not req.kv.holds_mamba
+                and state_slot_budget <= 0
+            ):
+                # No active state slot for this admission; the swap rotation
+                # (or a finish) reopens one at the next step boundary.
+                break
+            if (
+                state_slot_budget is not None
+                and not req.kv.holds_mamba
+                and state_slot_budget > 0
+            ):
+                state_slot_budget -= 1
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

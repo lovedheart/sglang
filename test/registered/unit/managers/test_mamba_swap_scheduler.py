@@ -120,7 +120,7 @@ class TestMambaSwapRotation(unittest.TestCase):
         victim = next(iter(self.parked))
         self.assertIsNotNone(victim.kv.mamba_swap_id)
         self.assertIsNone(victim.kv.mamba_pool_idx)
-        self.assertTrue(self.swap.ledger_ok())
+        self.assertEqual(self.swap_pool.num_parked(), len(list(self.parked)))
 
     def test_parked_wakes_into_freed_capacity(self):
         batch = self._running_batch([self._req("r0"), self._req("r1")])

@@ -80,6 +80,15 @@ class MambaSwapScheduler:
         back into the decode batch. Called only at a step boundary."""
         self.step += 1
         free = self.state.slots.available_size()
+        logger.debug(
+            "mamba swap tick: step=%d parked=%d free=%d waiting=%d bs=%s swapfree=%d",
+            self.step,
+            len(self.parked_reqs),
+            free,
+            waiting_count,
+            running_batch.batch_size(),
+            self.swap_pool.available_size(),
+        )
         if len(self.parked_reqs) > 0 and free > 0:
             return [self._wake_next()]
         if (
@@ -112,6 +121,15 @@ class MambaSwapScheduler:
             return False
         if req.session is not None or req.beam_group is not None:
             return False
+        # Park/wake round-trips the main row only. Anything with state beyond
+        # that row (radix CoW source, deferred clear, ping-pong tracking) is
+        # not movable by this path; skip rather than silently discard it.
+        if (
+            req.kv.mamba_cow_src_index is not None
+            or req.kv.mamba_slot_clear_queue is not None
+            or req.kv.mamba_ping_pong_track_buffer is not None
+        ):
+            return False
         woken = req.kv.mamba_swap_woken_iter
         return woken < 0 or self.step - woken >= self.wake_quantum
 
@@ -131,7 +149,7 @@ class MambaSwapScheduler:
         running_batch.filter_batch(reqs_to_exclude=[req])
         running_batch.batch_is_full = False
         self.num_parks += 1
-        logger.info(
+        logger.debug(
             "mamba swap: parked %s (swap slot %d, freed active slot %d)",
             req.rid,
             swap_id,
@@ -155,12 +173,5 @@ class MambaSwapScheduler:
         self.table.req_index_to_mamba_index_mapping[req.kv.req_pool_idx] = int(slot[0])
         move([req], self.running_reqs)
         self.num_wakes += 1
-        logger.info("mamba swap: woke %s into active slot %d", req.rid, int(slot[0]))
+        logger.debug("mamba swap: woke %s into active slot %d", req.rid, int(slot[0]))
         return req
-
-    # ===== Accounting =====
-
-    def ledger_ok(self) -> bool:
-        """The swap tier's parked count must match the parked list exactly:
-        every swap slot is owned by exactly one live request."""
-        return self.swap_pool.num_parked() == len(self.parked_reqs)

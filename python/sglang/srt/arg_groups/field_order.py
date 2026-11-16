@@ -579,5 +579,12 @@ POSITIONAL_FIELD_ORDER = (
     "qsa_kv_offload_hot_blocks",
     "enable_int8_mamba_checkpoint_offload",
     "int8_mamba_ckpt_host_size",
+    "enable_mamba_state_swap",
+    "mamba_swap_size",
+    "lm_head_dtype",
+    "enable_nvfp4_draft_lm_head",
+    "enable_fp8_shared_expert",
+    "enable_fp8_shared_expert_mtp",
+    "enable_fp8_hc_mix",
 )
 # fmt: on

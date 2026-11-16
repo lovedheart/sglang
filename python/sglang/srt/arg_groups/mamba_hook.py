@@ -147,6 +147,12 @@ def handle_mamba_state_swap(server_args: Any):
             "--enable-unified-memory: the unified pool keeps no separate "
             "active-slot allocator to park into. Disable one of them."
         )
+    if cfg.radix_cache_backend is not None:
+        raise ValueError(
+            "--enable-mamba-state-swap only supports the built-in mamba radix "
+            f"cache; --radix-cache-backend={cfg.radix_cache_backend!r} is not "
+            "swap-aware. Omit --radix-cache-backend."
+        )
     if not cfg.disable_radix_cache:
         # v1 slot economics: a parked request releases its MAIN slot only;
         # a request holding extra ping-pong tracking slots (radix state
@@ -157,18 +163,12 @@ def handle_mamba_state_swap(server_args: Any):
             "--disable-radix-cache: parked requests must be able to release "
             "their whole active state footprint."
         )
-    if cfg.radix_cache_backend is not None:
-        raise ValueError(
-            "--enable-mamba-state-swap only supports the built-in mamba radix "
-            f"cache; --radix-cache-backend={cfg.radix_cache_backend!r} is not "
-            "swap-aware. Omit --radix-cache-backend."
-        )
     if cfg.speculative_algorithm is not None:
         raise ValueError(
             "--enable-mamba-state-swap is not supported with speculative "
             "decoding: draft-state slots are not parked. Disable one of them."
         )
-    if cfg.enable_linear_replayssm:
+    if cfg.enable_linear_replayssm or cfg.enable_linear_replayssm_spec:
         raise ValueError(
             "--enable-mamba-state-swap is not supported with the ReplaySSM "
             "ring buffers: park/wake round-trips raw state rows only. "

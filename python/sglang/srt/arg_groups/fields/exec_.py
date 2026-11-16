@@ -649,10 +649,11 @@ class ExecMamba(msgspec.Struct):
     ] = None
     enable_mamba_state_swap: A[
         bool,
-        "Park idle requests' exact bf16 recurrent states into pinned-RAM swap "
-        "slots (freeing their active GPU state slot) so max-running-requests can "
-        "exceed the active mamba pool; woken requests resume decode without "
-        "re-prefill. Requires a positive --mamba-swap-size.",
+        "Park running requests' exact bf16 recurrent states into pinned-RAM swap "
+        "slots (rotating who holds an active GPU state slot) so "
+        "max-running-requests can exceed the active mamba pool; woken requests "
+        "resume decode without re-prefill. Requires a positive --mamba-swap-size "
+        "and --disable-radix-cache.",
     ] = False
     mamba_swap_size: A[
         Optional[int],
