@@ -413,6 +413,18 @@ def draft_loc_space_scale(*, hf_config, use_mla_backend: bool, dcp_size: int) ->
     return dcp_size // execution_width
 
 
+def _swap_extra() -> int:
+    """Extra live requests the state-swap tier adds on top of pool // ratio.
+
+    Parked records hold zero active rows, so each buys one more live request
+    (and more spec-state scratch rows) regardless of its width; the
+    intermediate-buffer reservations and the concurrency cap must price them
+    identically (see resolve_max_num_reqs).
+    """
+    mamba = get_exec().mamba
+    return mamba.mamba_swap_size if mamba.enable_mamba_state_swap else 0
+
+
 @dataclass(slots=True, kw_only=True)
 class KVCacheConfigurator:
     device: str
@@ -3351,7 +3363,7 @@ class KVCacheConfigurator:
             # ratio active rows would under-admit exactly the
             # extra_buffer configs the tier exists for.
             mamba = get_exec().mamba
-            swap_size = _swap_extra()
+            swap_size = mamba.mamba_swap_size if mamba.enable_mamba_state_swap else 0
             mamba_cap = get_schedule().max_mamba_cache_size // ratio + swap_size
             if swap_size and not get_memory().disable_radix_cache:
                 logger.info(
@@ -3598,18 +3610,6 @@ class KVCacheConfigurator:
             else:
                 low = mid + 1
         return low * alignment
-
-
-def _swap_extra() -> int:
-    """Extra live requests the state-swap tier adds on top of pool // ratio.
-
-    Parked records hold zero active rows, so each buys one more live request
-    (and more spec-state scratch rows) regardless of its width; the
-    intermediate-buffer reservations and the concurrency cap must price them
-    identically (see resolve_max_num_reqs).
-    """
-    mamba = get_exec().mamba
-    return mamba.mamba_swap_size if mamba.enable_mamba_state_swap else 0
 
     def _handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
