@@ -77,22 +77,39 @@ class MambaSwapScheduler:
         # the idle spin between steps.
         self._debug_scan = envs.SGLANG_DEBUG_MEMORY_POOL.get()
 
-    def wants_park(self, running_batch: ScheduleBatch, waiting_count: int) -> bool:
-        """Whether the next tick would want to park AND can actually park:
-        the park-branch conditions plus a parkable victim. The overlap loop
-        calls this to decide early result processing — parking a victim
-        whose step result is still unprocessed would drop that step's
-        sampled token from its output (see _parkable) — so the commit must
-        land first; the victim check keeps permanently infeasible rotations
-        (session/beam sets, wake-quantum windows) from silently disabling
-        overlap for nothing. Must not mutate; unlike _select_victim it does
-        not advance the rotor."""
+    @property
+    def predicted_tick_step(self) -> int:
+        """The `step` value the next on_step_boundary will judge at (it
+        increments before rotating). The overlap handshake evaluates
+        wants_park at this step, so its prediction and the tick's own
+        _parkable share one step base without duplicating the +1."""
+        return self.step + 1
+
+    def wants_park(
+        self, running_batch: ScheduleBatch, waiting_count: int, *, at_step: int
+    ) -> bool:
+        """Whether a tick running at `at_step` would want to park AND could:
+        the park-branch conditions plus a durably eligible victim. The
+        overlap loop calls this (at ``predicted_tick_step``) to decide
+        early result processing — parking a victim whose step result is
+        still unprocessed would drop that step's sampled token from its
+        output (see _parkable) — so the commit must land first; the victim
+        check keeps permanently infeasible rotations (session/beam sets,
+        wake-quantum windows) from silently disabling overlap for nothing.
+        Must not mutate; unlike _select_victim it does not advance the
+        rotor. A real tick always increments once before judging, so the
+        prediction is exact; a cheap-idle early return (which increments
+        nothing) only makes the next prediction match again, and a stale
+        lower `at_step` could only over-restrict (extra wake-quantum
+        protection), never park a protected victim. ``at_step`` is
+        keyword-only: the wrong step base silently re-opens the
+        uncommitted-victim park."""
         return (
             waiting_count > 0
             and self.state.slots.available_size() == 0
             and running_batch.batch_size() >= 2
             and self.swap_pool.available_size() > 0
-            and any(self._parkable(r) for r in running_batch.reqs)
+            and any(self._victim_eligible(r, step=at_step) for r in running_batch.reqs)
         )
 
     def on_step_boundary(
@@ -127,7 +144,7 @@ class MambaSwapScheduler:
         if len(self.parked_reqs) > 0 and free > 0:
             woken = self._wake_next()
             return [woken] if woken is not None else []
-        if self.wants_park(running_batch, waiting_count):
+        if self.wants_park(running_batch, waiting_count, at_step=self.step):
             victim = self._select_victim(running_batch.reqs)
             if victim is not None:
                 self._park(running_batch, victim)
@@ -183,20 +200,12 @@ class MambaSwapScheduler:
             return req
         return None
 
-    def _parkable(self, req: Req) -> bool:
+    def _victim_eligible(self, req: Req, *, step: int) -> bool:
+        """Durable park eligibility: nothing here is fixed by committing
+        the in-flight step, so the overlap handshake (wants_park) and the
+        tick (_parkable) share it. Quantum expiry is judged at `step`,
+        which for wants_park is the step the consuming tick will run at."""
         if req.kv.mamba_pool_idx is None or req.kv.mamba_swap_id is not None:
-            return False
-        # Tripwire for the early-process handshake: a victim whose last
-        # launched step has no committed result would lose that step's
-        # sampled token (its row is skipped once it leaves the running
-        # list), and the parked record would hold the post-step state —
-        # waking would then re-feed a token the state already consumed.
-        if req.inflight_steps > 0:
-            return False
-        # A prefill merged in this very tick (overlap merges before its result
-        # finishes the reqs) has no processed output yet; waking it reads
-        # output_ids[-1] off an empty array. One processed token suffices.
-        if len(req.output_ids) == 0:
             return False
         if req.session is not None or req.beam_group is not None:
             return False
@@ -210,7 +219,16 @@ class MambaSwapScheduler:
         ):
             return False
         woken = req.kv.mamba_swap_woken_iter
-        return woken < 0 or self.step - woken >= self.wake_quantum
+        return woken < 0 or step - woken >= self.wake_quantum
+
+    def _parkable(self, req: Req) -> bool:
+        # Transient conditions the overlap handshake commits away: a
+        # merged-not-yet-finished prefill has no output yet, and a launched
+        # step with no committed result would lose that result if the row
+        # left the running list (the parked record would hold the post-step
+        # state, so wake would re-feed a token it already consumed).
+        transient_ok = req.inflight_steps == 0 and len(req.output_ids) > 0
+        return transient_ok and self._victim_eligible(req, step=self.step)
 
     def _park(self, running_batch: ScheduleBatch, req: Req) -> None:
         active_slot = int(req.kv.mamba_pool_idx.reshape(-1)[0])

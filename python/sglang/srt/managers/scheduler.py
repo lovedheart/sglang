@@ -2342,9 +2342,14 @@ class Scheduler(
         # skipped once the request moves to the parked list) and capture a
         # post-step state. Process the result early so the tick can park a
         # fully-committed victim; this only fires on ticks that wanted to
-        # park, which fence on the copy stream anyway.
+        # park, which fence on the copy stream anyway. The shared
+        # disagg-decode overlap loop never reaches this: the mamba arg hook
+        # rejects --enable-mamba-state-swap together with
+        # --disaggregation-mode, so self.mamba_swap is None on every PD node.
         if self.mamba_swap is not None and self.mamba_swap.wants_park(
-            self.running_batch, len(self.waiting_queue)
+            self.running_batch,
+            len(self.waiting_queue),
+            at_step=self.mamba_swap.predicted_tick_step,
         ):
             return True
 

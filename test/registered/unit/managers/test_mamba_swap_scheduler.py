@@ -230,7 +230,13 @@ class TestMambaSwapRotation(unittest.TestCase):
         reqs = [self._req("r0"), self._req("r1")]
         for req in reqs:
             req.inflight_steps = 1
-        self.swap.on_step_boundary(self._running_batch(reqs), waiting_count=1)
+        # The handshake must still fire (it commits the step away), but
+        # the tick itself must not park until the results land.
+        batch = self._running_batch(reqs)
+        self.assertTrue(
+            self.swap.wants_park(batch, waiting_count=1, at_step=self.swap.step)
+        )
+        self.swap.on_step_boundary(batch, waiting_count=1)
         self.assertEqual(len(self.parked), 0)
         # The early-process handshake commits r0's step: it parks next tick.
         reqs[0].inflight_steps = 0
@@ -243,17 +249,33 @@ class TestMambaSwapRotation(unittest.TestCase):
         # processing; it must agree with the tick's park precondition,
         # including whether any victim is parkable at all.
         batch = self._running_batch([self._req("r0"), self._req("r1")])
-        self.assertFalse(self.swap.wants_park(batch, waiting_count=0))
-        self.assertTrue(self.swap.wants_park(batch, waiting_count=1))
+        self.assertFalse(
+            self.swap.wants_park(batch, waiting_count=0, at_step=self.swap.step)
+        )
+        self.assertTrue(
+            self.swap.wants_park(batch, waiting_count=1, at_step=self.swap.step)
+        )
         # Nothing parkable (session states): overlap must stay enabled.
         for r in batch.reqs:
             r.session = object()
-        self.assertFalse(self.swap.wants_park(batch, waiting_count=1))
+        self.assertFalse(
+            self.swap.wants_park(batch, waiting_count=1, at_step=self.swap.step)
+        )
         for r in batch.reqs:
             r.session = None
         self.swap.on_step_boundary(batch, waiting_count=1)
         # A slot freed by the park: nothing more to park this tick.
-        self.assertFalse(self.swap.wants_park(batch, waiting_count=1))
+        self.assertFalse(
+            self.swap.wants_park(batch, waiting_count=1, at_step=self.swap.step)
+        )
+
+    def test_predicted_tick_step_matches_the_tick(self):
+        # wants_park(at_step=predicted_tick_step) must denote exactly the
+        # step the next on_step_boundary judges at: one increment per tick.
+        predicted = self.swap.predicted_tick_step
+        batch = self._running_batch([self._req("r0"), self._req("r1")])
+        self.swap.on_step_boundary(batch, waiting_count=1)
+        self.assertEqual(self.swap.step, predicted)
 
     def test_wake_is_graceful_when_the_slot_vanishes(self):
         # F13: a same-tick retire may consume the free slot between the
