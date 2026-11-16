@@ -77,6 +77,19 @@ class MambaSwapScheduler:
         # the idle spin between steps.
         self._debug_scan = envs.SGLANG_DEBUG_MEMORY_POOL.get()
 
+    def wants_park(self, running_batch: ScheduleBatch, waiting_count: int) -> bool:
+        """Whether the next tick would want to park: the conditions of the
+        park branch, evaluated cheaply. The overlap loop asks this before
+        scheduling so the in-flight decode step gets committed first —
+        parking a victim whose step result is still unprocessed would drop
+        that step's sampled token from its output (see _parkable)."""
+        return (
+            waiting_count > 0
+            and self.state.slots.available_size() == 0
+            and running_batch.batch_size() >= 2
+            and self.swap_pool.available_size() > 0
+        )
+
     def on_step_boundary(
         self, running_batch: ScheduleBatch, *, waiting_count: int
     ) -> List[Req]:
@@ -109,12 +122,7 @@ class MambaSwapScheduler:
         if len(self.parked_reqs) > 0 and free > 0:
             woken = self._wake_next()
             return [woken] if woken is not None else []
-        if (
-            waiting_count > 0
-            and free == 0
-            and running_batch.batch_size() >= 2
-            and self.swap_pool.available_size() > 0
-        ):
+        if self.wants_park(running_batch, waiting_count):
             victim = self._select_victim(running_batch.reqs)
             if victim is not None:
                 self._park(running_batch, victim)
@@ -172,6 +180,13 @@ class MambaSwapScheduler:
 
     def _parkable(self, req: Req) -> bool:
         if req.kv.mamba_pool_idx is None or req.kv.mamba_swap_id is not None:
+            return False
+        # Tripwire for the early-process handshake: a victim whose last
+        # launched step has no committed result would lose that step's
+        # sampled token (its row is skipped once it leaves the running
+        # list), and the parked record would hold the post-step state —
+        # waking would then re-feed a token the state already consumed.
+        if req.inflight_steps > 0:
             return False
         # A prefill merged in this very tick (overlap merges before its result
         # finishes the reqs) has no processed output yet; waking it reads

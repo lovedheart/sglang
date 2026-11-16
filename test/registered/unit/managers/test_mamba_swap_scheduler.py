@@ -38,6 +38,9 @@ class _FakeReq:
     # Class attribute: only move()/the retirer set instance ownership, and the
     # list-edit audit forbids owner_list assignments outside those modules.
     owner_list = None
+    # Committed-by-default: a launched-but-unprocessed step sets this on the
+    # real Req; tests raise it to model the overlap in-flight case.
+    inflight_steps = 0
 
     def __init__(self, rid):
         self.rid = rid
@@ -218,6 +221,32 @@ class TestMambaSwapRotation(unittest.TestCase):
         reqs[0].output_ids = [7]
         self.swap.on_step_boundary(self._running_batch(reqs), waiting_count=1)
         self.assertEqual(len(self.parked), 1)
+
+    def test_inflight_step_is_not_parkable(self):
+        # Overlap may leave a victim's last decode step launched but
+        # uncommitted: parking then drops that row's sampled token (the
+        # result skips rows that left the running list) and captures a
+        # post-step state, so wake would re-feed a consumed token.
+        reqs = [self._req("r0"), self._req("r1")]
+        for req in reqs:
+            req.inflight_steps = 1
+        self.swap.on_step_boundary(self._running_batch(reqs), waiting_count=1)
+        self.assertEqual(len(self.parked), 0)
+        # The early-process handshake commits r0's step: it parks next tick.
+        reqs[0].inflight_steps = 0
+        self.swap.on_step_boundary(self._running_batch(reqs), waiting_count=1)
+        self.assertEqual(len(self.parked), 1)
+        self.assertIs(next(iter(self.parked)), reqs[0])
+
+    def test_wants_park_tracks_the_park_branch(self):
+        # The overlap loop calls wants_park to decide early result
+        # processing; it must agree with the tick's park precondition.
+        batch = self._running_batch([self._req("r0"), self._req("r1")])
+        self.assertFalse(self.swap.wants_park(batch, waiting_count=0))
+        self.assertTrue(self.swap.wants_park(batch, waiting_count=1))
+        self.swap.on_step_boundary(batch, waiting_count=1)
+        # A slot freed by the park: nothing more to park this tick.
+        self.assertFalse(self.swap.wants_park(batch, waiting_count=1))
 
     def test_wake_is_graceful_when_the_slot_vanishes(self):
         # F13: a same-tick retire may consume the free slot between the

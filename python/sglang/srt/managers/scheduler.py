@@ -2334,7 +2334,21 @@ class Scheduler(
                 return True
 
         # The next batch's grammar bitmask needs this result's FSM advance.
-        return last_batch.grammar_needs_sync()
+        if last_batch.grammar_needs_sync():
+            return True
+
+        # Mamba state swap: parking a victim whose decode step is still
+        # in flight would drop that step's committed output (its row is
+        # skipped once the request moves to the parked list) and capture a
+        # post-step state. Process the result early so the tick can park a
+        # fully-committed victim; this only fires on ticks that wanted to
+        # park, which fence on the copy stream anyway.
+        if self.mamba_swap is not None and self.mamba_swap.wants_park(
+            self.running_batch, len(self.waiting_queue)
+        ):
+            return True
+
+        return False
 
     def _advance_pending_grammar(self):
         """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet
