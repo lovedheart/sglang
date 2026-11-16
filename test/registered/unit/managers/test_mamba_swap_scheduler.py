@@ -489,6 +489,23 @@ class TestMambaSwapTrackedRotation(unittest.TestCase):
         # same track row; the forward-path drain dedups the same way.
         self.assertEqual(sorted(self.cleared[0].tolist()), [track_row, track_row])
 
+    def test_park_triggers_on_unaffordable_residue(self):
+        # V2.5: rotation must engage when an admission cannot be priced,
+        # not only when the pool reads empty — a sub-footprint residue
+        # (1 free row vs a 2-row record) still starves the queue.
+        r0 = self._tracked_req("p0")  # 2 rows
+        r1 = _FakeReq("p1")
+        r1.kv.req_pool_idx = 5
+        r1.kv.mamba_pool_idx = self.slots.alloc(1)[0]  # leaves free == 1
+        move([r1], self.running_reqs)
+        batch = _FakeRunningBatch([r0, r1])
+        self.assertEqual(self.slots.available_size(), 1)
+        self.assertTrue(
+            self.swap.wants_park(batch, 1, at_step=self.swap.predicted_tick_step)
+        )
+        self.swap.on_step_boundary(batch, waiting_count=1)
+        self.assertEqual(len(self.parked), 1)
+
     def test_wake_first_fit_skips_a_too_wide_record(self):
         # M3 (ocr): with variable-width records the longest-parked record
         # may not fit the currently free rows; wake must reach past it to

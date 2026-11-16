@@ -105,10 +105,21 @@ class MambaSwapScheduler:
         lower `at_step` could only over-restrict (extra wake-quantum
         protection), never park a protected victim. ``at_step`` is
         keyword-only: the wrong step base silently re-opens the
-        uncommitted-victim park."""
+        uncommitted-victim park.
+        """
+        # Starved means no waiting admission can be priced, not merely that
+        # a row is free: with multi-row records (V2.5) a sub-footprint
+        # residue must still trigger the rotation (the admission budget
+        # refuses to overspend it, mirroring this predicate). The
+        # rows_per_record bound is conservative for lazy, which can also
+        # price smaller admissions — an over-restricting direction for the
+        # handshake, and at worst one no-op park attempt for the tick.
+        unaffordable = (
+            self.state.slots.available_size() < self.swap_pool.rows_per_record
+        )
         return (
             waiting_count > 0
-            and self.state.slots.available_size() == 0
+            and unaffordable
             and running_batch.batch_size() >= 2
             and self.swap_pool.available_size() > 0
             and any(self._victim_eligible(r, step=at_step) for r in running_batch.reqs)
@@ -145,7 +156,12 @@ class MambaSwapScheduler:
         )
         if len(self.parked_reqs) > 0 and free > 0:
             woken = self._wake_next()
-            return [woken] if woken is not None else []
+            if woken is not None:
+                return [woken]
+            # Nothing fit (V2.5 multi-row records): fall through to the
+            # park branch — parking a running victim frees the extra rows
+            # a wake needs. With 1-row records a free slot always fits a
+            # wake, so this path only exists since V2.5.
         if self.wants_park(running_batch, waiting_count, at_step=self.step):
             victim = self._select_victim(running_batch.reqs)
             if victim is not None:
@@ -384,5 +400,5 @@ class MambaSwapScheduler:
         req.kv.mamba_swap_track_positions = None
         move([req], self.running_reqs)
         self.num_wakes += 1
-        logger.debug("mamba swap: woke %s into active slots %s", req.rid, slot.tolist())
+        logger.debug("mamba swap: woke %s into %d active rows", req.rid, n)
         return req
