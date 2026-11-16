@@ -263,6 +263,10 @@ class MambaCheckpointPool:
         # here are waited on by load_to_active before the dequantize.
         self._copy_stream = None
         self._staging_busy_event = None
+        # GPU slots owned by RAM->GPU promotions: (slot, H2D event). A slot
+        # stays owned until load_to_active consumes it (or a drop site calls
+        # release_promotion); an event retiring does NOT free it, because the
+        # consumer may still reference it as its COW source.
         self._pending_promotions: list[tuple[int, object]] = []
         if host_slots > 0:
             self._build_host_tier(
@@ -342,7 +346,6 @@ class MambaCheckpointPool:
     # ---- lifecycle (delegates to the embedded allocator) ----
 
     def alloc(self, n: int = 1):
-        self._drain_promotions()
         return self.allocator.alloc(n)
 
     def free(self, slots: torch.Tensor):
@@ -358,17 +361,22 @@ class MambaCheckpointPool:
         return len(self.allocator.free_host_slots)
 
     def num_pending_promotions(self) -> int:
-        """GPU slots held by in-flight RAM->GPU promotions (uncached until
-        their event retires and the drain frees them)."""
+        """GPU slots owned by RAM->GPU promotions not yet consumed by
+        load_to_active (the pool's uncached occupancy)."""
         return len(self._pending_promotions)
 
-    def _drain_promotions(self) -> None:
-        """Return promoted GPU slots whose H2D has completed."""
+    def release_promotion(self, slot_id: int) -> None:
+        """Give back a promoted GPU slot the requester abandoned before its
+        load (no-op for ids the pool does not own)."""
+        self._release_promoted_slots([slot_id])
+
+    def _release_promoted_slots(self, slot_ids) -> None:
         if not self._pending_promotions:
             return
+        wanted = set(slot_ids)
         still_pending = []
         for slot, event in self._pending_promotions:
-            if event is None or event.query():
+            if slot in wanted:
                 self.allocator.free(
                     torch.tensor(
                         [slot], dtype=torch.int64, device=self.allocator.device
@@ -382,6 +390,11 @@ class MambaCheckpointPool:
         """Release every checkpoint slot of both tiers (radix flush/reset) and
         drop pending-transfer bookkeeping. The int8 qdata is left as-is; slots
         are reused/overwritten on the next store."""
+        if self._copy_stream is not None:
+            # In-flight D2H/H2D may still read/write the staging and promoted
+            # rows; drain the copy stream before those rows re-enter the free
+            # lists. Flush runs at request idle, so this wait is cheap.
+            self._copy_stream.synchronize()
         self._pending_promotions = []
         self._staging_busy_event = None
         self.allocator.clear()
@@ -394,6 +407,7 @@ class MambaCheckpointPool:
         GPU staging row and D2H-copies the int8 planes unchanged; the RAM slot is
         safe to publish because every later reader chains on the pool copy
         stream."""
+        assert ckpt_slots.numel() == 1, "one checkpoint per store"
         ckpt_id = int(ckpt_slots.reshape(-1)[0].item())
         if self.host_slots > 0 and ckpt_id > self.num_slots:
             self._store_to_host(active_mamba_pool, active_slots, ckpt_id)
@@ -423,9 +437,13 @@ class MambaCheckpointPool:
             # CPU/mock pools: plain copies, already complete.
             self._copy_staging_to_host(self.host_row(host_logical))
             return
+        # Capture the producing (compute) stream OUTSIDE the context below:
+        # inside it, current_stream() is the copy stream and the wait would
+        # self-order (no-op), letting the D2H race the quantize kernels.
+        producer = torch.cuda.current_stream()
         self._staging_busy_event = torch.cuda.Event()
         with torch.cuda.stream(self._copy_stream):
-            self._copy_stream.wait_stream(torch.cuda.current_stream())
+            self._copy_stream.wait_stream(producer)
             self._copy_staging_to_host(self.host_row(host_logical))
             self._staging_busy_event.record(self._copy_stream)
 
@@ -445,12 +463,14 @@ class MambaCheckpointPool:
         for hc, c in zip(self.host_conv, self.conv):
             hc[:, h_row].copy_(c[:, self.staging_row], non_blocking=True)
         for (hm, dim), (m, _, _) in zip(self.host_sides, self.sides):
-            hm.index_copy_(dim, host_idx, m.index_select(dim, staging.to(m.device)))
+            # index_copy_ wants same-device value; stage through the GPU copy
+            # first, then move the selected rows across the device boundary.
+            rows = m.index_select(dim, staging.to(m.device))
+            hm.index_copy_(dim, host_idx, rows.to(hm.device, non_blocking=True))
 
     def alloc_device_slot(self) -> Optional[torch.Tensor]:
         """One GPU-tier checkpoint id, or None: promotions must land on the
         GPU tier, so they never fall through to the RAM tier."""
-        self._drain_promotions()
         if self.allocator.free_slots.numel() == 0:
             return None
         slot = self.allocator.free_slots[-1:]
@@ -461,7 +481,10 @@ class MambaCheckpointPool:
         """Copy one RAM checkpoint into a GPU checkpoint slot (async H2D on the
         pool copy stream). The caller owns ``device_logical`` (taken from the
         GPU tier); ``load_to_active`` waits the recorded event before
-        dequantizing it, and the slot returns to the free list once done."""
+        dequantizing it and then releases the slot. Until that consumption the
+        pool owns the slot: it is NOT on any free list, so neither a later
+        promote nor a checkpoint commit can overwrite a row a request still
+        references as its COW source."""
         assert self.is_host_slot(host_logical), (
             f"promote() wants a RAM checkpoint id, got {host_logical}"
         )
@@ -473,9 +496,13 @@ class MambaCheckpointPool:
             self._copy_host_to_device(h_row, device_logical)
             self._pending_promotions.append((device_logical, None))
             return
+        # Order the H2D after every compute-stream read of the destination row
+        # enqueued so far; capture outside the context (inside it the current
+        # stream is the copy stream itself).
+        compute = torch.cuda.current_stream()
         event = torch.cuda.Event()
         with torch.cuda.stream(self._copy_stream):
-            self._copy_stream.wait_stream(torch.cuda.current_stream())
+            self._copy_stream.wait_stream(compute)
             self._copy_host_to_device(h_row, device_logical)
             event.record(self._copy_stream)
         self._pending_promotions.append((device_logical, event))
@@ -488,13 +515,15 @@ class MambaCheckpointPool:
         for c, hc in zip(self.conv, self.host_conv):
             c[:, gpu_id].copy_(hc[:, h_row], non_blocking=True)
         for (hm, dim), (m, _, _) in zip(self.host_sides, self.sides):
-            # index_copy_/index_select want indices on the tensor's own device.
+            # index_copy_/index_select want indices on the tensor's own device;
+            # the VALUE must also be same-device, so move the selected row.
+            rows = hm.index_select(
+                dim, torch.tensor([h_row], dtype=torch.int64, device=hm.device)
+            )
             m.index_copy_(
                 dim,
                 torch.tensor([gpu_id], dtype=torch.int64, device=m.device),
-                hm.index_select(
-                    dim, torch.tensor([h_row], dtype=torch.int64, device=hm.device)
-                ),
+                rows.to(m.device, non_blocking=True),
             )
 
     def load_to_active(self, active_mamba_pool, ckpt_slots, active_slots) -> None:
@@ -502,28 +531,38 @@ class MambaCheckpointPool:
         active pool (the cache-hit copy-on-write). RAM checkpoints must be
         promoted first; promoted slots wait their H2D event (stream-ordered)."""
         ids = ckpt_slots.reshape(-1)
-        assert self.host_slots == 0 or bool((ids <= self.num_slots).all()), (
-            "load_to_active got a RAM checkpoint id; promote it to a GPU "
-            "checkpoint first"
-        )
-        self._wait_promotions(ckpt_slots)
+        id_list = None
+        if self.host_slots or self._pending_promotions:
+            # Only tiered pools can hand out a RAM id, and only a tiered pool
+            # has promotions to wait/release; pay the one value read there.
+            id_list = ids.tolist()
+            if self.host_slots and any(i > self.num_slots for i in id_list):
+                raise ValueError(
+                    "load_to_active got a RAM checkpoint id; promote it to a "
+                    f"GPU checkpoint first (ids={id_list}, GPU tier={self.num_slots})"
+                )
+        self._wait_promotions(id_list)
         cache = active_mamba_pool.mamba_cache
         self.temporal.copy_to_pool(cache.temporal, ckpt_slots, active_slots)
         for i, c in enumerate(self.conv):
             cache.conv[i][:, active_slots] = c[:, ckpt_slots].to(cache.conv[i].dtype)
         for mirror, src, dim in self.sides:
             src.index_copy_(dim, active_slots, mirror.index_select(dim, ckpt_slots))
+        if id_list is not None:
+            # The reads above are now enqueued on this stream: return any
+            # promoted source slots to the allocator. Future writers order
+            # after these reads (same stream, or the copy stream's captured
+            # wait at the next promote/store).
+            self._release_promoted_slots(id_list)
 
-    def _wait_promotions(self, ckpt_slots: torch.Tensor) -> None:
-        """Order the forward stream after any in-flight H2D of the source slots."""
-        if not self._pending_promotions or self._copy_stream is None:
+    def _wait_promotions(self, id_list: Optional[list]) -> None:
+        """Order the forward stream after in-flight H2Ds of the requested slots."""
+        if not self._pending_promotions or self._copy_stream is None or not id_list:
             return
-        promoted = {slot for slot, _ in self._pending_promotions}
-        if not any(int(s) in promoted for s in ckpt_slots.reshape(-1).tolist()):
-            return
+        wanted = set(id_list)
         stream = torch.cuda.current_stream()
         for slot, event in self._pending_promotions:
-            if slot in promoted and event is not None:
+            if slot in wanted and event is not None:
                 stream.wait_event(event)
 
     @staticmethod
@@ -630,7 +669,13 @@ def maybe_init_int8_mamba_checkpoint_pool(
     host_slots = 0
     host_bytes = 0
     if offload:
-        host_slots = int(mamba.int8_mamba_ckpt_host_size)
+        raw_host = mamba.int8_mamba_ckpt_host_size
+        if not raw_host or int(raw_host) <= 0:
+            raise RuntimeError(
+                "--int8-mamba-ckpt-host-size must be a positive number of RAM "
+                f"tier slots (got {raw_host})."
+            )
+        host_slots = int(raw_host)
         host_bytes = host_slots * est["per_row"]
     free_bytes = None
     if isinstance(device, str) and device.startswith("cuda"):
@@ -659,18 +704,17 @@ def maybe_init_int8_mamba_checkpoint_pool(
             f"(currently {ckpt_size}) or --mem-fraction-static."
         )
     if offload:
-        if host_slots <= 0:
-            raise RuntimeError(
-                "--int8-mamba-ckpt-host-size must be a positive number of RAM "
-                f"tier slots (got {mamba.int8_mamba_ckpt_host_size})."
-            )
-        import psutil
+        from sglang.srt.mem_cache.host_memory import host_memory_headroom_bytes
+        from sglang.srt.mem_cache.pool_host.base import ranks_per_host
 
-        free_host = psutil.virtual_memory().available
+        # Cgroup-aware allocatable RAM, divided by the ranks sharing this
+        # host: every rank sizes its own tier from the same machine budget.
+        free_host = host_memory_headroom_bytes() // max(1, ranks_per_host())
         if host_bytes >= free_host:
             raise RuntimeError(
                 f"int8 mamba checkpoint RAM tier needs ~{host_bytes / GB:.2f}GB "
-                f"pinned but only {free_host / GB:.2f}GB RAM is free. Lower "
+                f"pinned but only {free_host / GB:.2f}GB RAM is allocatable "
+                f"per rank ({ranks_per_host()} rank(s) per host). Lower "
                 f"--int8-mamba-ckpt-host-size (currently "
                 f"{mamba.int8_mamba_ckpt_host_size})."
             )

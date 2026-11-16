@@ -386,7 +386,8 @@ def int8_ckpt_offload() -> bool:
     """
     mamba = get_exec().mamba
     return bool(
-        mamba.enable_int8_mamba_checkpoint and mamba.enable_int8_mamba_checkpoint_offload
+        mamba.enable_int8_mamba_checkpoint
+        and mamba.enable_int8_mamba_checkpoint_offload
     )
 
 

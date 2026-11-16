@@ -220,7 +220,11 @@ class MambaComponent(TreeComponent):
                     self._cost_mark_used(node)
                 elif cd.host_value is not None and self._ckpt_host_tier():
                     # A RAM-checkpoint hit: keep it hot in the RAM tier's LRU.
-                    self.tree_core.host_lru_lists[ct].reset_node_mru(node)
+                    # An admitted match's host lock DELISTED the node, so the
+                    # refresh must not assume membership.
+                    host_lru = self.tree_core.host_lru_lists[ct]
+                    if host_lru.in_list(node):
+                        host_lru.reset_node_mru(node)
             case LRURefreshPhase.INSERT_END:
                 return
             case _:
@@ -492,9 +496,19 @@ class MambaComponent(TreeComponent):
             self._emit_excess_path_states_eviction(node, cache_actions)
             return
         if node.component_data[self.component_type].value is None:
+            cd = node.component_data[self.component_type]
+            superseded_host = cd.host_value if self._ckpt_host_tier() else None
             self.tree_core.set_component_device_value(
                 node.id, self.component_type, params.mamba_value
             )
+            if superseded_host is not None:
+                # The node's checkpoint lived in a RAM slot; the device
+                # commit supersedes it. Without this the RAM slot leaves the
+                # LRUs (host LRU exit happens in set_component_device_value)
+                # while still allocated and ledgered: permanently stuck
+                # occupancy invisible to evict_host.
+                self.free_host_values([superseded_host])
+                cd.host_value = None
             node.last_access_time = get_and_increase_time_counter()
             self._cost_mark_used(node)
             self._cost_forget_gains(node)
@@ -1017,14 +1031,11 @@ class MambaComponent(TreeComponent):
         ckpt_slot = self._alloc_int8_ckpt_slot()
         storage, sub_pool = self._state()
         pool = storage.checkpoint_pool(sub_pool)
-        is_ram = pool.is_host_slot(int(ckpt_slot.reshape(-1)[0].item()))
-        if is_ram:
+        ckpt_id = int(ckpt_slot.reshape(-1)[0].item())
+        if pool.is_host_slot(ckpt_id):
             self._ram_ckpts_issued += 1
             insert_params.mamba_host_value = ckpt_slot
-            logger.debug(
-                "int8 checkpoint spilled to RAM slot %d",
-                int(ckpt_slot.reshape(-1)[0].item()),
-            )
+            logger.debug("int8 checkpoint spilled to RAM slot %d", ckpt_id)
         else:
             insert_params.mamba_value = ckpt_slot
         storage.store_checkpoint(sub_pool, active_slots, ckpt_slot)
@@ -1284,6 +1295,12 @@ class MambaComponent(TreeComponent):
         # A loaded state supersedes the replay cursor and the deferred CoW/clear.
         storage, sub_pool = self._state()
         storage.restart_replay(sub_pool, req.kv.mamba_pool_idx.unsqueeze(0))
+        if req.kv.mamba_cow_src_index is not None:
+            # The COW will not run: hand back a promoted slot if that was the
+            # source (no-op for tree-owned sources).
+            pool = storage.checkpoint_pool(sub_pool)
+            if pool is not None:
+                pool.release_promotion(int(req.kv.mamba_cow_src_index.reshape(-1)[0]))
         req.kv.mamba_cow_src_index = None
         req.kv.mamba_needs_clear = False
 
@@ -1584,7 +1601,7 @@ class MambaComponent(TreeComponent):
             # not the HiCache host pool group.
             storage, sub_pool = self._state()
             for host_value in host_values:
-                self._ram_ckpts_issued -= 1
+                self._ram_ckpts_issued -= host_value.numel()
                 storage.free_checkpoints(sub_pool, host_value)
             return
         if self._mamba_pool_host is None:

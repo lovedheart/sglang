@@ -77,6 +77,15 @@ def handle_int8_mamba_checkpoint(server_args: Any):
     # checkpoint slots as bf16 active slots (wrong pool / out-of-range).
     # Reject the combination up front rather than silently corrupting state.
     cfg = resolving_view(server_args)
+    if not cfg.enable_int8_mamba_checkpoint and (
+        cfg.enable_int8_mamba_checkpoint_offload
+        or cfg.int8_mamba_ckpt_host_size is not None
+    ):
+        raise ValueError(
+            "--enable-int8-mamba-checkpoint-offload / "
+            "--int8-mamba-ckpt-host-size require --enable-int8-mamba-checkpoint: "
+            "the RAM tier is an extension of the int8 checkpoint pool."
+        )
     if not cfg.enable_int8_mamba_checkpoint:
         return
     if cfg.enable_hierarchical_cache:

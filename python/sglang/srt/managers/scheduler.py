@@ -4499,6 +4499,15 @@ class Scheduler(
         """Undo what the prefix match staged for a request this pass does not admit."""
         # init_next_round_input() may stage deferred Mamba COW/clear metadata,
         # and take a state slot a session does not own.
+        if req.kv.mamba_cow_src_index is not None:
+            ckpt_pool = self.token_to_kv_pool_allocator.state.ckpt_pool
+            if ckpt_pool is not None:
+                # A promoted RAM-checkpoint slot is pool-owned until the COW
+                # consumes it; an abandoned match must return it (no-op for
+                # tree-owned sources).
+                ckpt_pool.release_promotion(
+                    int(req.kv.mamba_cow_src_index.reshape(-1)[0])
+                )
         req.kv.mamba_cow_src_index = None
         req.kv.mamba_needs_clear = False
         if req.kv.holds_mamba and req.session is None:

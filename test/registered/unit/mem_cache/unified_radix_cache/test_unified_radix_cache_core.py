@@ -2025,7 +2025,10 @@ class TestUnifiedRadixCacheInt8MambaCkptOffload(
                 self.assertTrue(1 <= src <= ckpt.num_slots)
                 self.assertEqual(ckpt.num_pending_promotions(), 1)
                 pool.free(req2)
-                ckpt._drain_promotions()
+                # The fixture never forwards req2: releasing its abandoned
+                # promotion is what _drop_unadmitted_match does at runtime.
+                ckpt.release_promotion(src)
+                self.assertEqual(ckpt.num_pending_promotions(), 0)
                 cache.sanity_check()
 
                 # Soak past total (GPU + RAM) capacity: inserts keep evicting

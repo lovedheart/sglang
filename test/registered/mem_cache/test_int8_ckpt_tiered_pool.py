@@ -15,7 +15,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.mamba_checkpoint_pool import MambaCheckpointPool
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -153,9 +152,12 @@ class TestTieredCheckpointPool(unittest.TestCase):
         self.assertEqual(gpu_slot.item(), 3)
         pool.promote(9, 3)
         self.assertEqual(pool.num_pending_promotions(), 1)
+        # The promoted slot is pool-owned while a consumer may read it: it is
+        # NOT on the free list even though its transfer is complete on CPU.
+        self.assertNotIn(3, pool.allocator.free_slots.tolist())
         with self.assertRaises(AssertionError):
             pool.promote(3, 9)  # wrong tiers
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             pool.load_to_active(active, host_id, torch.tensor([4]))
 
         out = _active_pool()
@@ -163,10 +165,23 @@ class TestTieredCheckpointPool(unittest.TestCase):
         rel = ((out.mamba_cache.temporal[:, 5] - src).norm() / src.norm()).item()
         self.assertLess(rel, 1e-2)
 
-        # The promoted slot returns to the allocator once the transfer drains.
-        pool._drain_promotions()
+        # Consumption (load_to_active) returns the promoted slot.
         self.assertEqual(pool.num_pending_promotions(), 0)
         self.assertIn(3, pool.allocator.free_slots.tolist())
+
+    def test_zero_alloc_returns_empty(self):
+        alloc = MambaSlotAllocator(2, "cpu", host_slots=1)
+        self.assertEqual(alloc.alloc(0).numel(), 0)
+
+    def test_abandoned_promotion_releases_the_slot(self):
+        pool = self._pool(host_slots=4)
+        gpu_slot = pool.alloc_device_slot()
+        pool.promote(9, int(gpu_slot.item()))
+        pool.release_promotion(int(gpu_slot.item()))
+        self.assertEqual(pool.num_pending_promotions(), 0)
+        self.assertIn(int(gpu_slot.item()), pool.allocator.free_slots.tolist())
+        # No-op for ids the pool never promoted.
+        pool.release_promotion(12345)
 
     def test_two_ram_stores_do_not_clobber_the_staging_row(self):
         pool = self._pool(host_slots=4)
@@ -211,3 +226,80 @@ class TestTieredCheckpointPool(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA-only legs")
+class TestTieredPoolOnCuda(unittest.TestCase):
+    """Covers what the CPU suite structurally cannot: the pool copy stream
+    and the cross-device VALUE moves of the side-state mirrors (a CPU-host
+    row copied straight into a CUDA index_copy_ raises)."""
+
+    def setUp(self):
+        # No pinned registration in CI: a leaked cudaHostRegister range
+        # poisons later HiCache host pools on shared GPU boxes.
+        patcher = mock.patch.object(
+            MambaCheckpointPool,
+            "_alloc_host",
+            lambda self, shape, dtype: torch.empty(shape, dtype=dtype, device="cpu"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_spill_and_promote_move_side_states(self):
+        side_src = torch.zeros(10, L, 3, dtype=torch.float32).cuda()
+        pool = MambaCheckpointPool(
+            device="cuda",
+            **_pool_kwargs(num_slots=2, host_slots=2, side_states=[(side_src, 0)]),
+        )
+        temporal = torch.zeros(L, 10, H, V, K, dtype=torch.bfloat16, device="cuda")
+        conv = [torch.zeros(L, 10, *CONV_SHAPE, dtype=torch.bfloat16, device="cuda")]
+        active = SimpleNamespace(
+            mamba_cache=SimpleNamespace(temporal=temporal, conv=conv)
+        )
+        state = torch.randn(L, H, V, K, dtype=torch.bfloat16, device="cuda") * 6e-2
+        side = torch.randn(3, device="cuda")
+        active.mamba_cache.temporal[:, 1] = state
+        side_src[1] = side
+        cuda_i = lambda *v: torch.tensor(list(v), dtype=torch.int64, device="cuda")
+
+        # Spill: active slot 1 -> RAM id 3 (GPU tier has 2 slots).
+        pool.store_from_active(active, cuda_i(1), cuda_i(3))
+        gpu = pool.alloc_device_slot()
+        self.assertIsNotNone(gpu)
+        pool.promote(3, int(gpu.item()))
+
+        out = torch.zeros(L, 5, H, V, K, dtype=torch.bfloat16, device="cuda")
+        out_conv = [torch.zeros(L, 5, *CONV_SHAPE, dtype=torch.bfloat16, device="cuda")]
+        dst_pool = SimpleNamespace(
+            mamba_cache=SimpleNamespace(temporal=out, conv=out_conv)
+        )
+        pool.load_to_active(dst_pool, cuda_i(int(gpu.item())), cuda_i(2))
+        torch.cuda.synchronize()
+        rel = ((out[:, 2] - state).norm() / state.norm()).item()
+        self.assertLess(rel, 1e-2)
+        # The side mirror survived both tier crossings (D2H then H2D).
+        self.assertTrue(torch.allclose(side_src[2], side, atol=1e-6))
+        # Consumed: the promoted GPU slot is free again, and the RAM row the
+        # promotion READ may not have been overwritten by a later spill.
+        self.assertEqual(pool.num_pending_promotions(), 0)
+
+    def test_clear_waits_inflight_copies(self):
+        pool = MambaCheckpointPool(
+            device="cuda", **_pool_kwargs(num_slots=2, host_slots=2)
+        )
+        temporal = torch.zeros(L, 4, H, V, K, dtype=torch.bfloat16, device="cuda")
+        conv = [torch.zeros(L, 4, *CONV_SHAPE, dtype=torch.bfloat16, device="cuda")]
+        active = SimpleNamespace(
+            mamba_cache=SimpleNamespace(temporal=temporal, conv=conv)
+        )
+        active.mamba_cache.temporal[:, 1] = (
+            torch.randn(L, H, V, K, dtype=torch.bfloat16, device="cuda") * 6e-2
+        )
+        pool.store_from_active(
+            active,
+            torch.tensor([1], dtype=torch.int64, device="cuda"),
+            torch.tensor([3], dtype=torch.int64, device="cuda"),
+        )
+        pool.clear()  # must not return until the queued D2H retired
+        self.assertEqual(pool.num_pending_promotions(), 0)
+        self.assertEqual(pool.device_available_size(), 2)

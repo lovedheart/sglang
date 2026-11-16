@@ -47,7 +47,12 @@ class MambaSlotAllocator:
         self.clear()
 
     def translate(self, slot_ids: torch.Tensor) -> torch.Tensor:
-        """Static slot ids already index physical storage."""
+        """Static slot ids already index physical storage.
+
+        Valid for the DEVICE tier only (row == id there). RAM-tier ids
+        address a different plane at row ``id - size``; callers holding
+        host values resolve them through the checkpoint pool, never here.
+        """
         return slot_ids
 
     def tier_of(self, slot_id: int) -> tuple[str, int]:
@@ -94,6 +99,8 @@ class MambaSlotAllocator:
     def _do_alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > self.available_size():
             return None
+        if need_size == 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
         from_device = min(need_size, len(self.free_slots))
         parts = []
         if from_device > 0:
@@ -112,15 +119,15 @@ class MambaSlotAllocator:
         if self.host_slots == 0:
             self.free_slots = torch.cat((self.free_slots, free_index))
             return
+        # Split by tier without ANY host sync (no bool()/any()): both cats run
+        # and a possibly-empty selection is a no-op.
         is_host = free_index > self.size
-        if bool((~is_host).any()):
-            self.free_slots = torch.cat(
-                (self.free_slots, free_index.masked_select(~is_host))
-            )
-        if bool(is_host.any()):
-            self.free_host_slots = torch.cat(
-                (self.free_host_slots, free_index.masked_select(is_host))
-            )
+        self.free_slots = torch.cat(
+            (self.free_slots, free_index.masked_select(~is_host))
+        )
+        self.free_host_slots = torch.cat(
+            (self.free_host_slots, free_index.masked_select(is_host))
+        )
 
     def clear(self):
         # Slot 0 is reserved as a dummy write target for padded tokens.
