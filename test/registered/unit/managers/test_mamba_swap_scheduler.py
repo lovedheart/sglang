@@ -219,6 +219,24 @@ class TestMambaSwapRotation(unittest.TestCase):
         self.swap.on_step_boundary(self._running_batch(reqs), waiting_count=1)
         self.assertEqual(len(self.parked), 1)
 
+    def test_wake_is_graceful_when_the_slot_vanishes(self):
+        # F13: a same-tick retire may consume the free slot between the
+        # gate and the alloc; the wake must defer, not assert.
+        batch = self._running_batch([self._req("r0"), self._req("r1")])
+        self.swap.on_step_boundary(batch, waiting_count=1)
+        victim = next(iter(self.parked))
+        original = self.slots.alloc
+        self.slots.alloc = lambda n: None
+        try:
+            woken = self.swap.on_step_boundary(batch, waiting_count=0)
+        finally:
+            self.slots.alloc = original
+        self.assertEqual(woken, [])
+        self.assertIn(victim, self.parked)
+        self.assertIsNotNone(victim.kv.mamba_swap_id)
+        # The retry lands: the record was untouched by the failed tick.
+        self.assertEqual(self.swap.on_step_boundary(batch, waiting_count=0), [victim])
+
     def test_debug_scan_accepts_healthy_park_and_flags_stolen_row(self):
         batch = self._running_batch([self._req("r0"), self._req("r1")])
         with envs.SGLANG_DEBUG_MEMORY_POOL.override(True):

@@ -385,12 +385,25 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
+    checkpoint = checkpoint and not req.skip_radix_cache_insert
     if req.kv.mamba_swap_id is not None:
+        if checkpoint:
+            # A tree checkpoint reads the request's ACTIVE state row, which a
+            # parked request does not have, and dropping the swap record first
+            # would leave the tree inserting from nothing. v2.0 only ever
+            # retires parked requests through abort (checkpoint=False).
+            raise RuntimeError(
+                f"parked mamba request {req.rid} cannot be checkpointed into "
+                "the tree: parking a finish-pending request is not supported"
+            )
         # A parked request's swap slot is the last copy of its state: the
         # request is ending, so drop it (every retire path funnels here).
+        # The flag below tells the state-slot release that the obligation is
+        # discharged, so skipping it is not read as a double free.
         swap_pool = tree_cache.token_to_kv_pool_allocator.state.swap_pool
         swap_pool.drop(req.kv.mamba_swap_id)
         req.kv.mamba_swap_id = None
+        req.kv.mamba_state_released_via_swap = True
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
         assert tree_cache.supports_mamba(), (
@@ -412,7 +425,6 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         return
 
     owned_kv_len = req.owned_kv_len()
-    checkpoint = checkpoint and not req.skip_radix_cache_insert
     if checkpoint:
         # A tree that takes over component state (mamba) must see the request
         # finished, or the insert forks the state and the slot leaks.
@@ -434,6 +446,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
     kv_storage_of(
         tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
     ).release_row(req)
+    req.kv.mamba_state_released_via_swap = False  # consume if no release did
     req.kv.mark_kv_released()
 
 

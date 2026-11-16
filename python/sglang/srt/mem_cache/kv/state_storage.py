@@ -254,7 +254,15 @@ class StateStorage:
         the one kept for the radix cache. The request drops the slot tensors
         it frees here, so an open free group holds them without a copy."""
         mamba_index = req.kv.mamba_pool_idx
-        assert mamba_index is not None, "double free? mamba_index is None"
+        if mamba_index is None:
+            # A parked request owns no active row: its state obligation was
+            # discharged together with its swap record at release. Consume
+            # the marker; not a double free.
+            assert req.kv.mamba_state_released_via_swap, (
+                "double free? mamba_index is None"
+            )
+            req.kv.mamba_state_released_via_swap = False
+            return
         self.slots.free(mamba_index.unsqueeze(0), owned=True)
         req.kv.mamba_pool_idx = None
 

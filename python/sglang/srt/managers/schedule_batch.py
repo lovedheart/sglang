@@ -313,6 +313,10 @@ class ReqKvInfo:
     # Decode-step stamp of the last wake; the park policy protects a freshly
     # woken request from being re-parked before it made progress.
     mamba_swap_woken_iter: int = -1
+    # Set when the request's state obligation was discharged together with
+    # its swap record at release, so the state-slot release downstream is a
+    # no-op rather than a double free.
+    mamba_state_released_via_swap: bool = False
 
     def window_dead_lo(self, page_size: int) -> int:
         # Lowest position this request may free itself in any window: above the

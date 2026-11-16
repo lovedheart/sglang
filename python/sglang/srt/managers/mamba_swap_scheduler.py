@@ -104,7 +104,8 @@ class MambaSwapScheduler:
             self.swap_pool.available_size(),
         )
         if len(self.parked_reqs) > 0 and free > 0:
-            return [self._wake_next()]
+            woken = self._wake_next()
+            return [woken] if woken is not None else []
         if (
             waiting_count > 0
             and free == 0
@@ -194,12 +195,12 @@ class MambaSwapScheduler:
         if swap_id is None:
             return
         req.kv.mamba_swap_id = swap_id
-        # The state now lives in the swap tier; the active bookkeeping goes
-        # with it. The request keeps its token pages and its req row.
+        # The state now lives in the swap tier; the active slot bookkeeping
+        # goes with it. The request keeps its token pages and its req row.
+        # _parkable guarantees no CoW source, deferred clear or ping-pong
+        # buffer survived here, so there is nothing else to hand back.
         req.kv.mamba_pool_idx = None
         req.kv.mamba_needs_clear = False
-        req.kv.mamba_cow_src_index = None
-        req.kv.mamba_slot_clear_queue = None
         move([req], self.parked_reqs)
         running_batch.filter_batch(reqs_to_exclude=[req])
         running_batch.batch_is_full = False
@@ -213,12 +214,16 @@ class MambaSwapScheduler:
 
     # ===== Wake =====
 
-    def _wake_next(self) -> Req:
+    def _wake_next(self) -> Optional[Req]:
         """Take the longest-parked request, give it a fresh active slot, and
-        move it back to the running list; the caller merges it into decode."""
+        move it back to the running list; the caller merges it into decode.
+        Returns None (staying parked) if the slot vanished between the free
+        check and the alloc — same-tick retire or an admit racing ahead."""
         req = next(iter(self.parked_reqs))
         slot = self.state.slots.alloc(1)
-        assert slot is not None, "wake ran with no free active slot"
+        if slot is None:
+            logger.debug("mamba swap: wake deferred for %s (no free slot)", req.rid)
+            return None
         swap_id = req.kv.mamba_swap_id
         self.swap_pool.wake(swap_id, int(slot[0]), order_streams=self.order_streams)
         req.kv.mamba_pool_idx = slot[0]
