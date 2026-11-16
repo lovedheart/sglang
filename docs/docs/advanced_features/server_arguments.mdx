@@ -381,6 +381,36 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--lm-head-dtype`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Store the LM head weight in a compact blockwise format, picked at load time (SM120 only, ignored elsewhere; the dense bf16 weight is released). fp8_e4m3: FP8 e4m3 codes, 128x128 block scales, halves head memory traffic. fp8_e3m4: e3m4 codes, 128x128 block scales. fp6_e2m3: FP6 e2m3 codes, 32x32 FP32 block scales, served by the packed-stream SIMT/QMMA kernels. Default bf16 leaves the checkpoint's head format untouched.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`bf16`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>bf16</code>, <code>fp8_e4m3</code>, <code>fp8_e3m4</code>, <code>fp6_e2m3</code></td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-nvfp4-draft-lm-head`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Give the NEXTN/EAGLE draft runner its own NVFP4 W4A16 copy of the LM head (SM120 only, ignored elsewhere), cutting draft-step head traffic ~2x. Draft logits feed proposals only; greedy target verification keeps outputs unchanged.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-fp8-shared-expert`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Store the main model's shared-expert gate_up/down weights in FP8 e4m3 with 128x128 block scales at load time (SM120 only, ignored elsewhere), routing the skinny decode-time projections off cuBLAS wmma onto the sm120 fp8 path. The MTP draft shared expert stays BF16 unless --enable-fp8-shared-expert-mtp.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-fp8-shared-expert-mtp`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Also quantize the NEXTN MTP draft layer's shared expert to FP8 b128. Draft-path error feeds proposal accept-length directly, so it is a separate opt-in; has no effect unless --enable-fp8-shared-expert is also set.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-fp8-hc-mix`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Store the per-layer hyper-connection mix projections (input_mix_weight_down/up) in MXFP8 (e4m3 + 1x32 UE8M0 scales) at load time, halving ~1.27 GB of BF16 mix weights; the decode mix kernel descales in registers (W8A16: BF16 activations). The last main layer, the final mixer, and the NEXTN/MTP draft stay BF16.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--modelopt-quant`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The ModelOpt quantization configuration. Supported values: 'fp8', 'int4_awq', 'w4a8_awq', 'nvfp4', 'nvfp4_awq'. This requires the NVIDIA Model Optimizer library to be installed: pip install nvidia-modelopt</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
