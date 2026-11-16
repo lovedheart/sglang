@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
     MambaEvictExcessPathStates,
+    MambaReleaseSupersededHostValue,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import (
     BASE_COMPONENT_TYPE,
@@ -1623,6 +1624,19 @@ class MambaComponent(TreeComponent):
                 )
             finally:
                 self.cache._apply_eviction_result(result)
+            return
+        if isinstance(action, MambaReleaseSupersededHostValue):
+            # Rust-core parity for the device-commit-supersedes-checkpoint free
+            # (the python core frees inline in commit_insert_component_data).
+            # Only the RAM checkpoint tier owns these slots; with a HiCache
+            # host pool the value stays attached, like the python core.
+            if not self._ckpt_host_tier():
+                return
+            host_value = self.tree_core.clear_component_host_value(
+                action.node_id, self.component_type
+            )
+            if host_value is not None:
+                self.free_host_values([host_value])
             return
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:

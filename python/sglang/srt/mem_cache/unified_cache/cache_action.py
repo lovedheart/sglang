@@ -84,6 +84,15 @@ class MambaEvictExcessPathStates(ComponentAction, frozen=True):
     component_type: ComponentType = ComponentType.MAMBA
 
 
+class MambaReleaseSupersededHostValue(ComponentAction, frozen=True):
+    """A device commit superseded the node's Mamba host checkpoint; release
+    the host slot (the python core frees inline during commit; the Rust core
+    defers the free to this action)."""
+
+    node_id: NodeId
+    component_type: ComponentType = ComponentType.MAMBA
+
+
 class RebuildFullToSWAMapping(ComponentAction, frozen=True):
     """Rebuild the SWA allocator's full->swa index mapping for loaded chunks."""
 

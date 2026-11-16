@@ -3378,6 +3378,22 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """The component's host value on the node, or None if absent."""
         return self.node_by_id(node_id).component_data[component_type].host_value
 
+    def clear_component_host_value(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> Optional[torch.Tensor]:
+        """Take the component's host value off the node (detaching it from the
+        host LRU) and return it; None when unset."""
+        node = self.node_by_id(node_id)
+        cd = node.component_data[component_type]
+        host_value = cd.host_value
+        if host_value is None:
+            return None
+        host_lru = self.host_lru_lists[component_type]
+        if host_lru.in_list(node):
+            host_lru.remove_node(node)
+        cd.host_value = None
+        return host_value
+
     def component_has_host_value_only(
         self, node_id: NodeId, component_type: ComponentType
     ) -> bool:

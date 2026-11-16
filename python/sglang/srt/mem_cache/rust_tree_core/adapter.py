@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
     MambaEvictExcessPathStates,
+    MambaReleaseSupersededHostValue,
     RebuildFullToSWAMapping,
     RecoverSWAWithLockedFull,
     SWARebuild,
@@ -211,6 +212,8 @@ def _cache_action_from_tagged(action: tuple, ids: _CoreIds) -> CacheAction:
         return BackupKV(node_ids=list(action[1]))
     if tag == "mamba_evict_excess_path_states":
         return MambaEvictExcessPathStates(tail_node_id=action[1])
+    if tag == "mamba_release_superseded_host_value":
+        return MambaReleaseSupersededHostValue(node_id=action[1])
     if tag == "update_pending_backup_on_node_split":
         return UpdatePendingBackupOnNodeSplit(
             ack_id=action[1],
@@ -1430,6 +1433,13 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId, component_type: ComponentType
     ) -> Optional[torch.Tensor]:
         return self._binding.get_component_host_value(
+            node_id, self._ids.core(component_type)
+        )
+
+    def clear_component_host_value(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> Optional[torch.Tensor]:
+        return self._binding.clear_component_host_value(
             node_id, self._ids.core(component_type)
         )
 

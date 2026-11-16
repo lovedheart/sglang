@@ -7,7 +7,9 @@ use std::collections::HashMap;
 
 use tch::Tensor;
 
-use crate::cache_action::{FreeComponentHostSlot, MambaEvictExcessPathStates};
+use crate::cache_action::{
+    FreeComponentHostSlot, MambaEvictExcessPathStates, MambaReleaseSupersededHostValue,
+};
 use crate::components::TreeComponent;
 use crate::components::{ComponentType, FULL, Family, MAMBA};
 use crate::node::ChildKeyType;
@@ -458,6 +460,15 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             return;
         }
         if !tree_core.arena.has_device_value(node_id, MAMBA) {
+            if tree_core.arena.node(node_id).has_host_value(MAMBA) {
+                // The device commit supersedes the node's host checkpoint.
+                // Python frees it (only the python pool knows the RAM ledger);
+                // with a HiCache host pool the handler leaves it attached,
+                // matching the python core's tier gate.
+                cache_actions.push(Box::new(MambaReleaseSupersededHostValue {
+                    node_id: tree_core.arena.node(node_id).id,
+                }));
+            }
             tree_core.set_component_device_value_(node_id, MAMBA, mamba_value.shallow_clone());
             let tick = tree_core.arena.get_and_bump_access_counter();
             tree_core.arena.node_mut(node_id).last_access_counter = tick;
