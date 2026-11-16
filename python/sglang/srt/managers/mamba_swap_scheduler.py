@@ -125,6 +125,11 @@ class MambaSwapScheduler:
     def _parkable(self, req: Req) -> bool:
         if req.kv.mamba_pool_idx is None or req.kv.mamba_swap_id is not None:
             return False
+        # A prefill merged in this very tick (overlap merges before its result
+        # finishes the reqs) has no processed output yet; waking it reads
+        # output_ids[-1] off an empty array. One processed token suffices.
+        if len(req.output_ids) == 0:
+            return False
         if req.session is not None or req.beam_group is not None:
             return False
         # Park/wake round-trips the main row only. Anything with state beyond

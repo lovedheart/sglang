@@ -43,6 +43,8 @@ class _FakeReq:
         self.kv = ReqKvInfo()
         self.session = None
         self.beam_group = None
+        # Decoded at least one token; a merged-not-yet-finished prefill has [].
+        self.output_ids = [1]
 
 
 class _FakeRunningBatch:
@@ -192,6 +194,18 @@ class TestMambaSwapRotation(unittest.TestCase):
             req.beam_group = object()
         self.swap.on_step_boundary(self._running_batch(reqs), waiting_count=1)
         self.assertEqual(len(self.parked), 0)
+
+    def test_prefill_not_yet_finished_is_not_parkable(self):
+        # Overlap merges a prefill's reqs before its result appends output;
+        # parking one leaves wake reading output_ids[-1] of an empty array.
+        reqs = [self._req("r0"), self._req("r1")]
+        for req in reqs:
+            req.output_ids = []
+        self.swap.on_step_boundary(self._running_batch(reqs), waiting_count=1)
+        self.assertEqual(len(self.parked), 0)
+        reqs[0].output_ids = [7]
+        self.swap.on_step_boundary(self._running_batch(reqs), waiting_count=1)
+        self.assertEqual(len(self.parked), 1)
 
 
 if __name__ == "__main__":
