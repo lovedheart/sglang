@@ -88,6 +88,7 @@ class TestMambaSwapRotation(unittest.TestCase):
             ),
             enable_linear_replayssm=False,
             enable_linear_replayssm_spec=False,
+            replayssm_request_ring=False,
             replayssm_write_pos=None,
             _slot_siblings=[],
         )

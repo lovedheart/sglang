@@ -116,18 +116,26 @@ class MambaSwapPool:
         ]
         # ReplaySSM ring planes: [num_layers, num_slots, ...], slot-indexed
         # like temporal/conv, so a parked row is exactly complete state.
-        self._ring_planes = [
-            plane
-            for plane in (
-                cache.replayssm_d,
-                cache.replayssm_k,
-                cache.replayssm_g,
-                cache.replayssm_rawv,
-                cache.replayssm_rawk,
-                cache.replayssm_beta,
-            )
-            if plane is not None
-        ]
+        # Under a request ring (memory_pool.py:808-815: GDN -spec always,
+        # KDA -spec with host-only checkpoints) the rows are request-keyed
+        # and park with the request row instead — copying them by slot would
+        # park and wake a DIFFERENT request's rows, so skip them there.
+        self._ring_planes = (
+            []
+            if mamba_pool.replayssm_request_ring
+            else [
+                plane
+                for plane in (
+                    cache.replayssm_d,
+                    cache.replayssm_k,
+                    cache.replayssm_g,
+                    cache.replayssm_rawv,
+                    cache.replayssm_rawk,
+                    cache.replayssm_beta,
+                )
+                if plane is not None
+            ]
+        )
         self.host_ring = [
             self._alloc_host((p.shape[0], swap_slots + 1) + tuple(p.shape[2:]), p.dtype)
             for p in self._ring_planes
@@ -173,8 +181,13 @@ class MambaSwapPool:
         return len(self._parked)
 
     def total_bytes(self) -> int:
-        planes = [self.host_temporal, *self.host_conv]
+        planes = [self.host_temporal, *self.host_conv, *self.host_ring]
+        if self.host_write_pos is not None:
+            planes.append(self.host_write_pos)
         return sum(p.numel() * p.element_size() for p in planes)
+
+    def is_parked(self, swap_id: int) -> bool:
+        return swap_id in self._parked
 
     # ===== Park / wake =====
 

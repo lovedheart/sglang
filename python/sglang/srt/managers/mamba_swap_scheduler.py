@@ -73,12 +73,19 @@ class MambaSwapScheduler:
         self._rotor = 0
         self.num_parks = 0
         self.num_wakes = 0
+        # Read once: the env is set before boot, and the tick also runs in
+        # the idle spin between steps.
+        self._debug_scan = envs.SGLANG_DEBUG_MEMORY_POOL.get()
 
     def on_step_boundary(
         self, running_batch: ScheduleBatch, *, waiting_count: int
     ) -> List[Req]:
         """Run one rotation tick; return woken reqs for the caller to merge
         back into the decode batch. Called only at a step boundary."""
+        if self._debug_scan:
+            # Census the state carried in from previous ticks, before wake
+            # or park mutate it.
+            self._check_parked_ownership()
         if not self.parked_reqs and (
             waiting_count == 0 or running_batch.batch_size() < 2
         ):
@@ -107,8 +114,6 @@ class MambaSwapScheduler:
             victim = self._select_victim(running_batch.reqs)
             if victim is not None:
                 self._park(running_batch, victim)
-        if envs.SGLANG_DEBUG_MEMORY_POOL.get():
-            self._check_parked_ownership()
         return []
 
     # ===== Invariant scan =====
@@ -135,7 +140,7 @@ class MambaSwapScheduler:
             if kv.mamba_slot_clear_queue:
                 problems.append("clear_queue")
             swap_id = kv.mamba_swap_id
-            if swap_id is None or swap_id not in self.swap_pool._parked:
+            if swap_id is None or not self.swap_pool.is_parked(swap_id):
                 problems.append(f"record={swap_id}")
             elif swap_id in seen_ids:
                 problems.append(f"dup_record={swap_id}")
