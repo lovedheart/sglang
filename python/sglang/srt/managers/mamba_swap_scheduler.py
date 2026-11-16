@@ -78,6 +78,12 @@ class MambaSwapScheduler:
     ) -> List[Req]:
         """Run one rotation tick; return woken reqs for the caller to merge
         back into the decode batch. Called only at a step boundary."""
+        if not self.parked_reqs and (
+            waiting_count == 0 or running_batch.batch_size() < 2
+        ):
+            # Idle cheap path: neither branch could act, and this runs every
+            # scheduler pass including the spin between steps.
+            return []
         self.step += 1
         free = self.state.slots.available_size()
         logger.debug(
