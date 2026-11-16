@@ -32,6 +32,7 @@ import logging
 from typing import List, Optional, Sequence
 
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.request_list import move
 
@@ -106,7 +107,45 @@ class MambaSwapScheduler:
             victim = self._select_victim(running_batch.reqs)
             if victim is not None:
                 self._park(running_batch, victim)
+        if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+            self._check_parked_ownership()
         return []
+
+    # ===== Invariant scan =====
+
+    def _check_parked_ownership(self) -> None:
+        """Invariant 1 (debug builds): a parked request holds no active
+        row — slot, ping-pong buffer, CoW source or deferred clear — and
+        owns exactly one live, distinct swap record.
+
+        Runs at the step boundary, where the scheduler is the single
+        writer; the idle memory-pool checker cannot host this scan
+        because a non-empty parked list keeps the scheduler non-idle.
+        """
+        seen_ids = set()
+        for req in self.parked_reqs:
+            kv = req.kv
+            problems = []
+            if kv.mamba_pool_idx is not None:
+                problems.append(f"row={int(kv.mamba_pool_idx.reshape(-1)[0])}")
+            if kv.mamba_ping_pong_track_buffer is not None:
+                problems.append("ping_pong")
+            if kv.mamba_cow_src_index is not None:
+                problems.append("cow_src")
+            if kv.mamba_slot_clear_queue:
+                problems.append("clear_queue")
+            swap_id = kv.mamba_swap_id
+            if swap_id is None or swap_id not in self.swap_pool._parked:
+                problems.append(f"record={swap_id}")
+            elif swap_id in seen_ids:
+                problems.append(f"dup_record={swap_id}")
+            else:
+                seen_ids.add(swap_id)
+            if problems:
+                raise RuntimeError(
+                    f"mamba swap invariant 1 violated: rid={req.rid} "
+                    f"{','.join(problems)}"
+                )
 
     # ===== Park =====
 

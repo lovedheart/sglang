@@ -652,6 +652,10 @@ class SchedulerInvariantChecker:
                         f", swap_ledger=LEAK pool={swap_pool.num_parked()} "
                         f"list={parked_count}"
                     )
+                # Per-request ownership (invariant 1) is NOT checked here:
+                # a non-empty parked list keeps the scheduler non-idle, so
+                # this block can never observe one; the live scan lives in
+                # MambaSwapScheduler._check_parked_ownership (step boundary).
             has_leak |= mamba_leak
             messages.append(mamba_msg)
 

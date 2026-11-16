@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from sglang.srt.environ import envs
 from sglang.srt.managers.mamba_swap_scheduler import MambaSwapScheduler
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import (
@@ -206,6 +207,34 @@ class TestMambaSwapRotation(unittest.TestCase):
         reqs[0].output_ids = [7]
         self.swap.on_step_boundary(self._running_batch(reqs), waiting_count=1)
         self.assertEqual(len(self.parked), 1)
+
+    def test_debug_scan_accepts_healthy_park_and_flags_stolen_row(self):
+        batch = self._running_batch([self._req("r0"), self._req("r1")])
+        with envs.SGLANG_DEBUG_MEMORY_POOL.override(True):
+            # Parking runs the scan inline: a healthy park passes.
+            self.swap.on_step_boundary(batch, waiting_count=1)
+            victim = next(iter(self.parked))
+            # Someone else reclaims the freed row while it is parked.
+            victim.kv.mamba_pool_idx = self.slots.alloc(1)[0]
+            with self.assertRaisesRegex(RuntimeError, "row="):
+                self.swap._check_parked_ownership()
+
+    def test_debug_scan_flags_lost_or_duplicate_record(self):
+        batch = self._running_batch([self._req("r0"), self._req("r1")])
+        self.swap.on_step_boundary(batch, waiting_count=1)
+        victim = next(iter(self.parked))
+        victim.kv.mamba_swap_id = 999
+        with self.assertRaisesRegex(RuntimeError, "record=999"):
+            self.swap._check_parked_ownership()
+        # Back to a live id, then a second parked req claims the same one.
+        other = self._req("r2")
+        other.kv.mamba_pool_idx = None
+        move([other], self.parked)
+        self.swap_pool._parked[42] = True
+        victim.kv.mamba_swap_id = 42
+        other.kv.mamba_swap_id = 42
+        with self.assertRaisesRegex(RuntimeError, "dup_record=42"):
+            self.swap._check_parked_ownership()
 
 
 if __name__ == "__main__":
