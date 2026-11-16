@@ -114,6 +114,39 @@ class TestMambaSwapPoolCuda(CustomTestCase):
         self.assertTrue(torch.equal(pool.mamba_cache.temporal[:, 4], ref_t))
         self.assertTrue(torch.equal(pool.mamba_cache.conv[0][:, 4], ref_c))
 
+    def test_multirow_record_roundtrip_on_gpu(self):
+        # V2-P1 record v2: two slot rows, one id, one fence pair.
+        swap = MambaSwapPool(
+            mamba_pool=_fake_mamba_pool(self.device),
+            mamba_allocator=MambaSlotAllocator(ACTIVE_SLOTS - 1, self.device),
+            swap_slots=2,
+            device=self.device,
+            rows_per_record=2,
+        )
+        pool = swap.mamba_pool
+        self._fill(pool, 1, 21)
+        self._fill(pool, 2, 22)
+        sid = swap.park([1, 2])
+        self._fill(pool, 1, 23)  # both rows recycled with new contents
+        self._fill(pool, 2, 24)
+        swap.wake(sid, [4, 5])
+        torch.cuda.synchronize()
+        for slot, seed in ((4, 21), (5, 22)):
+            g = torch.Generator(device=self.device).manual_seed(seed)
+            ref_t = torch.rand(
+                L, H, V, K, generator=g, device=self.device, dtype=torch.float32
+            ).to(torch.bfloat16)
+            ref_c = torch.rand(
+                L,
+                2,
+                *CONV_SHAPE,
+                generator=g,
+                device=self.device,
+                dtype=torch.float32,
+            ).to(torch.bfloat16)
+            self.assertTrue(torch.equal(pool.mamba_cache.temporal[:, slot], ref_t))
+            self.assertTrue(torch.equal(pool.mamba_cache.conv[0][:, slot], ref_c))
+
     def test_wake_before_park_reuse_is_ordered(self):
         # Wake frees its swap row; the next park reuses that row on the
         # caller stream. The caller-stream wait recorded in wake must order

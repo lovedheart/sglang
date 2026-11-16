@@ -107,6 +107,44 @@ class TestMambaSwapPool(unittest.TestCase):
         for c in pool.mamba_cache.conv:
             self.assertTrue((c[:, 4] == -0.75).all())
 
+    def _swap_rpr(self, rows, swap_slots=3):
+        return MambaSwapPool(
+            mamba_pool=_fake_mamba_pool(),
+            mamba_allocator=MambaSlotAllocator(ACTIVE_SLOTS - 1, "cpu"),
+            swap_slots=swap_slots,
+            device="cpu",
+            rows_per_record=rows,
+        )
+
+    def test_multirow_record_round_trips_atomically(self):
+        # V2-P1 record v2: one id parks a slot SET (e.g. main + tracking).
+        swap = self._swap_rpr(2)
+        pool = swap.mamba_pool
+        _write_state(pool, 1, 0.5)
+        _write_state(pool, 2, 0.25)
+        alloc_before = swap.mamba_allocator.available_size()
+        swap_id = swap.park([1, 2])
+        self.assertIsNotNone(swap_id)
+        self.assertEqual(swap.mamba_allocator.available_size(), alloc_before + 2)
+        _write_state(pool, 1, -9.0)  # slots recycled by someone else
+        _write_state(pool, 2, -9.0)
+        swap.wake(swap_id, [3, 4])
+        self.assertTrue((pool.mamba_cache.temporal[:, 3] == 0.5).all())
+        self.assertTrue((pool.mamba_cache.temporal[:, 4] == 0.25).all())
+        for c in pool.mamba_cache.conv:
+            self.assertTrue((c[:, 3] == -0.5).all())
+            self.assertTrue((c[:, 4] == -0.25).all())
+        # One record consumed one swap id regardless of row count.
+        self.assertEqual(swap.num_parked(), 0)
+        self.assertEqual(swap.available_size(), 3)
+
+    def test_row_count_must_match_the_record(self):
+        swap = self._swap_rpr(2)
+        with self.assertRaises(ValueError):
+            swap.park(1)
+        with self.assertRaises(ValueError):
+            swap.park([1, 2, 3])
+
     def test_park_frees_the_active_slot(self):
         swap = self._swap()
         alloc = swap.mamba_allocator

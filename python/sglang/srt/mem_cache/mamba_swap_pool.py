@@ -83,6 +83,7 @@ class MambaSwapPool:
         swap_slots: int,
         device: str,
         allow_replayssm: bool = False,
+        rows_per_record: int = 1,
     ):
         # ReplaySSM adds slot-indexed ring planes (and, in plain decode mode,
         # a slot-indexed write cursor) to the parked state. Capture is cheap
@@ -102,16 +103,23 @@ class MambaSwapPool:
         self.mamba_allocator = mamba_allocator
         self.swap_slots = swap_slots
         self.device = device
+        # V2-P1 record v2: one swap id parks a ROW SET (e.g. the main slot
+        # plus ping-pong tracking slots), copied under one fence pair. All
+        # records are uniform: `rows_per_record` host rows each, record r
+        # owning host rows [r * rpr, (r + 1) * rpr); rows_per_record=1 is
+        # the v1 byte layout.
+        self.rows_per_record = rows_per_record
+        host_rows = (swap_slots + 1) * rows_per_record
         cache = mamba_pool.mamba_cache
 
         # Host planes mirror the device layout (slot axis in place), pinned
         # so the bulk D2H/H2D below are genuinely async.
         self.host_temporal = self._alloc_host(
-            (cache.temporal.shape[0], swap_slots + 1) + tuple(cache.temporal.shape[2:]),
+            (cache.temporal.shape[0], host_rows) + tuple(cache.temporal.shape[2:]),
             cache.temporal.dtype,
         )
         self.host_conv = [
-            self._alloc_host((c.shape[0], swap_slots + 1) + tuple(c.shape[2:]), c.dtype)
+            self._alloc_host((c.shape[0], host_rows) + tuple(c.shape[2:]), c.dtype)
             for c in cache.conv
         ]
         # ReplaySSM ring planes: [num_layers, num_slots, ...], slot-indexed
@@ -137,13 +145,13 @@ class MambaSwapPool:
             ]
         )
         self.host_ring = [
-            self._alloc_host((p.shape[0], swap_slots + 1) + tuple(p.shape[2:]), p.dtype)
+            self._alloc_host((p.shape[0], host_rows) + tuple(p.shape[2:]), p.dtype)
             for p in self._ring_planes
         ]
         # Plain-decode write cursor is slot-indexed; the -spec cursor triple
         # is req-row-indexed and survives parking with the request row.
         self.host_write_pos = (
-            self._alloc_host((swap_slots + 1,), torch.int32)
+            self._alloc_host((host_rows,), torch.int32)
             if mamba_pool.replayssm_write_pos is not None
             else None
         )
@@ -191,22 +199,35 @@ class MambaSwapPool:
 
     # ===== Park / wake =====
 
-    def park(self, active_slot: int, *, order_streams=()) -> Optional[int]:
-        """Copy the active slot's state into a pinned swap slot and return
-        the swap id, freeing the active slot. Returns None (leaving the
-        active slot untouched) when the swap tier is full. ``order_streams``
+    def _norm_slots(self, active_slots) -> List[int]:
+        slots = [active_slots] if isinstance(active_slots, int) else list(active_slots)
+        if len(slots) != self.rows_per_record:
+            raise ValueError(
+                f"swap record takes exactly {self.rows_per_record} active "
+                f"slot(s), got {slots}"
+            )
+        return slots
+
+    def park(self, active_slots, *, order_streams=()) -> Optional[int]:
+        """Copy the active row set's state into the pinned record rows and
+        return the swap id, freeing the active slots. Returns None (leaving
+        the rows untouched) when the swap tier is full. ``order_streams``
         are the streams that may still hold in-flight reads/writes of the
-        active row (the scheduler's forward and schedule streams); the D2H
-        is fenced behind them and they are fenced behind it, so the row can
-        be freed to the sync-free allocator immediately."""
+        active rows (the scheduler's forward and schedule streams); the D2H
+        is fenced behind them and they are fenced behind it, so the rows can
+        be freed to the sync-free allocator immediately. All rows of the
+        set share the one fence pair, so the record is atomic."""
+        slots = self._norm_slots(active_slots)
         if not self.free_ids:
             return None
         swap_id = self.free_ids.pop(0)
         cache = self.mamba_pool.mamba_cache
-        idx = torch.tensor([active_slot], dtype=torch.int64, device=self.device)
+        idx = torch.tensor(slots, dtype=torch.int64, device=self.device)
+        rows = [swap_id * self.rows_per_record + j for j in range(len(slots))]
 
         if self._copy_stream is None:
-            self._copy_planes(cache, active_slot, swap_id, to_device=False)
+            for slot, row in zip(slots, rows):
+                self._copy_planes(cache, slot, row, to_device=False)
             sibling_data = [
                 (sibling, sibling.get_cpu_slots(idx)) for sibling in self._siblings
             ]
@@ -215,10 +236,11 @@ class MambaSwapPool:
             # stream is a producer, not the copy stream itself.
             producers = self._producers(order_streams)
             with torch.cuda.stream(self._copy_stream):
-                # Fence behind every stream that may still touch the row.
+                # Fence behind every stream that may still touch the rows.
                 for stream in producers:
                     self._copy_stream.wait_stream(stream)
-                self._copy_planes(cache, active_slot, swap_id, to_device=False)
+                for slot, row in zip(slots, rows):
+                    self._copy_planes(cache, slot, row, to_device=False)
                 # Sibling rows ride the retraction copy path, on the copy
                 # stream so the fence above orders them too.
                 sibling_data = [
@@ -231,31 +253,32 @@ class MambaSwapPool:
             event if self._copy_stream is not None else None, sibling_data
         )
         if self._copy_stream is not None:
-            # Order future writes to the row (a new owner's prefill) after
-            # the D2H that still reads it (the promotion-release lesson).
+            # Order future writes to the rows (a new owner's prefill) after
+            # the D2H that still reads them (the promotion-release lesson).
             for stream in producers:
                 stream.wait_event(self._parked[swap_id].event)
 
         if self.mamba_allocator is not None:
-            idx_free = torch.tensor(
-                [active_slot], dtype=torch.int64, device=self.device
-            )
+            idx_free = idx.clone()
             if self._copy_stream is not None:
                 torch.cuda.current_stream().wait_event(self._parked[swap_id].event)
             self.mamba_allocator.free(idx_free)
         return swap_id
 
-    def wake(self, swap_id: int, active_slot: int, *, order_streams=()) -> None:
-        """Copy a parked state into a freshly allocated active slot; every
+    def wake(self, swap_id: int, active_slots, *, order_streams=()) -> None:
+        """Copy a parked record into freshly allocated active slots; every
         stream in ``order_streams`` (the forward's candidates) is fenced
-        after the H2D before this returns. The swap slot is recycled: a
-        later park reusing the row fences behind this H2D the same way."""
+        after the H2D before this returns. The swap record is recycled: a
+        later park reusing the rows fences behind this H2D the same way."""
+        slots = self._norm_slots(active_slots)
         record = self._parked.pop(swap_id)
         cache = self.mamba_pool.mamba_cache
-        idx = torch.tensor([active_slot], dtype=torch.int64, device=self.device)
+        idx = torch.tensor(slots, dtype=torch.int64, device=self.device)
+        rows = [swap_id * self.rows_per_record + j for j in range(len(slots))]
 
         if self._copy_stream is None:
-            self._copy_planes(cache, active_slot, swap_id, to_device=True)
+            for slot, row in zip(slots, rows):
+                self._copy_planes(cache, slot, row, to_device=True)
             for sibling, data in record.sibling_data:
                 sibling.load_cpu_slots(data, idx)
             self.free_ids.append(swap_id)
@@ -265,7 +288,8 @@ class MambaSwapPool:
         with torch.cuda.stream(self._copy_stream):
             for stream in producers:
                 self._copy_stream.wait_stream(stream)
-            self._copy_planes(cache, active_slot, swap_id, to_device=True)
+            for slot, row in zip(slots, rows):
+                self._copy_planes(cache, slot, row, to_device=True)
             for sibling, data in record.sibling_data:
                 sibling.load_cpu_slots(data, idx)
             event.record(self._copy_stream)
