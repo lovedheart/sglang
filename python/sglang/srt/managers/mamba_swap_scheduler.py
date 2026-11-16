@@ -95,13 +95,16 @@ class MambaSwapScheduler:
         self.step += 1
         free = self.state.slots.available_size()
         logger.debug(
-            "mamba swap tick: step=%d parked=%d free=%d waiting=%d bs=%s swapfree=%d",
+            "mamba swap tick: step=%d parked=%d free=%d waiting=%d bs=%s "
+            "swapfree=%d parks=%d wakes=%d",
             self.step,
             len(self.parked_reqs),
             free,
             waiting_count,
             running_batch.batch_size(),
             self.swap_pool.available_size(),
+            self.num_parks,
+            self.num_wakes,
         )
         if len(self.parked_reqs) > 0 and free > 0:
             woken = self._wake_next()
