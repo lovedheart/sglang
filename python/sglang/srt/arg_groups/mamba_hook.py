@@ -186,9 +186,10 @@ def handle_mamba_state_swap(server_args: Any):
             "requests may drop."
         )
     if cfg.enable_linear_replayssm_spec:
-        # Plain ReplaySSM rings ride in the parked record (swap-v2 P0b/P4);
-        # the -spec rings track speculative-decode state, which swap already
-        # rejects with speculative decoding itself.
+        # Plain ReplaySSM rings ride in the parked record (swap-v2 P0b/P4).
+        # The -spec rings are request-keyed verify-round state that no record
+        # layout carries, so this rejection stays even though plain
+        # speculative decoding is now accepted above.
         raise ValueError(
             "--enable-mamba-state-swap is not supported with the ReplaySSM "
             "-spec ring buffers: the speculative-decode ring state is not "

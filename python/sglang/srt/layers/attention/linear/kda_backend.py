@@ -586,6 +586,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False  # mamba radix tracking snapshots `temporal`
         if get_exec().mamba.enable_linear_replayssm_spec:
             return False  # the ring already owns the verify-round commitment
+        if get_exec().mamba.enable_mamba_state_swap:
+            return False  # park/wake rebinds a request to different slots;
+            # the slot-keyed seed and the starved `temporal` commit would
+            # feed a woken request another request's verify state
         if get_disagg().disaggregation_mode != "null":
             return False  # the PD hand-off transfers `temporal`
         return True

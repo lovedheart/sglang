@@ -3351,7 +3351,7 @@ class KVCacheConfigurator:
             # ratio active rows would under-admit exactly the
             # extra_buffer configs the tier exists for.
             mamba = get_exec().mamba
-            swap_size = mamba.mamba_swap_size if mamba.enable_mamba_state_swap else 0
+            swap_size = _swap_extra()
             mamba_cap = get_schedule().max_mamba_cache_size // ratio + swap_size
             if swap_size and not get_memory().disable_radix_cache:
                 logger.info(
@@ -3599,6 +3599,18 @@ class KVCacheConfigurator:
                 low = mid + 1
         return low * alignment
 
+
+def _swap_extra() -> int:
+    """Extra live requests the state-swap tier adds on top of pool // ratio.
+
+    Parked records hold zero active rows, so each buys one more live request
+    (and more spec-state scratch rows) regardless of its width; the
+    intermediate-buffer reservations and the concurrency cap must price them
+    identically (see resolve_max_num_reqs).
+    """
+    mamba = get_exec().mamba
+    return mamba.mamba_swap_size if mamba.enable_mamba_state_swap else 0
+
     def _handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
         assert config is not None
@@ -3689,7 +3701,7 @@ class KVCacheConfigurator:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     max(1, get_schedule().max_running_requests // self.attn_dp_size),
-                    get_schedule().max_mamba_cache_size // ratio,
+                    get_schedule().max_mamba_cache_size // ratio + _swap_extra(),
                 )
                 intermediate_size = (
                     stage_per_req
@@ -3746,7 +3758,7 @@ class KVCacheConfigurator:
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
                     max(1, get_schedule().max_running_requests // self.attn_dp_size),
-                    get_schedule().max_mamba_cache_size // ratio,
+                    get_schedule().max_mamba_cache_size // ratio + _swap_extra(),
                 )
                 intermediate_size = per_req * (capped_reqs + 1) * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))

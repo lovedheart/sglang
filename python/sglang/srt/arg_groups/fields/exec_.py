@@ -656,9 +656,10 @@ class ExecMamba(msgspec.Struct):
         "and --disable-radix-cache, or --enable-int8-mamba-checkpoint with the "
         "radix cache on (any --mamba-radix-cache-strategy: parked requests "
         "release their whole active footprint, ping-pong tracking rows "
-        "included). Works with speculative decoding, but parked records "
-        "carry only target-model state: a woken request resumes with stale "
-        "draft state, costing acceptance rate, not correctness.",
+        "included). Works with speculative decoding except "
+        "--enable-linear-replayssm-spec; parked records carry only "
+        "target-model state, so a woken request resumes with stale draft "
+        "state, costing acceptance rate, not correctness.",
     ] = False
     mamba_swap_size: A[
         Optional[int],
