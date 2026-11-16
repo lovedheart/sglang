@@ -138,7 +138,6 @@ class _Base(CustomTestCase):
             mamba_allocator=None,
             swap_slots=2,
             device="cuda",
-            allow_replayssm=True,
         )
         rows = _slot_rows(pool) if rows is None else rows
         before = [p[:, 1].clone() for p in rows]
@@ -219,15 +218,6 @@ class TestSpecCursorsSurvive(_Base):
         self.assertEqual(int(pool.replayssm_spec_write_pos[2]), 3)
         self.assertEqual(int(pool.replayssm_cache_base[2]), 1)
         self.assertEqual(int(pool.replayssm_is_flush[2]), 1)
-
-
-class TestV1GatePreserved(_Base):
-    def test_replayssm_still_rejected_without_spike_env(self):
-        pool = _make_pool(spec=False)
-        with self.assertRaises(ValueError):
-            MambaSwapPool(
-                mamba_pool=pool, mamba_allocator=None, swap_slots=1, device="cuda"
-            )
 
 
 if __name__ == "__main__":

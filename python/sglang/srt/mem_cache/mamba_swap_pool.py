@@ -52,7 +52,6 @@ from typing import Any, List, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
@@ -82,23 +81,13 @@ class MambaSwapPool:
         mamba_allocator,
         swap_slots: int,
         device: str,
-        allow_replayssm: bool = False,
         rows_per_record: int = 1,
     ):
         # ReplaySSM adds slot-indexed ring planes (and, in plain decode mode,
         # a slot-indexed write cursor) to the parked state. Capture is cheap
         # and exact; the -spec row-keyed cursors live in req rows that park
-        # keeps, so they need no record. ``allow_replayssm`` is the V2-P0b
-        # spike switch — production gating stays in the mamba arg hook until
-        # the swap-v2 P4 gate passes.
-        if (
-            mamba_pool.enable_linear_replayssm
-            or mamba_pool.enable_linear_replayssm_spec
-        ) and not allow_replayssm:
-            raise ValueError(
-                "--enable-mamba-state-swap does not support the ReplaySSM "
-                "ring buffers yet; disable one of them."
-            )
+        # keeps, so they need no record. -spec rings are rejected upstream in
+        # the mamba arg hook (they ride on speculative decoding).
         self.mamba_pool = mamba_pool
         self.mamba_allocator = mamba_allocator
         self.swap_slots = swap_slots
@@ -384,7 +373,6 @@ def maybe_init_mamba_state_swap_pool(
         mamba_allocator=mamba_allocator,
         swap_slots=mamba.mamba_swap_size,
         device=device,
-        allow_replayssm=envs.SGLANG_TEST_MAMBA_SWAP_ALLOW_REPLAYSSM.get(),
     )
     logger.info(
         "mamba swap pool: %d parked slots (%.2fGB pinned)",

@@ -605,10 +605,6 @@ class Envs:
     SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
-    # V2-P0b spike: lift the swap x ReplaySSM validation rejection so the
-    # ring round-trip can be validated end to end. Temporary; removed when
-    # swap-v2 P4 promotes the combination (or the spike fails and it goes).
-    SGLANG_TEST_MAMBA_SWAP_ALLOW_REPLAYSSM = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)

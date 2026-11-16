@@ -1635,6 +1635,19 @@ class TestMambaStateSwapCompatibility(unittest.TestCase):
             )
         )
 
+    def test_accepts_plain_replayssm(self):
+        # swap-v2 P4 promoted plain ReplaySSM: the rings ride the parked
+        # record, so the combination is accepted.
+        handle_mamba_state_swap(
+            ServerArgs(
+                model_path="dummy",
+                enable_mamba_state_swap=True,
+                mamba_swap_size=4,
+                disable_radix_cache=True,
+                enable_linear_replayssm=True,
+            )
+        )
+
 
 class TestKV4Compatibility(unittest.TestCase):
     def setUp(self):
