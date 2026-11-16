@@ -29,8 +29,8 @@ def _make_req(req_pool_idx, origin_input_ids, output_ids):
 
 
 class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
-    def test_build_hisparse_decode_batch_populates_req_pool_indices_cpu(self):
-        # _build_hisparse_decode_batch builds a ScheduleBatch off the normal
+    def test_build_resumed_decode_batch_populates_req_pool_indices_cpu(self):
+        # _build_resumed_decode_batch builds a ScheduleBatch off the normal
         # extend path, so it must populate the req_pool_indices_cpu host mirror
         # in lockstep with the device tensor. A missing mirror crashes hisparse
         # decode bookkeeping (map_last_loc_to_buffer -> _grow_device_buffers
@@ -56,7 +56,7 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
             "sglang.srt.managers.scheduler.SamplingBatchInfo.from_schedule_batch",
             return_value=MagicMock(),
         ):
-            batch = scheduler._build_hisparse_decode_batch(reqs)
+            batch = scheduler._build_resumed_decode_batch(reqs)
 
         # Assert the invariant (cpu mirror == device tensor), not a hardcoded
         # copy of the input -- the latter would just restate the builder line.

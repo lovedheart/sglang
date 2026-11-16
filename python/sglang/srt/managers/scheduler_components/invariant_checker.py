@@ -639,6 +639,19 @@ class SchedulerInvariantChecker:
 
         if ps.is_hybrid_ssm and self.tree_cache.supports_mamba():
             mamba_leak, mamba_msg = self._check_mamba_pool(ps)
+            # Virtual SSM slots: every parked swap slot is owned by exactly
+            # one request in the parked list; a mismatch is a lost reference.
+            state = self.token_to_kv_pool_allocator.state
+            swap_pool = state.swap_pool if state is not None else None
+            if swap_pool is not None:
+                parked = self.get_request_lists().get(ListKind.MAMBA_PARKED)
+                parked_count = 0 if parked is None else len(list(parked))
+                if swap_pool.num_parked() != parked_count:
+                    mamba_leak = True
+                    mamba_msg += (
+                        f", swap_ledger=LEAK pool={swap_pool.num_parked()} "
+                        f"list={parked_count}"
+                    )
             has_leak |= mamba_leak
             messages.append(mamba_msg)
 

@@ -36,6 +36,9 @@ class ListKind(enum.Enum):
     PD_RELEASING = enum.auto()
     PD_OFFLOADING = enum.auto()
     HISPARSE_STAGING = enum.auto()
+    # Requests whose linear-attention state is parked in a pinned swap slot
+    # (virtual SSM slots); they hold their KV row and await a wake.
+    MAMBA_PARKED = enum.auto()
     GRAMMAR = enum.auto()
     DLLM = enum.auto()
     UOCR_PARKED = enum.auto()

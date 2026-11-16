@@ -1564,8 +1564,20 @@ class TestMambaStateSwapCompatibility(unittest.TestCase):
             enable_mamba_state_swap=True,
             mamba_swap_size=4,
             enable_unified_memory=True,
+            disable_radix_cache=True,
         )
         with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
+            handle_mamba_state_swap(server_args)
+
+    def test_rejects_radix_cache_on(self):
+        """v1 parked states cannot release ping-pong tracking slots, so the
+        rotation needs the one-slot-per-request radix-off config."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_mamba_state_swap=True,
+            mamba_swap_size=4,
+        )
+        with self.assertRaisesRegex(ValueError, "--disable-radix-cache"):
             handle_mamba_state_swap(server_args)
 
     def test_rejects_speculative_decoding(self):
@@ -1575,6 +1587,7 @@ class TestMambaStateSwapCompatibility(unittest.TestCase):
             mamba_swap_size=4,
             speculative_algorithm="DFLASH",
             speculative_draft_model_path="/local/draft",
+            disable_radix_cache=True,
         )
         with self.assertRaisesRegex(ValueError, "speculative"):
             handle_mamba_state_swap(server_args)
@@ -1582,7 +1595,10 @@ class TestMambaStateSwapCompatibility(unittest.TestCase):
     def test_plain_pair_is_accepted(self):
         handle_mamba_state_swap(
             ServerArgs(
-                model_path="dummy", enable_mamba_state_swap=True, mamba_swap_size=4
+                model_path="dummy",
+                enable_mamba_state_swap=True,
+                mamba_swap_size=4,
+                disable_radix_cache=True,
             )
         )
 

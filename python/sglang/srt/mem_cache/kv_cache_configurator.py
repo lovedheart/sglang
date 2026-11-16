@@ -3338,17 +3338,26 @@ class KVCacheConfigurator:
         capped_by_mamba = False
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
-            mamba_cap = get_schedule().max_mamba_cache_size // ratio
+            # Virtual SSM slots: with the state-swap tier on, a parked
+            # request lives in a pinned swap row, so the concurrency bound
+            # follows the combined capacity. v1 only allows the swap tier in
+            # one-slot-per-request configs (radix cache off), so the ratio
+            # term stays exact.
+            mamba = get_exec().mamba
+            swap_size = mamba.mamba_swap_size if mamba.enable_mamba_state_swap else 0
+            mamba_cap = (get_schedule().max_mamba_cache_size + swap_size) // ratio
             if mamba_cap < max_num_reqs:
                 capped_by_mamba = True
                 logger.warning(
                     "max_running_requests is capped to %d by the mamba state "
-                    "cache (max_mamba_cache_size=%d, %d state slots per "
-                    "request). To raise it: increase --mamba-full-memory-ratio "
-                    "or --max-mamba-cache-size, or halve the state size with "
-                    "--mamba-ssm-dtype bfloat16.",
+                    "cache (max_mamba_cache_size=%d, mamba_swap_size=%d, %d "
+                    "state slots per request). To raise it: increase "
+                    "--mamba-full-memory-ratio or --max-mamba-cache-size, "
+                    "enable --enable-mamba-state-swap, or halve the state "
+                    "size with --mamba-ssm-dtype bfloat16.",
                     mamba_cap,
                     get_schedule().max_mamba_cache_size,
+                    swap_size,
                     ratio,
                 )
             max_num_reqs = min(max_num_reqs, mamba_cap)
@@ -3357,6 +3366,7 @@ class KVCacheConfigurator:
                 raise RuntimeError(
                     f"Hybrid (mamba/linear-attention) state cache is too small to serve "
                     f"any requests. max_mamba_cache_size={get_schedule().max_mamba_cache_size}, "
+                    f"mamba_swap_size={swap_size}, "
                     f"mamba_ratio={ratio}, resulting max_num_reqs={max_num_reqs}. "
                     f"Try: (1) reduce --max-running-requests, "
                     f"(2) increase --mem-fraction-static, or "

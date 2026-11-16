@@ -319,6 +319,7 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
+from sglang.srt.managers.mamba_swap_scheduler import MambaSwapScheduler
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
@@ -710,6 +711,7 @@ class Scheduler(
         # Init running status
         self.init_running_status()
         self.init_pause_state()
+        self.init_mamba_swap()
 
         # Init chunked prefill
         self.init_chunked_prefill()
@@ -1388,6 +1390,33 @@ class Scheduler(
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+    def init_mamba_swap(self) -> None:
+        """Virtual SSM slots: the park/wake rotation over the active mamba
+        state pool, when a swap pool was built (see MambaSwapPool)."""
+        self.mamba_swap: Optional[MambaSwapScheduler] = None
+        self.mamba_parked_reqs: Optional[IndexedReqList] = None
+        swap_pool = self.req_to_token_pool.mamba_swap_pool
+        if swap_pool is None:
+            return
+        self.mamba_parked_reqs = IndexedReqList(
+            ListKind.MAMBA_PARKED, abort=self._abort_mamba_parked
+        )
+        self.mamba_swap = MambaSwapScheduler(
+            swap_pool=swap_pool,
+            state=self.token_to_kv_pool_allocator.state,
+            table=self.req_to_token_pool,
+            running_reqs=self.running_reqs,
+            parked_reqs=self.mamba_parked_reqs,
+            order_streams=(self.forward_stream, self.schedule_stream),
+        )
+
+    def _abort_mamba_parked(self, recv_req: AbortReq) -> None:
+        """Abort a parked request: its release drops the swap slot (the last
+        copy of its state) along with its KV."""
+        for req in [r for r in self.mamba_parked_reqs if recv_req.matches(r.rid)]:
+            self.request_retirer.abort(req, finished_reason=recv_req.finished_reason)
+            logger.debug(f"Abort mamba-parked request. {req.rid=}")
 
     def init_running_status(self):
         self.tp_size = get_parallel().tp_size
@@ -4195,8 +4224,9 @@ class Scheduler(
         self._pending_chunked_abort_req = None
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
-    def _build_hisparse_decode_batch(self, reqs):
-        """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
+    def _build_resumed_decode_batch(self, reqs):
+        """Build a decode batch for requests resuming without prefill (HiSparse
+        staging, mamba-state wakes)."""
         device = self.device
 
         batch = ScheduleBatch.init_new(
@@ -4290,7 +4320,7 @@ class Scheduler(
         if self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.move_ready_reqs(self.running_reqs)
             if len(ready_reqs) > 0:
-                new_batch = self._build_hisparse_decode_batch(ready_reqs)
+                new_batch = self._build_resumed_decode_batch(ready_reqs)
                 if running_batch.is_empty():
                     running_batch = new_batch
                 else:
@@ -4340,6 +4370,21 @@ class Scheduler(
         running_batch.filter_batch()
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
+
+        # Virtual SSM slots: wake a parked request into freed state capacity,
+        # or rotate one out when an admission is starved. Woken reqs join the
+        # decode stream through a resumed-decode batch, like HiSparse staging.
+        if self.mamba_swap is not None:
+            woken = self.mamba_swap.on_step_boundary(
+                running_batch, waiting_count=len(self.waiting_queue)
+            )
+            if woken:
+                woken_batch = self._build_resumed_decode_batch(woken)
+                if running_batch.is_empty():
+                    running_batch = woken_batch
+                else:
+                    running_batch.merge_batch(woken_batch)
+                running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch, staged)
@@ -4985,6 +5030,9 @@ class Scheduler(
             ListKind.PREFILL_LAUNCHED: self.prefill_launched_reqs,
             ListKind.DECODING: self.running_reqs,
         }
+        # Only exists with --enable-mamba-state-swap.
+        if self.mamba_parked_reqs is not None:
+            lists[ListKind.MAMBA_PARKED] = self.mamba_parked_reqs
         # Read at call time: a PD role switch rebuilds the PD queues.
         if self.disagg_prefill_bootstrap_queue is not None:
             lists[ListKind.PD_BOOTSTRAP] = self.disagg_prefill_bootstrap_queue.queue
