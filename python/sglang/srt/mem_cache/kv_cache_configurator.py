@@ -3254,6 +3254,19 @@ class KVCacheConfigurator:
         if get_memory().disable_radix_cache:
             return 1
 
+        # int8 checkpoints quantize radix state into the dedicated int8
+        # pool: the tree owns zero active fp rows (P0a forensics, asserted
+        # by the invariant checker), so each resident request keeps exactly
+        # one live slot — plus the ping-pong slots extra-buffer writes.
+        if get_exec().mamba.enable_int8_mamba_checkpoint:
+            if not get_exec().mamba.enable_mamba_extra_buffer:
+                return 1
+            return 1 + get_mamba_tracking_slots(
+                extra_buffer=True,
+                overlap=not get_schedule().disable_overlap_schedule,
+                lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+            )
+
         # Host-only checkpoints keep the live slot plus the ping-pong slots
         # the extra-buffer kernel writes. They do not keep a donate slot.
         if host_only_mamba_checkpoint():
@@ -3340,12 +3353,22 @@ class KVCacheConfigurator:
             ratio = self._calculate_mamba_ratio()
             # Virtual SSM slots: with the state-swap tier on, a parked
             # request lives in a pinned swap row, so the concurrency bound
-            # follows the combined capacity. v1 only allows the swap tier in
-            # one-slot-per-request configs (radix cache off), so the ratio
-            # term stays exact.
+            # follows the combined capacity. Both configs the swap tier
+            # allows (radix off, or radix on with int8 checkpoints +
+            # no_buffer) keep one live slot per request, so the ratio
+            # term is exact.
             mamba = get_exec().mamba
             swap_size = mamba.mamba_swap_size if mamba.enable_mamba_state_swap else 0
             mamba_cap = (get_schedule().max_mamba_cache_size + swap_size) // ratio
+            if swap_size and not get_memory().disable_radix_cache:
+                logger.info(
+                    "swap v2: radix-on mode, active=%d swap=%d, %d live "
+                    "slot(s) per request, transient reserve 0 (int8 radix "
+                    "checkpoints own no active fp rows).",
+                    get_schedule().max_mamba_cache_size,
+                    swap_size,
+                    ratio,
+                )
             if mamba_cap < max_num_reqs:
                 capped_by_mamba = True
                 logger.warning(

@@ -1580,15 +1580,37 @@ class TestMambaStateSwapCompatibility(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ReplaySSM"):
             handle_mamba_state_swap(server_args)
 
-    def test_rejects_radix_cache_on(self):
-        """v1 parked states cannot release ping-pong tracking slots, so the
-        rotation needs the one-slot-per-request radix-off config."""
+    def test_rejects_radix_cache_on_without_int8(self):
+        """Plain radix state caching keeps active fp slots a parked request
+        cannot release, so radix-on swap needs int8 checkpoints."""
         server_args = ServerArgs(
             model_path="dummy",
             enable_mamba_state_swap=True,
             mamba_swap_size=4,
         )
-        with self.assertRaisesRegex(ValueError, "--disable-radix-cache"):
+        with self.assertRaisesRegex(ValueError, "int8"):
+            handle_mamba_state_swap(server_args)
+
+    def test_accepts_radix_cache_on_with_int8(self):
+        handle_mamba_state_swap(
+            ServerArgs(
+                model_path="dummy",
+                enable_mamba_state_swap=True,
+                mamba_swap_size=4,
+                enable_int8_mamba_checkpoint=True,
+                mamba_radix_cache_strategy="no_buffer",
+            )
+        )
+
+    def test_rejects_radix_cache_on_with_int8_but_extra_buffer(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_mamba_state_swap=True,
+            mamba_swap_size=4,
+            enable_int8_mamba_checkpoint=True,
+            mamba_radix_cache_strategy="extra_buffer",
+        )
+        with self.assertRaisesRegex(ValueError, "no_buffer"):
             handle_mamba_state_swap(server_args)
 
     def test_rejects_speculative_decoding(self):

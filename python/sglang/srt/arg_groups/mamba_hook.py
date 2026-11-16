@@ -155,15 +155,29 @@ def handle_mamba_state_swap(server_args: Any):
             "swap-aware. Omit --radix-cache-backend."
         )
     if not cfg.disable_radix_cache:
-        # v1 slot economics: a parked request releases its MAIN slot only;
-        # a request holding extra ping-pong tracking slots (radix state
-        # caching) cannot free enough of the active pool for the rotation
-        # to pay. The 1-slot-per-request config is radix-off.
-        raise ValueError(
-            "--enable-mamba-state-swap currently requires "
-            "--disable-radix-cache: parked requests must be able to release "
-            "their whole active state footprint."
-        )
+        # Slot economics: a parked request must release its whole active
+        # footprint, so radix-on swap needs the 1-slot-per-request config.
+        # v2 opens radix-on when int8 checkpointing quantizes the tree's
+        # checkpoints into the dedicated int8 pool — the radix then owns
+        # zero active fp rows (P0a forensics) — but only with no_buffer,
+        # since ping-pong tracking slots are not parked.
+        if not cfg.enable_int8_mamba_checkpoint:
+            raise ValueError(
+                "--enable-mamba-state-swap with the radix cache enabled "
+                "requires --enable-int8-mamba-checkpoint: only int8 "
+                "checkpointing keeps zero active fp state slots in the "
+                "tree, so a parked request can release its whole active "
+                "footprint. Disable the radix cache or enable int8 "
+                "checkpoints."
+            )
+        if cfg.mamba_radix_cache_strategy != "no_buffer":
+            raise ValueError(
+                "--enable-mamba-state-swap with the radix cache enabled "
+                "requires --mamba-radix-cache-strategy no_buffer: "
+                "ping-pong tracking slots are not parked, so the swap "
+                "rotation cannot pay. Set "
+                "--mamba-radix-cache-strategy no_buffer."
+            )
     if cfg.speculative_algorithm is not None:
         raise ValueError(
             "--enable-mamba-state-swap is not supported with speculative "

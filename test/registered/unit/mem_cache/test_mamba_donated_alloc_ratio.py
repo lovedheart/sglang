@@ -130,7 +130,9 @@ class TestMambaRatioEnvGate(CustomTestCase):
     ratio can never drift out of sync with whether the decode lock is skipped."""
 
     @staticmethod
-    def _ratio(*, extra_buffer, lazy, disable_overlap, skip, host_only=False):
+    def _ratio(
+        *, extra_buffer, lazy, disable_overlap, skip, host_only=False, int8=False
+    ):
         from sglang.srt.environ import envs
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
@@ -156,6 +158,7 @@ class TestMambaRatioEnvGate(CustomTestCase):
                 disable_overlap_schedule=disable_overlap,
                 mamba_radix_cache_strategy=strategy,
                 enable_hierarchical_cache=host_only,
+                enable_int8_mamba_checkpoint=int8,
             ):
                 return KVCacheConfigurator._calculate_mamba_ratio(fake)
 
@@ -240,6 +243,33 @@ class TestMambaRatioEnvGate(CustomTestCase):
         self.assertEqual(r(extra_buffer=False, lazy=False, disable_overlap=True), 1)
         self.assertEqual(r(extra_buffer=True, lazy=True, disable_overlap=False), 2)
         self.assertEqual(r(extra_buffer=True, lazy=False, disable_overlap=False), 3)
+
+    def test_int8_checkpoints_drop_gpu_prefix_floor(self):
+        """int8 quantizes radix checkpoints into the int8 pool, so the tree
+        owns no active fp row: the divisor is the live slot plus ping-pong
+        only — no_buffer 1, lazy 2, overlap 3 — independent of skip.
+
+        The divisor-1 no_buffer branch is what lets swap v2 serve
+        (pool + swap) requests with the radix cache on.
+        """
+
+        def r(**kwargs):
+            return self._ratio(skip=False, int8=True, **kwargs)
+
+        self.assertEqual(r(extra_buffer=False, lazy=False, disable_overlap=True), 1)
+        self.assertEqual(r(extra_buffer=True, lazy=True, disable_overlap=False), 2)
+        self.assertEqual(r(extra_buffer=True, lazy=False, disable_overlap=False), 3)
+        # The int8 branch precedes the skip-decode-lock adjustment.
+        self.assertEqual(
+            self._ratio(
+                skip=True,
+                int8=True,
+                extra_buffer=False,
+                lazy=False,
+                disable_overlap=True,
+            ),
+            1,
+        )
 
     def _cleanup(self, *, host_only: bool, mamba_exist: bool):
         from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
