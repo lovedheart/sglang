@@ -398,12 +398,21 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
             )
         # A parked request's swap slot is the last copy of its state: the
         # request is ending, so drop it (every retire path funnels here).
-        # The flag below tells the state-slot release that the obligation is
-        # discharged, so skipping it is not read as a double free.
+        # The flag below tells the state-slot release — which runs from
+        # several places in this funnel — that the obligation is discharged,
+        # so skipping it is not read as a double free. The finally consumes
+        # it on every exit, so a retracted req never carries it onward.
         swap_pool = tree_cache.token_to_kv_pool_allocator.state.swap_pool
         swap_pool.drop(req.kv.mamba_swap_id)
         req.kv.mamba_swap_id = None
         req.kv.mamba_state_released_via_swap = True
+    try:
+        _release_kv_cache_inner(req, tree_cache, checkpoint=checkpoint)
+    finally:
+        req.kv.mamba_state_released_via_swap = False
+
+
+def _release_kv_cache_inner(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
         assert tree_cache.supports_mamba(), (
@@ -446,7 +455,6 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
     kv_storage_of(
         tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
     ).release_row(req)
-    req.kv.mamba_state_released_via_swap = False  # consume if no release did
     req.kv.mark_kv_released()
 
 

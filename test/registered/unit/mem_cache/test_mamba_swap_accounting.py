@@ -78,6 +78,10 @@ class TestSwapReleaseExactlyOnce(unittest.TestCase):
         self._retire(req, swap)
 
         self.assertIsNone(kv.mamba_swap_id)
+        # This retire exits through the not-holds_kv early return, so the
+        # swap-release marker must never be armed (a stale one would mask a
+        # real double-free assert in the request's next life).
+        self.assertFalse(kv.mamba_state_released_via_swap)
         self.assertEqual(swap.num_parked(), 0)
         self.assertEqual(swap.available_size(), 2)
         # A second retire of the same request must not touch the pool.
