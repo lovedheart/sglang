@@ -118,7 +118,12 @@ def handle_int8_mamba_checkpoint(server_args: Any):
                 "--int8-mamba-ckpt-host-size (number of pinned-RAM checkpoint "
                 "slots for the checkpoint RAM tier)."
             )
-        if cfg.mamba_radix_cache_strategy not in ("auto", "no_buffer", "extra_buffer"):
+        if cfg.mamba_radix_cache_strategy not in (
+            "auto",
+            "no_buffer",
+            "extra_buffer",
+            "extra_buffer_lazy",
+        ):
             raise ValueError(
                 "--enable-int8-mamba-checkpoint-offload does not support "
                 f"--mamba-radix-cache-strategy={cfg.mamba_radix_cache_strategy!r}."
