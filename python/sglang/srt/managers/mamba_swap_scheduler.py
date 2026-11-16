@@ -222,7 +222,12 @@ class MambaSwapScheduler:
         req = next(iter(self.parked_reqs))
         slot = self.state.slots.alloc(1)
         if slot is None:
-            logger.debug("mamba swap: wake deferred for %s (no free slot)", req.rid)
+            # Unreachable in single-writer discipline (the caller saw a free
+            # slot this tick); if it fires, slot accounting is broken and the
+            # rotation is stalling — keep it visible.
+            logger.warning(
+                "mamba swap: wake deferred for %s (no free active slot)", req.rid
+            )
             return None
         swap_id = req.kv.mamba_swap_id
         self.swap_pool.wake(swap_id, int(slot[0]), order_streams=self.order_streams)

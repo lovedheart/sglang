@@ -3254,28 +3254,19 @@ class KVCacheConfigurator:
         if get_memory().disable_radix_cache:
             return 1
 
-        # int8 checkpoints quantize radix state into the dedicated int8
-        # pool: the tree owns zero active fp rows (P0a forensics, asserted
-        # by the invariant checker), so each resident request keeps exactly
-        # one live slot — plus the ping-pong slots extra-buffer writes.
-        if get_exec().mamba.enable_int8_mamba_checkpoint:
-            if not get_exec().mamba.enable_mamba_extra_buffer:
+        mamba = get_exec().mamba
+        # Quantized checkpoints keep the live slot plus the ping-pong slots
+        # the extra-buffer kernel writes; they do not keep a donate slot.
+        # int8 goes first because host_only_mamba_checkpoint() rejects the
+        # int8 pairing; the int8 tree likewise owns zero active fp rows
+        # (P0a forensics, asserted by the invariant checker).
+        if mamba.enable_int8_mamba_checkpoint or host_only_mamba_checkpoint():
+            if not mamba.enable_mamba_extra_buffer:
                 return 1
             return 1 + get_mamba_tracking_slots(
                 extra_buffer=True,
                 overlap=not get_schedule().disable_overlap_schedule,
-                lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
-            )
-
-        # Host-only checkpoints keep the live slot plus the ping-pong slots
-        # the extra-buffer kernel writes. They do not keep a donate slot.
-        if host_only_mamba_checkpoint():
-            if not get_exec().mamba.enable_mamba_extra_buffer:
-                return 1
-            return 1 + get_mamba_tracking_slots(
-                extra_buffer=True,
-                overlap=not get_schedule().disable_overlap_schedule,
-                lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+                lazy=mamba.enable_mamba_extra_buffer_lazy,
             )
 
         skip_decode_lock = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
