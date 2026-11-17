@@ -913,6 +913,10 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # Fork-local escape hatch: skip the whole-request multimodal content salt in
+    # bind_multimodal_cache_namespace so text prefixes stay shared across media
+    # changes (single-tenant trust, matches pre-#47120 radix behaviour).
+    SGLANG_DISABLE_MM_CACHE_NAMESPACE = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
