@@ -822,13 +822,21 @@ class FlashEngramEmbedding(nn.Module):
         self.num_embeddings = sum(sizes)
         self.dim = dim
         self.rows = self.vocab_end - self.vocab_start
+        # Host-offloaded serving stages rows into registered host memory
+        # during loading instead of ever materializing the table in VRAM.
+        # (Unit tests build layers without a published runtime context.)
+        try:
+            offload = get_exec().offload.hy4_engram_offload
+        except ValueError:
+            offload = False
+        self.offload_mode = bool(fp8 and torch.cuda.is_available() and offload)
         # An fp8-serving checkpoint stores the table as fp8 rows + fp32 row
         # scales; reserve it up front (like the Qwen PLE table) so VRAM is
         # committed before streaming starts. Otherwise the dtype comes from
         # the checkpoint when it loads.
         self.weight = nn.Parameter(
             torch.empty(
-                (self.rows if fp8 else 0),
+                (self.rows if fp8 and not self.offload_mode else 0),
                 dim,
                 dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
             ),
@@ -836,7 +844,8 @@ class FlashEngramEmbedding(nn.Module):
         )
         self.weight_scale_inv = nn.Parameter(
             torch.empty(
-                self.rows if fp8 else 0, dtype=torch.float32 if fp8 else torch.bfloat16
+                self.rows if fp8 and not self.offload_mode else 0,
+                dtype=torch.float32 if fp8 else torch.bfloat16,
             ),
             requires_grad=False,
         )
@@ -847,18 +856,61 @@ class FlashEngramEmbedding(nn.Module):
         # Set by offload_to_host(): table lives in registered host memory.
         self.offloaded = False
 
+    def _host_tables(self):
+        """Lazily create the DeepSeek-V4.1 ``_HostTable`` backing (huge-page
+        mmap + cudaHostRegister) plus torch views over the pinned bytes:
+        ``(table, scale, table_view_u8, scale_view_f32)``."""
+        if getattr(self, "_host_stage", None) is None:
+            import numpy as np
+
+            from sglang.srt.arg_groups.engram_config import EngramReplication
+            from sglang.srt.layers.engram import _HostTable
+
+            table = _HostTable(
+                EngramReplication.NONE, self.rows * self.dim, "hy4_engram", None
+            )
+            scale = _HostTable(
+                EngramReplication.NONE, self.rows * 4, "hy4_engram_sc", None
+            )
+            self._host_stage = (
+                table,
+                scale,
+                torch.from_numpy(np.frombuffer(table.mm, dtype=np.uint8)).view(
+                    self.rows, self.dim
+                ),
+                torch.from_numpy(np.frombuffer(scale.mm, dtype=np.float32)).view(
+                    self.rows
+                ),
+            )
+        return self._host_stage
+
+    def _publish_offloaded(self) -> None:
+        table, scale, _, _ = self._host_stage
+        self._host_backing = (table, scale)
+        self._host_ptrs = (table.device_ptr, scale.device_ptr)
+        self.weight = nn.Parameter(
+            torch.empty(0, self.dim, dtype=torch.float8_e4m3fn), requires_grad=False
+        )
+        self.weight_scale_inv = nn.Parameter(
+            torch.empty(0, dtype=torch.float32), requires_grad=False
+        )
+        self.offloaded = True
+
     def offload_to_host(self, name: str) -> None:
         """Move the FP6/FP8 table and its fp32 row scales into huge-paged,
         cudaHostRegister-pinned host memory (the DeepSeek-V4.1 engram
         ``placement: cpu`` backing), leaving empty device parameters behind.
         The mapping's address is fixed for the process lifetime, so the
-        pointers baked into a CUDA graph stay valid across replays."""
-        import numpy as np
-
-        from sglang.srt.arg_groups.engram_config import EngramReplication
-        from sglang.srt.layers.engram import _HostTable
-
-        if self.offloaded or self.weight.numel() == 0:
+        pointers baked into a CUDA graph stay valid across replays. With
+        ``offload_mode`` the rows were already staged into the host tables
+        during loading, so this only publishes them; otherwise the VRAM
+        table is copied out."""
+        if self.offloaded:
+            return
+        if getattr(self, "_host_stage", None) is not None:
+            self._publish_offloaded()
+            return
+        if self.weight.numel() == 0:
             return
         if not self.weight.is_cuda:
             raise RuntimeError("--hy4-engram-offload requires CUDA weights")
@@ -871,28 +923,11 @@ class FlashEngramEmbedding(nn.Module):
                 "tables with fp32 row scales; got table="
                 f"{self.weight.dtype}, scale={self.weight_scale_inv.dtype}"
             )
-        table = _HostTable(
-            EngramReplication.NONE, self.rows * self.dim, f"hy4_engram_{name}", None
-        )
-        scale = _HostTable(
-            EngramReplication.NONE, self.rows * 4, f"hy4_engram_{name}_sc", None
-        )
+        _, _, table_view, scale_view = self._host_tables()
         with torch.no_grad():
-            np.frombuffer(table.mm, dtype=np.uint8)[:] = (
-                self.weight.view(torch.uint8).detach().cpu().reshape(-1).numpy()
-            )
-            np.frombuffer(scale.mm, dtype=np.float32)[:] = (
-                self.weight_scale_inv.detach().cpu().reshape(-1).numpy()
-            )
-        self._host_backing = (table, scale)
-        self._host_ptrs = (table.device_ptr, scale.device_ptr)
-        self.weight = nn.Parameter(
-            torch.empty(0, self.dim, dtype=torch.float8_e4m3fn), requires_grad=False
-        )
-        self.weight_scale_inv = nn.Parameter(
-            torch.empty(0, dtype=torch.float32), requires_grad=False
-        )
-        self.offloaded = True
+            table_view.reshape(-1).copy_(self.weight.view(torch.uint8).reshape(-1))
+            scale_view.reshape(-1).copy_(self.weight_scale_inv.reshape(-1))
+        self._publish_offloaded()
 
     def host_lookup(self):
         """Kernel args addressing the host-resident table
@@ -926,8 +961,17 @@ class FlashEngramEmbedding(nn.Module):
         if hi > lo:
             src = value[lo - row_start : hi - row_start]
             dst = slice(lo - self.vocab_start, hi - self.vocab_start)
-            # The shard tensors arrive on CPU; decode on the table's device.
-            if leaf == "weight":
+            # The shard tensors arrive on CPU; decode on the GPU and write
+            # either into the VRAM table or straight into the pinned host
+            # staging tables (offload mode keeps the table out of VRAM).
+            if self.offload_mode:
+                _, _, table_view, scale_view = self._host_tables()
+                if leaf == "weight":
+                    decoded = unpack_fp6_e2m3_pack4x6b(src.cuda())
+                    table_view[dst].copy_(decoded.view(torch.uint8))
+                else:
+                    scale_view[dst].copy_(src.reshape(-1).cuda())
+            elif leaf == "weight":
                 if tuple(self.weight.shape) != (self.rows, self.dim):
                     self.weight = nn.Parameter(
                         torch.empty(self.rows, self.dim, dtype=torch.float8_e4m3fn),
