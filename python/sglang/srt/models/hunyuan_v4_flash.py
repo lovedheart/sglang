@@ -1684,6 +1684,7 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
         )
         self.logits_processor = LogitsProcessor(text_config)
         self.dfly = None
+        self._dfly_load_in_progress = False
         if get_spec().speculative_algorithm == "DFLY":
             from sglang.srt.models.hunyuan_v4_flash_dfly import HYV4FlashDFly
 
@@ -1810,11 +1811,20 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
                     name += "_inv"
                 yield name, loaded_weight
 
-        self.do_load_weights(mapped_weights())
+        # do_load_weights calls post_load_weights from inside itself, before the
+        # draft's own weights have been handed to dfly.load_weights below. Defer
+        # dfly's post-load fixups here, otherwise the real-weights loader hits
+        # the "draft FFNs absent" fallback before the checkpoint has created them.
+        self._dfly_load_in_progress = self.dfly is not None
+        try:
+            self.do_load_weights(mapped_weights())
+        finally:
+            self._dfly_load_in_progress = False
         if self.visual is not None:
             self.visual.load_weights(vision_weights)
-        if self.dfly is not None and dfly_weights:
+        if self.dfly is not None:
             self.dfly.load_weights(dfly_weights)
+            self.dfly.post_load_weights()
         if model.engram_hasher is not None and not model.engram_hasher._loaded:
             raise ValueError("Hy4-Flash checkpoint is missing the Engram lookup_table")
         for layer in model.layers:
@@ -1840,7 +1850,10 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
 
             quantize_hy4_dense_weights_fp8_e3m4(self)
         self._maybe_quantize_lm_head()
-        if self.dfly is not None:
+        if self.dfly is not None and not self._dfly_load_in_progress:
+            # Dummy/sharded loads never pass through load_weights(), so no
+            # later call site covers them; real checkpoint loads defer to the
+            # tail of load_weights() after dfly.load_weights().
             self.dfly.post_load_weights()
 
     def _maybe_quantize_lm_head(self) -> None:
