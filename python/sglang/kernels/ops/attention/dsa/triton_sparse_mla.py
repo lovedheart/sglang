@@ -206,6 +206,7 @@ def _block_k_for_shared_memory(
     kv_dim: int,
     element_size: int,
     max_shared_memory: int | None,
+    row_elems: int | None = None,
 ) -> int:
     """Choose the largest supported KV tile that fits in shared memory.
 
@@ -213,6 +214,11 @@ def _block_k_for_shared_memory(
     for every BLOCK_K entry. A 64x576 BF16 tile therefore needs 73,984 bytes,
     which exceeds the 64 KiB workgroup limit on gfx942. FP8 needs only 37,120
     bytes, while devices with a larger limit can retain the preferred tile.
+
+    ``row_elems`` overrides the staged row width when the kernel's per-key
+    footprint differs from ``kv_dim`` -- notably the padded rope tail: a
+    non-power-of-2 D_TAIL is loaded as ``next_pow2(D_TAIL)``, so the tile
+    holds ``D_V + BLOCK_DT`` elements, more than the cache row itself.
     """
     block_k = _PREFERRED_BLOCK_K
     if max_shared_memory is None:
@@ -220,28 +226,52 @@ def _block_k_for_shared_memory(
         # limit. One-byte FP8 inputs fit the common 64 KiB minimum at D=576.
         return block_k if element_size == 1 else block_k // 2
 
-    bytes_per_entry = kv_dim * element_size + _INDEX_ELEMENT_SIZE
+    staged_dim = max(kv_dim, row_elems or 0)
+    bytes_per_entry = staged_dim * element_size + _INDEX_ELEMENT_SIZE
     while block_k > _MIN_BLOCK_K and block_k * bytes_per_entry > max_shared_memory:
         block_k //= 2
     return block_k
 
 
-def _sparse_mla_block_k(kv: torch.Tensor) -> int:
+def _sparse_mla_block_k(kv: torch.Tensor, row_elems: int | None = None) -> int:
     device = kv.device.index
     if device is None:
         device = torch.cuda.current_device()
     return _block_k_for_shared_memory(
-        kv.shape[-1], kv.element_size(), _max_shared_memory(device)
+        kv.shape[-1], kv.element_size(), _max_shared_memory(device), row_elems
     )
 
 
-def _scaled_kv_block_k(kv: torch.Tensor, kv_scaled: bool) -> int:
+def _scaled_kv_block_k(
+    kv: torch.Tensor, kv_scaled: bool, row_elems: int | None = None
+) -> int:
     # gfx950 with scaled-FP8 (fp8_ds_mla) KV: 64-key tiles spill scratch, 32-key tiles
     # do not (1.4-2.1x faster at 8-384 rows, measured on MI350X, K3.1).
-    block_k = _sparse_mla_block_k(kv)
+    block_k = _sparse_mla_block_k(kv, row_elems)
     if kv_scaled and is_gfx95_supported():
         return min(block_k, 32)
     return block_k
+
+
+def _fit_launch(launch, block_k: int, num_stages: int = 2):
+    """Run ``launch(block_k, num_stages)``, shrinking on shared-memory limits.
+
+    The tile heuristics size the KV stage by the cache row width, but the
+    kernels pad a non-power-of-2 rope tail to ``next_pow2(D_TAIL)``, so a
+    shape like Hy4's D_TAIL=320 (BLOCK_DT=512) can still overflow. Halve the
+    KV tile, then the pipeline depth, instead of failing the launch.
+    """
+    bk, st = block_k, num_stages
+    while True:
+        try:
+            return bk, st, launch(bk, st)
+        except triton.runtime.errors.OutOfResources:
+            if bk > _MIN_BLOCK_K:
+                bk = max(_MIN_BLOCK_K, bk // 2)
+            elif st > 1:
+                st = 1
+            else:
+                raise
 
 
 def _kv_splits_heuristic(
@@ -1169,7 +1199,8 @@ def _triton_sparse_mla_fwd_splitk(
     q_rope, stride_qr_t, stride_qr_h = _row_strides(q_rope)
 
     BLOCK_H = 16
-    BLOCK_K = _scaled_kv_block_k(kv, kv_scaled)
+    BLOCK_DT = triton.next_power_of_2(d_tail)
+    BLOCK_K = _scaled_kv_block_k(kv, kv_scaled, row_elems=d_v + BLOCK_DT)
     n_head_blocks = (H + BLOCK_H - 1) // BLOCK_H
     h_padded = n_head_blocks * BLOCK_H
     num_cu = _cu_count(q_nope.device)
@@ -1200,47 +1231,43 @@ def _triton_sparse_mla_fwd_splitk(
         # gate, since narrowing only paid off in this configuration.
         i32_page_safe = _page_offsets_fit_i32(kv.shape[0], kv_dim)
         i32_page_tuned = optimize_gfx950_fp8 and fused_num_warps == 2 and topk >= 2048
-        _sparse_mla_fused_kernel[(seq, n_head_blocks)](
-            q_nope,
-            q_rope,
-            kv,
-            idx_flat,
-            topk_length_ptr,
-            out,
-            qk_scale,
-            _FP8_MAX,
-            topk=topk,
-            H=H,
-            KV_DIM=kv_dim,
-            D_V=d_v,
-            D_TAIL=d_tail,
-            BLOCK_DT=triton.next_power_of_2(d_tail),
-            NUM_GROUPS=num_groups,
-            STRIDE_QN_T=stride_qn_t,
-            STRIDE_QN_H=stride_qn_h,
-            STRIDE_QR_T=stride_qr_t,
-            STRIDE_QR_H=stride_qr_h,
-            USE_FP8_DOT=use_fp8_dot,
-            USE_TOPK_LENGTH=use_topk_length,
-            BLOCK_H=BLOCK_H,
-            BLOCK_K=BLOCK_K,
-            USE_I64_PAGE=not (i32_page_safe and i32_page_tuned),
-            PIPE_STAGES=1 if use_topk_length else 3,
-            KV_SCALED=kv_scaled,
-            num_warps=fused_num_warps,
-            num_stages=2,
-        )
+
+        def _fused(bk: int, st: int) -> None:
+            _sparse_mla_fused_kernel[(seq, n_head_blocks)](
+                q_nope,
+                q_rope,
+                kv,
+                idx_flat,
+                topk_length_ptr,
+                out,
+                qk_scale,
+                _FP8_MAX,
+                topk=topk,
+                H=H,
+                KV_DIM=kv_dim,
+                D_V=d_v,
+                D_TAIL=d_tail,
+                BLOCK_DT=BLOCK_DT,
+                NUM_GROUPS=num_groups,
+                STRIDE_QN_T=stride_qn_t,
+                STRIDE_QN_H=stride_qn_h,
+                STRIDE_QR_T=stride_qr_t,
+                STRIDE_QR_H=stride_qr_h,
+                USE_FP8_DOT=use_fp8_dot,
+                USE_TOPK_LENGTH=use_topk_length,
+                BLOCK_H=BLOCK_H,
+                BLOCK_K=bk,
+                USE_I64_PAGE=not (i32_page_safe and i32_page_tuned),
+                PIPE_STAGES=1 if use_topk_length else 3,
+                KV_SCALED=kv_scaled,
+                num_warps=fused_num_warps,
+                num_stages=st,
+            )
+
+        _fit_launch(_fused, BLOCK_K)
         return out.unsqueeze(0)
 
-    tiles_per_split = (topk + kv_splits * BLOCK_K - 1) // (kv_splits * BLOCK_K)
-    active_splits = (topk + tiles_per_split * BLOCK_K - 1) // (
-        tiles_per_split * BLOCK_K
-    )
-    active_splits = min(active_splits, kv_splits)
     split_num_warps = 4
-    if optimize_gfx950_fp8:
-        split_num_warps = _gfx950_sparse_mla_num_warps(base_ctas, active_splits, num_cu)
-
     lse_partial = torch.empty(
         seq, kv_splits, h_padded, dtype=torch.float32, device=q_nope.device
     )
@@ -1248,7 +1275,13 @@ def _triton_sparse_mla_fwd_splitk(
         seq, kv_splits, h_padded, d_v, dtype=torch.bfloat16, device=q_nope.device
     )
 
-    with _no_async_copy():
+    def _splitk(bk: int, st: int) -> int:
+        tiles_per_split = (topk + kv_splits * bk - 1) // (kv_splits * bk)
+        active = (topk + tiles_per_split * bk - 1) // (tiles_per_split * bk)
+        active = min(active, kv_splits)
+        warps = split_num_warps
+        if optimize_gfx950_fp8:
+            warps = _gfx950_sparse_mla_num_warps(base_ctas, active, num_cu)
         _sparse_mla_split_k_kernel[(seq, n_head_blocks, kv_splits)](
             q_nope,
             q_rope,
@@ -1263,7 +1296,7 @@ def _triton_sparse_mla_fwd_splitk(
             KV_DIM=kv_dim,
             D_V=d_v,
             D_TAIL=d_tail,
-            BLOCK_DT=triton.next_power_of_2(d_tail),
+            BLOCK_DT=BLOCK_DT,
             NUM_GROUPS=num_groups,
             STRIDE_QN_T=stride_qn_t,
             STRIDE_QN_H=stride_qn_h,
@@ -1272,11 +1305,15 @@ def _triton_sparse_mla_fwd_splitk(
             USE_FP8_DOT=use_fp8_dot,
             KV_SPLITS=kv_splits,
             BLOCK_H=BLOCK_H,
-            BLOCK_K=BLOCK_K,
+            BLOCK_K=bk,
             KV_SCALED=kv_scaled,
-            num_warps=split_num_warps,
-            num_stages=2,
+            num_warps=warps,
+            num_stages=st,
         )
+        return active
+
+    with _no_async_copy():
+        block_k, _, active_splits = _fit_launch(_splitk, BLOCK_K)
 
         D_CHUNK = _reduce_d_chunk(active_splits, seq * H) if optimize_gfx950_fp8 else 64
         _sparse_mla_reduce_kernel[(seq, H, (d_v + D_CHUNK - 1) // D_CHUNK)](
@@ -1289,7 +1326,7 @@ def _triton_sparse_mla_fwd_splitk(
             ACTIVE_SPLITS=active_splits,
             ACTIVE_SPLITS_POW2=_next_pow2(active_splits),
             D_CHUNK=D_CHUNK,
-            BLOCK_K=BLOCK_K,
+            BLOCK_K=block_k,
             num_warps=4,
         )
     return out.unsqueeze(0)
