@@ -13,6 +13,7 @@ adds:
 
 import logging
 import os
+import re
 from copy import copy
 from typing import Iterable, Optional, Tuple
 
@@ -828,6 +829,61 @@ class FlashEngramEmbedding(nn.Module):
         self.weight_scale_inv = nn.Parameter(
             torch.empty(0, dtype=torch.bfloat16), requires_grad=False
         )
+        # FP6_E2M3_ROW_SCALE checkpoints stream the table as row parts; rows
+        # counted per sub-leaf, and the flags flip when the table is whole.
+        self._fp6_seen = {"weight": 0, "scale": 0}
+        self._fp6_done = {"weight": False, "scale": False}
+
+    def load_fp6_part(self, leaf: str, value: torch.Tensor, row_start: int) -> None:
+        """Row part of an fp6-E2M3 packed table (quant algo
+        FP6_E2M3_ROW_SCALE): leaf is "weight" ([rows, dim*3//4] uint8, 4
+        codes per 3 little-endian bytes) or "scale" ([rows, 1] fp32) starting
+        at global row ``row_start``. Parts must arrive in order."""
+        from sglang.kernels.ops.embeddings.hy4_flash_engram import (
+            unpack_fp6_e2m3_pack4x6b,
+        )
+
+        if row_start != self._fp6_seen[leaf]:
+            raise ValueError(
+                f"Engram fp6 {leaf} part at row {row_start} after "
+                f"{self._fp6_seen[leaf]} rows"
+            )
+        stop = row_start + value.shape[0]
+        if stop > self.num_embeddings:
+            raise ValueError(
+                f"Engram fp6 {leaf} part overruns the table "
+                f"({stop} > {self.num_embeddings} rows)"
+            )
+        lo = max(row_start, self.vocab_start)
+        hi = min(stop, self.vocab_end)
+        if hi > lo:
+            src = value[lo - row_start : hi - row_start]
+            dst = slice(lo - self.vocab_start, hi - self.vocab_start)
+            if leaf == "weight":
+                if tuple(self.weight.shape) != (self.rows, self.dim):
+                    self.weight = nn.Parameter(
+                        torch.empty(self.rows, self.dim, dtype=torch.float8_e4m3fn),
+                        requires_grad=False,
+                    )
+                self.weight.data[dst] = unpack_fp6_e2m3_pack4x6b(src)
+            else:
+                if tuple(self.weight_scale_inv.shape) != (self.rows,):
+                    self.weight_scale_inv = nn.Parameter(
+                        torch.empty(self.rows, dtype=torch.float32),
+                        requires_grad=False,
+                    )
+                self.weight_scale_inv.data[dst] = src.reshape(-1)
+        self._fp6_seen[leaf] = stop
+        if stop == self.num_embeddings:
+            self._fp6_done[leaf] = True
+
+    def check_fp6_complete(self) -> None:
+        if self._fp6_seen["weight"] and not all(self._fp6_done.values()):
+            raise ValueError(
+                "Engram fp6 table incomplete: weight "
+                f"{self._fp6_seen['weight']}/{self.num_embeddings} rows, scale "
+                f"{self._fp6_seen['scale']}/{self.num_embeddings} rows"
+            )
 
     def load(self, leaf: str, value: torch.Tensor) -> None:
         if value.shape[0] != self.num_embeddings:
@@ -1617,6 +1673,21 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
             self.dfly.load_weights(dfly_weights)
         if model.engram_hasher is not None and not model.engram_hasher._loaded:
             raise ValueError("Hy4-Flash checkpoint is missing the Engram lookup_table")
+        for layer in model.layers:
+            if getattr(layer, "engram_layer", None) is not None:
+                layer.engram_layer.multi_head_embedding.check_fp6_complete()
+
+    def _load_engram_fp6_part(self, prefix, engram, part, leaf, value):
+        entries = getattr(self.quant_config, "quantized_layers", None) or {}
+        entry = entries.get(f"{prefix}.engram_layer.multi_head_embedding.embedding")
+        if not entry or "rows_per_part" not in entry:
+            raise ValueError(
+                f"FP6 Engram part for {prefix} needs an FP6_E2M3_ROW_SCALE "
+                "quantized_layers entry carrying rows_per_part"
+            )
+        engram.multi_head_embedding.load_fp6_part(
+            leaf, value, part * int(entry["rows_per_part"])
+        )
 
     def _load_engram(self, name: str, value: torch.Tensor):
         prefix, leaf = name.split(".engram_layer.", 1)
@@ -1628,7 +1699,12 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
             self.model.engram_hasher.load_lookup(value)
             return
         if leaf.startswith("multi_head_embedding.embedding."):
-            engram.multi_head_embedding.load(leaf.rsplit(".", 1)[1], value)
+            tail = leaf[len("multi_head_embedding.embedding.") :]
+            part = re.fullmatch(r"p(\d+)\.(weight|scale)", tail)
+            if part:
+                self._load_engram_fp6_part(prefix, engram, int(part[1]), part[2], value)
+                return
+            engram.multi_head_embedding.load(tail, value)
             return
         if engram.load_leaf(leaf, value):
             return

@@ -853,7 +853,12 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     def override_quantization_method(cls, hf_quant_config, user_quant):
         if hf_quant_config is None:
             return None
-        if hf_quant_config.get("quant_method", "") == "modelopt_mixed":
+        # Hy4's quantizer labels the same MIXED_PRECISION layout
+        # "modelopt_hybrid"; both spellings mean this config.
+        if hf_quant_config.get("quant_method", "") in (
+            "modelopt_mixed",
+            "modelopt_hybrid",
+        ):
             return "modelopt_mixed"
         return None
 

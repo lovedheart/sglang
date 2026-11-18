@@ -167,6 +167,7 @@ def hy4_flash_engram_combine(
     hidden = hidden.contiguous()
     assert kv.shape == (tokens, (hc + 1) * hidden_size)
     assert hashes.stride(1) == 1
+
     _engram_combine_kernel[(tokens,)](
         kv,
         hidden,
@@ -187,3 +188,48 @@ def hy4_flash_engram_combine(
         num_warps=8,
     )
     return out
+
+
+_E2M3_LUT: torch.Tensor | None = None
+
+
+def _e2m3_lut() -> torch.Tensor:
+    """float32 decode table for the 64 FP6 E2M3 codes (sign, exp2, mant3)."""
+    global _E2M3_LUT
+    if _E2M3_LUT is None:
+        codes = torch.arange(64, dtype=torch.int32)
+        mag_i = codes & 31
+        e, m = mag_i >> 3, mag_i & 7
+        mag = torch.where(
+            e == 0,
+            m.to(torch.float32) * 0.125,
+            (1.0 + m.to(torch.float32) / 8.0)
+            * torch.pow(2.0, (e - 1).to(torch.float32)),
+        )
+        _E2M3_LUT = torch.where(codes >= 32, -mag, mag)
+    return _E2M3_LUT
+
+
+def unpack_fp6_e2m3_pack4x6b(
+    packed: torch.Tensor, out_dtype: torch.dtype = torch.float8_e4m3fn
+) -> torch.Tensor:
+    """[rows, n * 3 // 4] uint8 holding n six-bit codes per row four to three
+    little-endian bytes -> [rows, n] ``out_dtype`` values. FP6 E2M3 values sit
+    exactly on the FP8 E4M3 grid, so the default cast is lossless."""
+    rows, nbytes = packed.shape
+    assert nbytes % 3 == 0, "packed rows must hold whole 4-code groups"
+    b = packed.reshape(rows, nbytes // 3, 3).to(torch.int16)
+    codes = (
+        torch.stack(
+            (
+                b[..., 0] & 0x3F,
+                ((b[..., 0] >> 6) | (b[..., 1] << 2)) & 0x3F,
+                ((b[..., 1] >> 4) | (b[..., 2] << 4)) & 0x3F,
+                b[..., 2] >> 2,
+            ),
+            -1,
+        )
+        .reshape(rows, -1)
+        .to(torch.int64)
+    )
+    return _e2m3_lut().to(packed.device)[codes].to(out_dtype)

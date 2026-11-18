@@ -112,5 +112,6 @@ def fused_experts_none_to_sm12x_fp3_bf16(
         topk_ids=topk_ids,
         activation=cfg.activation,
         routed_scaling_factor=cfg.routed_scaling_factor,
+        swiglu_limit=cfg.swiglu_limit or None,
     )
     return StandardCombineInput(hidden_states=output)

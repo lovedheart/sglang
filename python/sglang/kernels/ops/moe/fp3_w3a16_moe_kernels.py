@@ -861,6 +861,7 @@ def _gemv_fused_experts(
     topk_weights: torch.Tensor,  # [M, topk] fp32
     topk_ids: torch.Tensor,  # [M, topk] int
     routed_scaling_factor: float,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """Decode-size fused MoE via two grouped SIMT GEMV launches; fp32 math."""
     m, k = hidden_states.shape
@@ -878,7 +879,14 @@ def _gemv_fused_experts(
     _jit_gemv_module(1, k // 8, r1, ln1).run(
         hidden_states, w13, w13_sf, w13_gs, etab, y1, topk
     )
-    act = torch.nn.functional.silu(y1[:, :inter]) * y1[:, inter:]
+    act = torch.nn.functional.silu(
+        y1[:, :inter] if swiglu_limit is None else y1[:, :inter].clamp(max=swiglu_limit)
+    )
+    act = act * (
+        y1[:, inter:]
+        if swiglu_limit is None
+        else y1[:, inter:].clamp(-swiglu_limit, swiglu_limit)
+    )
     y2 = torch.empty((slots, k), dtype=torch.float32, device=dev)
     _jit_gemv_module(2, inter // 8, r2, ln2).run(act, w2, w2_sf, w2_gs, etab, y2)
     out = (y2.view(m, topk, k) * topk_weights.reshape(m, topk, 1)).sum(1)
@@ -899,12 +907,16 @@ def fused_experts_fp3_w3a16(
     topk_ids: torch.Tensor,  # [M, topk] int
     activation: str = "silu",
     routed_scaling_factor: float | None = None,
+    swiglu_limit: float | None = None,
     config: dict[str, int] | None = None,
 ) -> torch.Tensor:
     """Full W3A16 fused-MoE forward: GEMM1 -> silu*up -> GEMM2 -> topk sum.
 
     Dispatches decode-size slot counts to the grouped SIMT GEMV (zero VRAM
     overhead, fp32 math) and larger ones to the Triton tensor-core GEMM.
+    ``swiglu_limit`` clamps gate to (-inf, L] and up to [-L, L] before the
+    activation; the CuTe DSL and W4A4 arms bake an unclamped swiglu into
+    their epilogues, so any set limit routes to the GEMV/Triton paths.
     """
     global \
         _gemv_unavailable, \
@@ -930,6 +942,7 @@ def fused_experts_fp3_w3a16(
     if (
         not _w4a4_disabled
         and config is None
+        and swiglu_limit is None
         and w4a4_min > 0
         and m >= w4a4_min
         and _is_sm12x()
@@ -965,6 +978,7 @@ def fused_experts_fp3_w3a16(
     if (
         not _cute_disabled
         and config is None
+        and swiglu_limit is None
         and 0 < slots <= _CUTE_MAX_SLOTS
         and _is_sm12x()
     ):
@@ -1011,6 +1025,7 @@ def fused_experts_fp3_w3a16(
                 topk_weights,
                 topk_ids,
                 routed_scaling_factor or 1.0,
+                swiglu_limit=swiglu_limit,
             )
         except Exception as exc:  # noqa: BLE001  (JIT build/host: stay on Triton)
             _gemv_unavailable = True
@@ -1061,6 +1076,7 @@ def fused_experts_fp3_w3a16(
         config,
         topk_ids=topk_ids_i32,
         activation=activation,
+        swiglu_limit=swiglu_limit,
     )
 
     cache3 = torch.empty((num_valid, k), dtype=torch.bfloat16, device=dev)
