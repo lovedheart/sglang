@@ -2682,9 +2682,13 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
-        if attn_sink is not None and dsa_impl != "flashmla_sparse":
+        if attn_sink is not None and dsa_impl not in (
+            "flashmla_sparse",
+            "triton_sparse_mla",
+        ):
             raise RuntimeError(
-                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
+                "Learnable attention sinks require flashmla_sparse or "
+                f"triton_sparse_mla, got {dsa_impl}"
             )
 
         phase = (
@@ -2964,6 +2968,7 @@ class DeepseekSparseAttnBackend(
                     sm_scale=layer.scaling,
                     v_head_dim=layer.v_head_dim,
                     topk_length=metadata.dsa_cache_seqlens_int32,
+                    attn_sink=attn_sink,
                 )
             return self._forward_flashmla_sparse(
                 q_all=q_all,
@@ -3872,6 +3877,7 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
         topk_length: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
             sparse_mla_prefill,
@@ -3896,6 +3902,7 @@ class DeepseekSparseAttnBackend(
             sm_scale,
             v_head_dim,
             topk_length=topk_length,
+            attn_sink=attn_sink,
             union=union,
         )
 
@@ -4216,15 +4223,19 @@ class DeepseekSparseAttnBackend(
     _TRITON_SINK_DECODE_MAX_WORK = 64 * 1024
 
     def _use_triton_sink_decode(self, q_nope, kv_cache, page_table_1, attn_sink):
-        return (
-            attn_sink is not None
-            and _is_cuda
-            and q_nope.shape[1] <= 16
-            and q_nope.dtype == torch.bfloat16
-            and kv_cache.dtype == torch.bfloat16
+        if attn_sink is None or not _is_cuda:
+            return False
+        if q_nope.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
+            return False
+        if (
+            q_nope.shape[1] <= 16
             and q_nope.shape[0] * page_table_1.shape[-1]
             <= self._TRITON_SINK_DECODE_MAX_WORK
-        )
+        ):
+            return True
+        # SM12x has no flash_mla binaries at all, so the triton sink decode is
+        # the only bf16 sparse-decode path; take it past the tuned caps.
+        return self.device_sm_major == 12
 
     def _forward_triton_sink_decode(
         self,

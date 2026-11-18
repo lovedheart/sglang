@@ -9,6 +9,7 @@ on DSA shapes:
 """
 
 import torch
+import triton
 
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _FP8_MAX,
@@ -209,6 +210,7 @@ def triton_sparse_mla_decode_splitk(
                 KV_DIM=kv_dim,
                 D_V=d_v,
                 D_TAIL=d_tail,
+                BLOCK_DT=triton.next_power_of_2(d_tail),
                 NUM_GROUPS=num_groups,
                 STRIDE_QN_T=stride_qn_t,
                 STRIDE_QN_H=stride_qn_h,
@@ -271,6 +273,7 @@ def triton_sparse_mla_decode_splitk(
             KV_DIM=kv_dim,
             D_V=d_v,
             D_TAIL=d_tail,
+            BLOCK_DT=triton.next_power_of_2(d_tail),
             NUM_GROUPS=num_groups,
             STRIDE_QN_T=stride_qn_t,
             STRIDE_QN_H=stride_qn_h,

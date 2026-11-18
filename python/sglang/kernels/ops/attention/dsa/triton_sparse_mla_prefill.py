@@ -57,6 +57,7 @@ def _sparse_mla_prefill_kernel(
     idx_ptr,
     len_ptr,
     o_ptr,
+    sink_ptr,
     sm_scale,
     topk,
     H: tl.constexpr,
@@ -64,7 +65,9 @@ def _sparse_mla_prefill_kernel(
     D_QK: tl.constexpr,
     D_V: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_DT: tl.constexpr,
     IDX64: tl.constexpr,
+    HAS_SINK: tl.constexpr,
 ):
     t = tl.program_id(0)
     # Token offsets in int64: at h=128 the q offset t*H*D_QK passes 2^31 from
@@ -75,19 +78,29 @@ def _sparse_mla_prefill_kernel(
     h = tl.arange(0, BLOCK_H)
     hmask = h < H
     dv = tl.arange(0, D_V)
-    dt = tl.arange(0, D_TAIL)
+    dt = tl.arange(0, BLOCK_DT)
+    dtmask = dt < D_TAIL
 
     qb = q_ptr + t64 * H * D_QK
     q_main = tl.load(
         qb + h[:, None] * D_QK + dv[None, :], mask=hmask[:, None], other=0.0
     )
     q_tail = tl.load(
-        qb + h[:, None] * D_QK + (D_V + dt)[None, :], mask=hmask[:, None], other=0.0
+        qb + h[:, None] * D_QK + (D_V + dt)[None, :],
+        mask=hmask[:, None] & dtmask[None, :],
+        other=0.0,
     )
 
     m_i = tl.full([BLOCK_H], -float("inf"), tl.float32)
     l_i = tl.zeros([BLOCK_H], tl.float32)
     acc = tl.zeros([BLOCK_H, D_V], tl.float32)
+    if HAS_SINK:
+        # Seed the online softmax with the sink logit as if it were one extra
+        # key with zero value: m_i starts at the sink and l_i at its (unit)
+        # weight, so the loop's rescaling folds exp(sink - m) like any key.
+        sink = tl.load(sink_ptr + h, mask=hmask, other=-float("inf")).to(tl.float32)
+        m_i = sink
+        l_i = tl.where(sink == -float("inf"), 0.0, 1.0)
 
     n = tl.arange(0, BLOCK_N)
     k_len = tl.load(len_ptr + t)
@@ -100,7 +113,11 @@ def _sparse_mla_prefill_kernel(
             row = tl.where(valid, idx, 0)
         kb = kv_ptr + row[:, None] * D_QK
         kv_main = tl.load(kb + dv[None, :], mask=valid[:, None], other=0.0)
-        kv_tail = tl.load(kb + (D_V + dt)[None, :], mask=valid[:, None], other=0.0)
+        kv_tail = tl.load(
+            kb + (D_V + dt)[None, :],
+            mask=valid[:, None] & dtmask[None, :],
+            other=0.0,
+        )
 
         qk = tl.dot(q_main, tl.trans(kv_main))
         qk = tl.dot(q_tail, tl.trans(kv_tail), qk) * sm_scale
@@ -411,6 +428,7 @@ def sparse_mla_prefill(
     d_v=512,
     *,
     topk_length=None,
+    attn_sink=None,
     out=None,
     union=0,
     config=None,
@@ -430,6 +448,9 @@ def sparse_mla_prefill(
         d_v: value head dim (512 for DSA).
         topk_length: optional ``[T]`` int32 per-row valid count. Computed from
             ``indices`` when omitted; pass it to skip that reduction.
+        attn_sink: optional ``[H]`` fp32 per-head sink logits added to the softmax
+            denominator (same convention as the sparse-MLA decode kernels). Only
+            supported with ``union=0``.
         out: optional preallocated ``[T, H, d_v]`` bf16 output.
         union: 0 (off), 2 or 4: share one gathered union index set across ``G``
             adjacent query tokens. Exact, not an approximation: an ownership
@@ -446,6 +467,13 @@ def sparse_mla_prefill(
         indices = indices.squeeze(1)
     T, h, d_qk = q.shape
     topk = indices.shape[-1]
+    if attn_sink is not None:
+        assert attn_sink.shape == (h,) and attn_sink.dtype == torch.float32, (
+            f"attn_sink must be [H={h}] fp32, got {tuple(attn_sink.shape)} "
+            f"{attn_sink.dtype}"
+        )
+        if union in (2, 4):
+            raise ValueError("attn_sink is not supported on the union path")
     q, kv, indices = q.contiguous(), kv.contiguous(), indices.contiguous()
     if kv.dtype != torch.bfloat16:
         # An FP8 pool that reaches this entry (the PAGED transform leaves it
@@ -458,15 +486,19 @@ def sparse_mla_prefill(
     if out is None:
         out = torch.empty(T, h, d_v, dtype=torch.bfloat16, device=q.device)
 
-    if union in (2, 4) and _union_path(
-        q=q,
-        kv=kv,
-        indices=indices,
-        sm_scale=sm_scale,
-        d_v=d_v,
-        out=out,
-        G=union,
-        union_config=union_config,
+    if (
+        union in (2, 4)
+        and (d_qk - d_v) & (d_qk - d_v - 1) == 0
+        and _union_path(
+            q=q,
+            kv=kv,
+            indices=indices,
+            sm_scale=sm_scale,
+            d_v=d_v,
+            out=out,
+            G=union,
+            union_config=union_config,
+        )
     ):
         return out
 
@@ -491,6 +523,7 @@ def sparse_mla_prefill(
                 indices,
                 topk_length,
                 out,
+                attn_sink,
                 sm_scale,
                 topk,
                 H=h,
@@ -498,9 +531,11 @@ def sparse_mla_prefill(
                 D_QK=d_qk,
                 D_V=d_v,
                 BLOCK_N=bn_try,
+                BLOCK_DT=triton.next_power_of_2(d_qk - d_v),
                 num_warps=warps,
                 num_stages=ns_try,
                 IDX64=idx64,
+                HAS_SINK=attn_sink is not None,
             )
         except triton.runtime.errors.OutOfResources:
             # A larger head count (BLOCK_H) or a smaller smem budget can push the

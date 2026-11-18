@@ -116,17 +116,19 @@ def _load_kv_tail(
     valid,
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
+    BLOCK_DT: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     KV_SCALED: tl.constexpr,
 ):
-    dt = tl.arange(0, D_TAIL)
+    dt = tl.arange(0, BLOCK_DT)
     if KV_SCALED:
         # The BF16 tail follows the FP8 NoPE bytes and one FP32 scale per group.
         tail_base = (kv_base + D_V + 4 * NUM_GROUPS).to(tl.pointer_type(tl.bfloat16))
         tail_ptr = tail_base + dt[None, :]
     else:
         tail_ptr = kv_base + (D_V + dt)[None, :]
-    return tl.load(tail_ptr, mask=valid[:, None], other=0.0)
+    mask = valid[:, None] & (dt < D_TAIL)[None, :]
+    return tl.load(tail_ptr, mask=mask, other=0.0)
 
 
 def _async_copy_is_harmful() -> bool:
@@ -388,6 +390,7 @@ def _sparse_mla_fwd_split_dim_kernel(
     DIM: tl.constexpr,
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
+    BLOCK_DT: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     STRIDE_QN_T,
     STRIDE_QN_H,
@@ -401,7 +404,7 @@ def _sparse_mla_fwd_split_dim_kernel(
     s_i = tl.program_id(0).to(tl.int64)
 
     h = tl.arange(0, H)
-    dt = tl.arange(0, D_TAIL)
+    dt = tl.arange(0, BLOCK_DT)
     g = tl.arange(0, _G)
 
     input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
@@ -414,7 +417,9 @@ def _sparse_mla_fwd_split_dim_kernel(
     if NUM_GROUPS >= 4:
         q3 = tl.load(q_row + (3 * _G + g)[None, :]).to(input_type)
     q_tail = tl.load(
-        q_rope_ptr + s_i * STRIDE_QR_T + h[:, None] * STRIDE_QR_H + dt[None, :]
+        q_rope_ptr + s_i * STRIDE_QR_T + h[:, None] * STRIDE_QR_H + dt[None, :],
+        mask=(dt < D_TAIL)[None, :],
+        other=0.0,
     ).to(input_type)
 
     neg_large = -3.4028234663852886e38
@@ -447,9 +452,9 @@ def _sparse_mla_fwd_split_dim_kernel(
             kv2 = _load_kv_group(kbase, valid, 2, D_V, KV_SCALED).to(input_type)
         if NUM_GROUPS >= 4:
             kv3 = _load_kv_group(kbase, valid, 3, D_V, KV_SCALED).to(input_type)
-        kv_tail = _load_kv_tail(kbase, valid, D_V, D_TAIL, NUM_GROUPS, KV_SCALED).to(
-            input_type
-        )
+        kv_tail = _load_kv_tail(
+            kbase, valid, D_V, D_TAIL, BLOCK_DT, NUM_GROUPS, KV_SCALED
+        ).to(input_type)
 
         qk = tl.dot(q0, tl.trans(kv0))
         if NUM_GROUPS >= 2:
@@ -586,6 +591,7 @@ def _triton_sparse_mla_fwd_single(
             DIM=dim,
             D_V=d_v,
             D_TAIL=d_tail,
+            BLOCK_DT=triton.next_power_of_2(d_tail),
             NUM_GROUPS=num_groups,
             STRIDE_QN_T=stride_qn_t,
             STRIDE_QN_H=stride_qn_h,
@@ -610,6 +616,7 @@ def _triton_sparse_mla_fwd_single(
             DIM=dim,
             D_V=d_v,
             D_TAIL=d_tail,
+            BLOCK_DT=triton.next_power_of_2(d_tail),
             NUM_GROUPS=num_groups,
             STRIDE_QN_T=stride_qn_t,
             STRIDE_QN_H=stride_qn_h,
@@ -661,6 +668,7 @@ def _sparse_mla_fused_kernel(
     KV_DIM: tl.constexpr,
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
+    BLOCK_DT: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     STRIDE_QN_T,
     STRIDE_QN_H,
@@ -692,7 +700,7 @@ def _sparse_mla_fused_kernel(
 
     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = h_offs < H
-    dt = tl.arange(0, D_TAIL)
+    dt = tl.arange(0, BLOCK_DT)
     g = tl.arange(0, _G)
 
     input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
@@ -723,7 +731,7 @@ def _sparse_mla_fused_kernel(
         ).to(input_type)
     q_tail = tl.load(
         q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
-        mask=h_mask[:, None],
+        mask=h_mask[:, None] & (dt < D_TAIL)[None, :],
         other=0.0,
     ).to(input_type)
 
@@ -766,9 +774,9 @@ def _sparse_mla_fused_kernel(
             kv2 = _load_kv_group(kv_base, valid, 2, D_V, KV_SCALED).to(input_type)
         if NUM_GROUPS >= 4:
             kv3 = _load_kv_group(kv_base, valid, 3, D_V, KV_SCALED).to(input_type)
-        kv_tail = _load_kv_tail(kv_base, valid, D_V, D_TAIL, NUM_GROUPS, KV_SCALED).to(
-            input_type
-        )
+        kv_tail = _load_kv_tail(
+            kv_base, valid, D_V, D_TAIL, BLOCK_DT, NUM_GROUPS, KV_SCALED
+        ).to(input_type)
 
         scores = tl.dot(q0, tl.trans(kv0))
         if NUM_GROUPS >= 2:
@@ -866,6 +874,7 @@ def _sparse_mla_split_k_kernel(
     KV_DIM: tl.constexpr,
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
+    BLOCK_DT: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     STRIDE_QN_T,
     STRIDE_QN_H,
@@ -886,7 +895,7 @@ def _sparse_mla_split_k_kernel(
 
     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = h_offs < H
-    dt = tl.arange(0, D_TAIL)
+    dt = tl.arange(0, BLOCK_DT)
     g = tl.arange(0, _G)
 
     input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
@@ -917,7 +926,7 @@ def _sparse_mla_split_k_kernel(
         ).to(input_type)
     q_tail = tl.load(
         q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
-        mask=h_mask[:, None],
+        mask=h_mask[:, None] & (dt < D_TAIL)[None, :],
         other=0.0,
     ).to(input_type)
 
@@ -966,9 +975,9 @@ def _sparse_mla_split_k_kernel(
             kv2 = _load_kv_group(kv_base, valid, 2, D_V, KV_SCALED).to(input_type)
         if NUM_GROUPS >= 4:
             kv3 = _load_kv_group(kv_base, valid, 3, D_V, KV_SCALED).to(input_type)
-        kv_tail = _load_kv_tail(kv_base, valid, D_V, D_TAIL, NUM_GROUPS, KV_SCALED).to(
-            input_type
-        )
+        kv_tail = _load_kv_tail(
+            kv_base, valid, D_V, D_TAIL, BLOCK_DT, NUM_GROUPS, KV_SCALED
+        ).to(input_type)
 
         scores = tl.dot(q0, tl.trans(kv0))
         if NUM_GROUPS >= 2:
@@ -1205,6 +1214,7 @@ def _triton_sparse_mla_fwd_splitk(
             KV_DIM=kv_dim,
             D_V=d_v,
             D_TAIL=d_tail,
+            BLOCK_DT=triton.next_power_of_2(d_tail),
             NUM_GROUPS=num_groups,
             STRIDE_QN_T=stride_qn_t,
             STRIDE_QN_H=stride_qn_h,
@@ -1253,6 +1263,7 @@ def _triton_sparse_mla_fwd_splitk(
             KV_DIM=kv_dim,
             D_V=d_v,
             D_TAIL=d_tail,
+            BLOCK_DT=triton.next_power_of_2(d_tail),
             NUM_GROUPS=num_groups,
             STRIDE_QN_T=stride_qn_t,
             STRIDE_QN_H=stride_qn_h,
