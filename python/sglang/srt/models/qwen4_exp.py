@@ -762,7 +762,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     if backend == "safetensors"
                     else None
                 ),
-                safetensors_key_prefix=ngram_prefix if backend == "safetensors" else None,
+                safetensors_key_prefix=ngram_prefix
+                if backend == "safetensors"
+                else None,
             )
         self.ngram_embedding = ngram_embedding
 
@@ -3177,6 +3179,17 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loaded_params.update(loaded_buffers)
         loaded_params.update(loaded_shard_params)
 
+        # That dict references every Parameter, including the BF16 vision-MLP
+        # weights the e3m4 packer is about to release: packing while it is alive
+        # raises the peak instead of freeing. Nothing below reads it again.
+        params_dict.clear()
+
+        from sglang.srt.layers.fp8_mm_visual import quantize_vision_mlps_if_enabled
+
+        # The visual weights were written straight into params_dict above, so the
+        # vision model's own load_weights never ran; pack its MLPs here.
+        quantize_vision_mlps_if_enabled(self)
+
         for mod_prefix, ple_mod in ple_modules.items():
             # A uint8 table only decodes with its row scales; silent zeros
             # would serve garbage embeddings, so fail the load instead.
@@ -3263,7 +3276,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             )
 
     def precompile_kernels_after_loading(self) -> None:
-        from sglang.srt.layers.quantization.unquant import precompile_sm107_splitk_tactics
+        from sglang.srt.layers.quantization.unquant import (
+            precompile_sm107_splitk_tactics,
+        )
 
         if precompile_sm107_splitk_tactics():
             logger.info("Precompiled BF16 split-K GEMM tactics for Qwen4-Exp")
