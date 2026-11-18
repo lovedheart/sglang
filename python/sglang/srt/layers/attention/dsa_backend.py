@@ -2682,6 +2682,7 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
+        dsa_impl = self._resolve_sparse_extend_impl(dsa_impl)
         if attn_sink is not None and dsa_impl not in (
             "flashmla_sparse",
             "triton_sparse_mla",
@@ -3868,6 +3869,21 @@ class DeepseekSparseAttnBackend(
         if need_padding:
             o = o[:, :num_heads, :]
         return o
+
+    def _resolve_sparse_extend_impl(self, dsa_impl: str) -> str:
+        # flash_mla's sparse prefill/verify binaries are SM90a/SM100f only, so
+        # on SM12x route the bf16 sparse-MLA extend leg -- plain prefill and
+        # the target-verify / draft-extend legs that carry the decode
+        # backend -- into the Triton sink kernel, which consumes the same
+        # inputs with the same math. FP8 pools keep their existing paths.
+        if (
+            dsa_impl == "flashmla_sparse"
+            and self.device_sm_major == 12
+            and not _is_hip
+            and not self.dsa_kv_cache_store_fp8
+        ):
+            return "triton_sparse_mla"
+        return dsa_impl
 
     def _forward_triton_sparse_mla(
         self,

@@ -251,6 +251,38 @@ class TestTritonSparseMLATopkTransformRouting(CustomTestCase):
         )
 
 
+class TestTritonSparseMLASM120ExtendReroute(CustomTestCase):
+    """On SM12x the bf16 sparse-MLA extend leg (prefill AND the
+    target-verify/draft-extend leg that carries the decode backend) must run
+    on the Triton kernel: flash_mla's sparse binaries are SM90a/SM100f-only.
+
+    Regression: the DFly draft-extend leg picked the pinned flashmla_sparse
+    decode backend and died mid-autotune on
+    "Sparse Attention Forward Kernel is only supported on SM90a and SM100f".
+    """
+
+    def _resolved(self, dsa_impl, *, sm=12, store_fp8=False, hip=False):
+        from sglang.srt.layers.attention import dsa_backend as m
+
+        backend = m.DeepseekSparseAttnBackend.__new__(m.DeepseekSparseAttnBackend)
+        backend.device_sm_major = sm
+        backend.dsa_kv_cache_store_fp8 = store_fp8
+        with patch.object(m, "_is_hip", hip):
+            return backend._resolve_sparse_extend_impl(dsa_impl)
+
+    def test_bf16_sparse_reroutes_on_sm120(self):
+        self.assertEqual(self._resolved("flashmla_sparse"), "triton_sparse_mla")
+
+    def test_other_hardware_and_pool_keep_flashmla(self):
+        self.assertEqual(self._resolved("flashmla_sparse", sm=9), "flashmla_sparse")
+        self.assertEqual(self._resolved("flashmla_sparse", sm=10), "flashmla_sparse")
+        self.assertEqual(
+            self._resolved("flashmla_sparse", store_fp8=True), "flashmla_sparse"
+        )
+        self.assertEqual(self._resolved("flashmla_sparse", hip=True), "flashmla_sparse")
+        self.assertEqual(self._resolved("triton_sparse_mla"), "triton_sparse_mla")
+
+
 class TestTritonSparseMLARegistration(CustomTestCase):
     """Selectable from the CLI, and opt-in only."""
 
