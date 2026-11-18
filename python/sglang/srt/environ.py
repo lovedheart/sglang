@@ -1587,6 +1587,11 @@ class Envs:
     # all. Same MMA operands as the repacked arm; requires H and I to be
     # multiples of 128. Default on: 1.4-2.8x the repacked arm's prefill time.
     SGLANG_SM12X_W3A4_FUSED = EnvBool(True)
+    # Skip the grouped SIMT GEMV decode arm of the sm12x_fp3_bf16 runner even
+    # when its host contract is satisfied, so decode-sized batches take the
+    # Triton tensor-core GEMM like prefills do. MoE-arm ablation when
+    # debugging a server fault: True removes GEMV from the suspects.
+    SGLANG_SM12X_W3A16_DISABLE_GEMV = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)

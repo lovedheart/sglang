@@ -1028,6 +1028,7 @@ def fused_experts_fp3_w3a16(
         and sf13 is not None
         and sf2 is not None
         and not _gemv_unavailable
+        and not envs.SGLANG_SM12X_W3A16_DISABLE_GEMV.get()
     ):
         try:
             return _gemv_fused_experts(
