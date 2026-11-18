@@ -822,13 +822,23 @@ class FlashEngramEmbedding(nn.Module):
         self.num_embeddings = sum(sizes)
         self.dim = dim
         self.rows = self.vocab_end - self.vocab_start
-        # The table dtype (bf16, or fp8 with per-row bf16 scales) is taken from
+        # An fp8-serving checkpoint stores the table as fp8 rows + fp32 row
+        # scales; reserve it up front (like the Qwen PLE table) so VRAM is
+        # committed before streaming starts. Otherwise the dtype comes from
         # the checkpoint when it loads.
         self.weight = nn.Parameter(
-            torch.empty(0, dim, dtype=torch.bfloat16), requires_grad=False
+            torch.empty(
+                (self.rows if fp8 else 0),
+                dim,
+                dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
+            ),
+            requires_grad=False,
         )
         self.weight_scale_inv = nn.Parameter(
-            torch.empty(0, dtype=torch.bfloat16), requires_grad=False
+            torch.empty(
+                self.rows if fp8 else 0, dtype=torch.float32 if fp8 else torch.bfloat16
+            ),
+            requires_grad=False,
         )
         # FP6_E2M3_ROW_SCALE checkpoints stream the table as row parts; rows
         # counted per sub-leaf, and the flags flip when the table is whole.
@@ -916,20 +926,25 @@ class FlashEngramEmbedding(nn.Module):
         if hi > lo:
             src = value[lo - row_start : hi - row_start]
             dst = slice(lo - self.vocab_start, hi - self.vocab_start)
+            # The shard tensors arrive on CPU; decode on the table's device.
             if leaf == "weight":
                 if tuple(self.weight.shape) != (self.rows, self.dim):
                     self.weight = nn.Parameter(
                         torch.empty(self.rows, self.dim, dtype=torch.float8_e4m3fn),
                         requires_grad=False,
                     )
-                self.weight.data[dst] = unpack_fp6_e2m3_pack4x6b(src)
+                self.weight.data[dst] = unpack_fp6_e2m3_pack4x6b(
+                    src.to(self.weight.device, non_blocking=True)
+                )
             else:
                 if tuple(self.weight_scale_inv.shape) != (self.rows,):
                     self.weight_scale_inv = nn.Parameter(
                         torch.empty(self.rows, dtype=torch.float32),
                         requires_grad=False,
                     )
-                self.weight_scale_inv.data[dst] = src.reshape(-1)
+                self.weight_scale_inv.data[dst] = src.reshape(-1).to(
+                    self.weight_scale_inv.device
+                )
         self._fp6_seen[leaf] = stop
         if stop == self.num_embeddings:
             self._fp6_done[leaf] = True

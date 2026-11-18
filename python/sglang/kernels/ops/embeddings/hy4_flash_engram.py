@@ -231,46 +231,41 @@ def hy4_flash_engram_combine(
     return out
 
 
-_E2M3_LUT: torch.Tensor | None = None
-
-
-def _e2m3_lut() -> torch.Tensor:
-    """float32 decode table for the 64 FP6 E2M3 codes (sign, exp2, mant3)."""
-    global _E2M3_LUT
-    if _E2M3_LUT is None:
-        codes = torch.arange(64, dtype=torch.int32)
-        mag_i = codes & 31
-        e, m = mag_i >> 3, mag_i & 7
-        mag = torch.where(
-            e == 0,
-            m.to(torch.float32) * 0.125,
-            (1.0 + m.to(torch.float32) / 8.0)
-            * torch.pow(2.0, (e - 1).to(torch.float32)),
-        )
-        _E2M3_LUT = torch.where(codes >= 32, -mag, mag)
-    return _E2M3_LUT
-
-
 def unpack_fp6_e2m3_pack4x6b(
-    packed: torch.Tensor, out_dtype: torch.dtype = torch.float8_e4m3fn
+    packed: torch.Tensor,
+    out_dtype: torch.dtype = torch.float8_e4m3fn,
+    chunk_rows: int = 1_000_000,
 ) -> torch.Tensor:
     """[rows, n * 3 // 4] uint8 holding n six-bit codes per row four to three
     little-endian bytes -> [rows, n] ``out_dtype`` values. FP6 E2M3 values sit
     exactly on the FP8 E4M3 grid, so the default cast is lossless."""
     rows, nbytes = packed.shape
     assert nbytes % 3 == 0, "packed rows must hold whole 4-code groups"
-    b = packed.reshape(rows, nbytes // 3, 3).to(torch.int16)
-    codes = (
-        torch.stack(
-            (
-                b[..., 0] & 0x3F,
-                ((b[..., 0] >> 6) | (b[..., 1] << 2)) & 0x3F,
-                ((b[..., 1] >> 4) | (b[..., 2] << 4)) & 0x3F,
-                b[..., 2] >> 2,
-            ),
-            -1,
+    # Decode row blocks at a time and without index-tensor gathers: an eager
+    # whole-table pass builds int16/int64 temporaries (50 GB for a 66 M-row
+    # part) that thrash host RAM when the shard tensor is CPU-resident.
+    out = torch.empty(rows, nbytes // 3 * 4, dtype=out_dtype, device=packed.device)
+    two = torch.tensor(2.0, device=packed.device)
+    for lo in range(0, rows, chunk_rows):
+        b = packed[lo : lo + chunk_rows].reshape(-1, 3)
+        b0, b1, b2 = b[:, 0], b[:, 1], b[:, 2]
+        codes = (
+            torch.stack(
+                (
+                    b0 & 0x3F,
+                    ((b0 >> 6) | (b1 << 2)) & 0x3F,
+                    ((b1 >> 4) | (b2 << 4)) & 0x3F,
+                    b2 >> 2,
+                ),
+                -1,
+            )
+            .reshape(-1, out.shape[1])
+            .to(torch.int16)
         )
-        .reshape(rows, -1)
-        .to(torch.int64)
-    )
-    return _e2m3_lut().to(packed.device)[codes].to(out_dtype)
+        # FP6 E2M3 decode (sign, exp2, mant3), evaluated per row block.
+        mag_i = codes & 31
+        e = (mag_i >> 3).to(torch.float32)
+        m = (mag_i & 7).to(torch.float32)
+        mag = torch.where(e == 0, m * 0.125, (1.0 + m / 8.0) * torch.pow(two, e - 1.0))
+        out[lo : lo + chunk_rows] = torch.where(codes >= 32, -mag, mag).to(out_dtype)
+    return out
