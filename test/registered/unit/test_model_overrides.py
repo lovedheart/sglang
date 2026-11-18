@@ -2970,6 +2970,32 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "dsa_decode_backend": "flashinfer_sparse_mla",
                 },
             )
+            # SM120 sinks: flash_mla has no SM12x binaries, so the Triton
+            # sink kernel is the default and the accepted prefill.
+            self.assertEqual(
+                _dsa_split_backend_resolution(
+                    _view(
+                        arch="HYV4ForCausalLM",
+                        learnable_sink=True,
+                        kv_cache_dtype="bfloat16",
+                    )
+                ),
+                {
+                    "dsa_prefill_backend": "triton_sparse_mla",
+                    "dsa_decode_backend": "flashmla_sparse",
+                },
+            )
+            self.assertEqual(
+                _dsa_split_backend_resolution(
+                    _view(
+                        arch="HYV4ForCausalLM",
+                        learnable_sink=True,
+                        kv_cache_dtype="bfloat16",
+                        dsa_prefill_backend="triton_sparse_mla",
+                    )
+                ),
+                {"dsa_decode_backend": "flashmla_sparse"},
+            )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
             override_platform(is_npu=False),

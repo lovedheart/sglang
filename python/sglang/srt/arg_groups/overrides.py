@@ -693,15 +693,34 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     )
 
     if getattr(hf_config, "learnable_sink", False):
-        backend = "flashmla_sparse"
-        declared = _pin_dsa_backends(
-            view,
-            backend,
-            lambda option, value: (
-                f"{model_arch} uses learnable attention sinks and requires "
-                f"{option} {backend!r}; got {value!r}"
-            ),
+        # Sparse prefill with sinks runs either through flash_mla's binaries
+        # (SM90/SM100) or the Triton sink kernel; on SM12x only the latter
+        # exists, so default there. Decode stays on the flashmla_sparse
+        # dispatch, which routes SM12x sink decode into the Triton split-k
+        # kernel itself.
+        sink_prefills = ("flashmla_sparse", "triton_sparse_mla")
+        default_prefill = (
+            "triton_sparse_mla"
+            if major == 12 and not get_platform().is_hip
+            else "flashmla_sparse"
         )
+        declared: Dict[str, Any] = {}
+        if view.dsa_prefill_backend is None:
+            declared["dsa_prefill_backend"] = default_prefill
+        elif view.dsa_prefill_backend not in sink_prefills:
+            raise ValueError(
+                f"{model_arch} uses learnable attention sinks and requires "
+                "--dsa-prefill-backend in {list(sink_prefills)!r}; got "
+                f"{view.dsa_prefill_backend!r}"
+            )
+        if view.dsa_decode_backend is None:
+            declared["dsa_decode_backend"] = "flashmla_sparse"
+        elif view.dsa_decode_backend != "flashmla_sparse":
+            raise ValueError(
+                f"{model_arch} uses learnable attention sinks and requires "
+                f"--dsa-decode-backend 'flashmla_sparse'; got "
+                f"{view.dsa_decode_backend!r}"
+            )
         logger.warning(
             "Set DSA backends for learnable attention sinks: "
             f"prefill={declared.get('dsa_prefill_backend', view.dsa_prefill_backend)}, "
