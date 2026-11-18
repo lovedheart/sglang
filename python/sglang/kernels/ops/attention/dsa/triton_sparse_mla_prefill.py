@@ -103,7 +103,10 @@ def _sparse_mla_prefill_kernel(
         l_i = tl.where(sink == -float("inf"), 0.0, 1.0)
 
     n = tl.arange(0, BLOCK_N)
-    k_len = tl.load(len_ptr + t)
+    # Clamp the per-row valid count to the selection width: a sliding-window
+    # layer's topk row is narrower than index_topk, and scanning past it
+    # reads the next row (or past the buffer end) as if it were keys.
+    k_len = min(tl.load(len_ptr + t), topk)
     for k0 in tl.range(0, k_len, BLOCK_N):
         idx = tl.load(idx_ptr + t64 * topk + k0 + n, mask=(k0 + n) < k_len, other=-1)
         valid = idx >= 0

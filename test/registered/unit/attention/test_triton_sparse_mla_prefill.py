@@ -122,7 +122,13 @@ class TestTritonSparseMLAAdapter(CustomTestCase):
     """The backend method forwards exactly what the kernel expects."""
 
     def _call_forward(
-        self, *, union=0, capturing=False, stream_capturing=False, topk_length=None
+        self,
+        *,
+        union=0,
+        capturing=False,
+        stream_capturing=False,
+        topk_length=None,
+        index_topk=16,
     ):
         from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
@@ -138,6 +144,8 @@ class TestTritonSparseMLAAdapter(CustomTestCase):
         backend.dsa_shards_index_k = False
         backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
         backend.dsa_triton_union = union
+        # Matches the 16-wide page table below: full-width selection by default.
+        backend.dsa_index_topk = index_topk
 
         # `get_is_capture_mode` is patched although the method no longer reads
         # it, so the breakable-graph regression below stays a real check.
@@ -211,6 +219,17 @@ class TestTritonSparseMLAAdapter(CustomTestCase):
             topk_length=torch.full((5,), 16, dtype=torch.int32)
         )
         self.assertIsNone(captured["topk_length"])
+
+    def test_topk_length_is_clamped_to_a_narrower_selection(self):
+        # Regression: sliding-window layers select into a topk row narrower
+        # than index_topk, while `dsa_cache_seqlens_int32` is only clipped to
+        # index_topk. Uncipped, the kernel scans past the row: interior rows
+        # read the next row's slots and the last row reads past the indices
+        # allocation, faulting once a sequence exceeds the selection width.
+        captured, _ = self._call_forward(
+            topk_length=torch.full((4,), 100, dtype=torch.int32), index_topk=2048
+        )
+        self.assertTrue((captured["topk_length"] <= 16).all())
 
 
 class TestTritonSparseMLATopkTransformRouting(CustomTestCase):
