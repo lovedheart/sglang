@@ -278,7 +278,23 @@ class HYV4FlashDFly(nn.Module):
         head = self.lm_head
         shard = head.shard_indices
         weight = head.weight[: shard.num_org_elements]
-        logits = torch.mm(hidden, weight.T, out_dtype=torch.float32)
+        if weight.dtype == torch.float8_e4m3fn:
+            # --lm-head-dtype fp8_* packed the shared head; run the same
+            # block-fp8 GEMM the target logits use so draft greedy choices
+            # track the target's own argmax.
+            from sglang.srt.layers.quantization.fp8_utils import (
+                cutlass_w8a8_block_fp8_linear_with_fallback,
+            )
+
+            scale = head.weight_block_scale[: weight.shape[0] // 128]
+            logits = cutlass_w8a8_block_fp8_linear_with_fallback(
+                input=hidden,
+                weight=weight,
+                block_size=[128, 128],
+                weight_scale=scale,
+            ).float()
+        else:
+            logits = torch.mm(hidden, weight.T, out_dtype=torch.float32)
         local_max, local_arg = logits.max(dim=-1)
         local_ids = local_arg + shard.org_vocab_start_index
         tp_group = get_parallel().tp_group

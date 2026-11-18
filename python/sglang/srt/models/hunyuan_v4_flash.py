@@ -1839,8 +1839,36 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
             )
 
             quantize_hy4_dense_weights_fp8_e3m4(self)
+        self._maybe_quantize_lm_head()
         if self.dfly is not None:
             self.dfly.post_load_weights()
+
+    def _maybe_quantize_lm_head(self) -> None:
+        # One-shot swap at load time, never lazy: the decode CUDA graphs must
+        # capture the final head form. The DFly draft shares this module via
+        # bind_target, so quantizing here covers both runners.
+        dtype = get_exec().features.lm_head_dtype
+        if dtype == "bf16" or self.config.tie_word_embeddings:
+            return
+        if dtype == "fp6_e2m3" and self.dfly is not None:
+            # The fp6 packer releases the dense weight, which the DFly draft
+            # reads directly for its greedy step; the fp8 formats keep an
+            # fp8 container that _greedy runs through the block-fp8 GEMM.
+            logger.warning(
+                "--lm-head-dtype fp6_e2m3 is not supported with the DFly "
+                "draft; keeping the BF16 head"
+            )
+            return
+        from sglang.srt.layers.lm_head_quant import lm_head_block_size, quantize_lm_head
+
+        if quantize_lm_head(self.lm_head, dtype):
+            blk = lm_head_block_size(dtype)
+            logger.info(
+                "Quantized lm_head to %s codes with %dx%d block scales",
+                dtype,
+                blk,
+                blk,
+            )
 
     def _load_engram_fp6_part(self, prefix, engram, part, leaf, value):
         entries = getattr(self.quant_config, "quantized_layers", None) or {}
