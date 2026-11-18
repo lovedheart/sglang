@@ -231,21 +231,46 @@ def hy4_flash_engram_combine(
     return out
 
 
+_FP6_E2M3_LUT: dict = {}
+
+
+def _fp6_e2m3_to_fp8_lut(device: torch.device) -> torch.Tensor:
+    """[32] uint8 of FP8-E4M3 bytes for FP6-E2M3 magnitudes (code & 31)."""
+    key = (device.type, device.index)
+    lut = _FP6_E2M3_LUT.get(key)
+    if lut is None:
+        mags = [
+            (m * 0.125) if e == 0 else (1.0 + m / 8.0) * 2.0 ** (e - 1)
+            for e in range(4)
+            for m in range(8)
+        ]
+        lut = (
+            torch.tensor(mags, dtype=torch.float32, device=device)
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+            .contiguous()
+        )
+        _FP6_E2M3_LUT[key] = lut
+    return lut
+
+
 def unpack_fp6_e2m3_pack4x6b(
     packed: torch.Tensor,
     out_dtype: torch.dtype = torch.float8_e4m3fn,
-    chunk_rows: int = 1_000_000,
+    chunk_rows: int = 262_144,
 ) -> torch.Tensor:
     """[rows, n * 3 // 4] uint8 holding n six-bit codes per row four to three
     little-endian bytes -> [rows, n] ``out_dtype`` values. FP6 E2M3 values sit
     exactly on the FP8 E4M3 grid, so the default cast is lossless."""
     rows, nbytes = packed.shape
     assert nbytes % 3 == 0, "packed rows must hold whole 4-code groups"
-    # Decode row blocks at a time and without index-tensor gathers: an eager
-    # whole-table pass builds int16/int64 temporaries (50 GB for a 66 M-row
-    # part) that thrash host RAM when the shard tensor is CPU-resident.
+    # Decode row blocks at a time and with a byte-wise LUT: an eager
+    # whole-table pass builds wide temporaries (50 GB for a 66 M-row part)
+    # that thrash host RAM when the shard tensor is CPU-resident, and even
+    # float-valued per-row-block math peaks at several multiples of the
+    # block in VRAM.
     out = torch.empty(rows, nbytes // 3 * 4, dtype=out_dtype, device=packed.device)
-    two = torch.tensor(2.0, device=packed.device)
+    lut = _fp6_e2m3_to_fp8_lut(packed.device)
     for lo in range(0, rows, chunk_rows):
         b = packed[lo : lo + chunk_rows].reshape(-1, 3)
         b0, b1, b2 = b[:, 0], b[:, 1], b[:, 2]
@@ -260,12 +285,12 @@ def unpack_fp6_e2m3_pack4x6b(
                 -1,
             )
             .reshape(-1, out.shape[1])
-            .to(torch.int16)
+            .to(torch.uint8)
         )
-        # FP6 E2M3 decode (sign, exp2, mant3), evaluated per row block.
-        mag_i = codes & 31
-        e = (mag_i >> 3).to(torch.float32)
-        m = (mag_i & 7).to(torch.float32)
-        mag = torch.where(e == 0, m * 0.125, (1.0 + m / 8.0) * torch.pow(two, e - 1.0))
-        out[lo : lo + chunk_rows] = torch.where(codes >= 32, -mag, mag).to(out_dtype)
+        # FP6 E2M3 decode (sign, exp2, mant3) via the LUT + sign-bit XOR.
+        flat = codes.reshape(-1).to(torch.int32)
+        chunk = torch.bitwise_xor(
+            lut.index_select(0, flat & 31).view_as(codes), (codes >> 5) << 7
+        )
+        out[lo : lo + chunk_rows] = chunk.view(torch.float8_e4m3fn).to(out_dtype)
     return out

@@ -967,8 +967,18 @@ class FlashEngramEmbedding(nn.Module):
             if self.offload_mode:
                 _, _, table_view, scale_view = self._host_tables()
                 if leaf == "weight":
-                    decoded = unpack_fp6_e2m3_pack4x6b(src.cuda())
-                    table_view[dst].copy_(decoded.view(torch.uint8))
+                    # Copy the packed rows to the GPU, decode and stream them
+                    # into the pinned host table in blocks: a whole-part
+                    # upload + decode would spike several GB of VRAM per
+                    # engram shard.
+                    step = 262_144
+                    for begin in range(0, hi - lo, step):
+                        end = min(begin + step, hi - lo)
+                        decoded = unpack_fp6_e2m3_pack4x6b(src[begin:end].cuda())
+                        table_view[dst.start + begin : dst.start + end].copy_(
+                            decoded.view(torch.uint8)
+                        )
+                        del decoded
                 else:
                     scale_view[dst].copy_(src.reshape(-1).cuda())
             elif leaf == "weight":
@@ -1833,6 +1843,11 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
     def _load_engram(self, name: str, value: torch.Tensor):
         prefix, leaf = name.split(".engram_layer.", 1)
         layer_id = int(prefix.rsplit(".", 1)[1])
+        if layer_id >= len(self.model.layers):
+            # A layer-reduced (debug) config drops engram tables that the
+            # full checkpoint still ships; `check_fp6_complete` validates
+            # only the declared engrams.
+            return
         engram = self.model.layers[layer_id].engram_layer
         if engram is None:
             raise ValueError(f"Undeclared Engram checkpoint weight: {name}")
