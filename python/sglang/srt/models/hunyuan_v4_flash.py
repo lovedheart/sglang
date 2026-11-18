@@ -1830,8 +1830,15 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None) -> None:
         # DeepseekV2WeightLoaderMixin builds the absorbed w_kc/w_vc the
-        # target-verify leg needs; keep it and add the DFly draft fixups.
+        # target-verify leg needs (from BF16 kv_b_proj, which --enable-fp8-
+        # weights deliberately leaves alone); keep it and add the DFly fixups.
         super().post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        if get_exec().features.enable_fp8_weights:
+            from sglang.srt.layers.fp8_e3m4_weights import (
+                quantize_hy4_dense_weights_fp8_e3m4,
+            )
+
+            quantize_hy4_dense_weights_fp8_e3m4(self)
         if self.dfly is not None:
             self.dfly.post_load_weights()
 

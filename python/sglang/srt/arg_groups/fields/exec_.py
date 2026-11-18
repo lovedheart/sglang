@@ -94,6 +94,16 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Store the per-layer hyper-connection mix projections (input_mix_weight_down/up) in MXFP8 (e4m3 + 1x32 UE8M0 scales) at load time, halving ~1.27 GB of BF16 mix weights; the decode mix kernel descales in registers (W8A16: BF16 activations). The last main layer, the final mixer, and the NEXTN/MTP draft stay BF16.",
     ] = False
+    enable_fp8_weights: A[
+        bool,
+        "Re-encode the checkpoint's BF16 dense projections (attention q/kv-a/o "
+        "projections and dense/shared-expert FFNs; not MoE experts, the DSA "
+        "indexer, kv_b_proj, or any draft) in FP8 E3M4 codes with 128x128 block "
+        "scales at load time, halving their bytes and releasing the BF16 copies "
+        "(SM120 only, ignored elsewhere). Same representation as an offline "
+        "FP8_PB_WO_E3M4 checkpoint; accuracy and KV-cache behavior are "
+        "unchanged from BF16 within ~37 dB SQNR per weight.",
+    ] = False
     enable_mm_dtype: A[
         Literal["bf16", "fp8_e3m4"],
         "Store the vision tower's MLP projections (every block's linear_fc1 and "
