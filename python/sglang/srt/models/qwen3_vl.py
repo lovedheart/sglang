@@ -170,9 +170,14 @@ class Qwen3_VisionMLP(nn.Module):
         self.act = ACT2FN[hidden_act]
 
     def forward(self, x: torch.Tensor):
-        x_fc1, _ = self.linear_fc1(x)
-        mlp_output, _ = self.linear_fc2(self.act(x_fc1))
-        return mlp_output
+        from sglang.srt.layers.fp8_mm_visual import mm_e3m4_padded_fc
+
+        # A packed e3m4 fc owns the padded-width GEMM; the padding is sliced away.
+        y = mm_e3m4_padded_fc(self.linear_fc1, x, self.linear_fc1.bias)
+        x_fc1 = y if y is not None else self.linear_fc1(x)[0]
+        a = self.act(x_fc1)
+        y = mm_e3m4_padded_fc(self.linear_fc2, a, self.linear_fc2.bias)
+        return y if y is not None else self.linear_fc2(a)[0]
 
 
 class Qwen3VLVisionPatchEmbed(nn.Module):
@@ -352,9 +357,13 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             x = self.norm(x).view(-1, self.hidden_size)
 
         if not self.disable_merger_proj:
-            x_parallel, _ = self.linear_fc1(x)
+            from sglang.srt.layers.fp8_mm_visual import mm_e3m4_padded_fc
+
+            y = mm_e3m4_padded_fc(self.linear_fc1, x, self.linear_fc1.bias)
+            x_parallel = y if y is not None else self.linear_fc1(x)[0]
             x_parallel = self.act_fn(x_parallel)
-            x, _ = self.linear_fc2(x_parallel)
+            y = mm_e3m4_padded_fc(self.linear_fc2, x_parallel, self.linear_fc2.bias)
+            x = y if y is not None else self.linear_fc2(x_parallel)[0]
         return x
 
 
@@ -1083,6 +1092,16 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        # The dict above references every Parameter, including the BF16 weights
+        # the packer is about to release, so drop it first.
+        params_dict.clear()
+
+        # One-shot, before any forward or graph capture: the packed weights are
+        # what the CUDA graphs must bake in.
+        from sglang.srt.layers.fp8_mm_visual import quantize_vision_mlps_if_enabled
+
+        quantize_vision_mlps_if_enabled(self)
         return loaded_params
 
     def _prepare_graph_inputs(
@@ -1672,6 +1691,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             )
         self.capture_aux_hidden_states = True
         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
+
+    def post_load_weights(self) -> None:
+        from sglang.srt.layers.fp8_mm_visual import quantize_vision_mlps_if_enabled
+
+        quantize_vision_mlps_if_enabled(self)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

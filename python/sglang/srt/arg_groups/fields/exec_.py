@@ -87,6 +87,16 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Store the per-layer hyper-connection mix projections (input_mix_weight_down/up) in MXFP8 (e4m3 + 1x32 UE8M0 scales) at load time, halving ~1.27 GB of BF16 mix weights; the decode mix kernel descales in registers (W8A16: BF16 activations). The last main layer, the final mixer, and the NEXTN/MTP draft stay BF16.",
     ] = False
+    enable_mm_dtype: A[
+        Literal["bf16", "fp8_e3m4"],
+        "Store the vision tower's MLP projections (every block's linear_fc1 and "
+        "linear_fc2, plus the merger and deepstack mergers: 67% of the visual "
+        "matmul bytes) in FP8 e3m4 codes with 128x128 block scales at load time "
+        "(SM120 only, ignored elsewhere; the BF16 weights are released). The "
+        "4304-wide intermediate is zero-padded to 4352 for the block contract; "
+        "measured merger-output error 29.5 dB SNR / 0.9994 cos vs BF16. qkv, "
+        "attn.proj, embeddings and norms stay BF16. Default bf16.",
+    ] = "bf16"
     enable_tf32_matmul: A[
         Optional[bool],
         Arg(
