@@ -1828,6 +1828,13 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
             # Hand the freed table blocks back before the KV pool is sized.
             torch.cuda.empty_cache()
 
+    def post_load_weights(self, is_nextn: bool = False, weight_names=None) -> None:
+        # DeepseekV2WeightLoaderMixin builds the absorbed w_kc/w_vc the
+        # target-verify leg needs; keep it and add the DFly draft fixups.
+        super().post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        if self.dfly is not None:
+            self.dfly.post_load_weights()
+
     def _load_engram_fp6_part(self, prefix, engram, part, leaf, value):
         entries = getattr(self.quant_config, "quantized_layers", None) or {}
         entry = entries.get(f"{prefix}.engram_layer.multi_head_embedding.embedding")

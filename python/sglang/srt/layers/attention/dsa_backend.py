@@ -2959,6 +2959,28 @@ class DeepseekSparseAttnBackend(
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 
+            if (
+                dsa_impl == "triton_sparse_mla"
+                and kv_cache.dtype != torch.bfloat16
+                and page_table_1 is not None
+            ):
+                # The spec legs (target-verify / draft-extend) keep the PAGED
+                # transform, which hands over the packed fp8 pool. Batch-
+                # dequantize the selected rows and re-index them contiguously
+                # so the bf16-only Triton kernel stays valid; -1 pads keep
+                # their -1 markers so the kernel's mask still applies.
+                rows, width = page_table_1.shape
+                slots = page_table_1.to(torch.int64)
+                kv_cache = dequantize_k_cache_paged_dsa(
+                    kv_cache, slots.clamp(min=0).reshape(-1).to(torch.int32)
+                )
+                new_ids = torch.arange(rows * width, device=slots.device).view(
+                    rows, width
+                )
+                page_table_1 = torch.where(
+                    slots < 0, -1, new_ids.to(page_table_1.dtype)
+                )
+
             if dsa_impl == "triton_sparse_mla":
                 if q_rope is not None:
                     q_all = concat_mla_absorb_q_general(q_nope, q_rope)

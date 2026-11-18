@@ -378,6 +378,9 @@ class HYV4FlashDFlyConfig(msgspec.Struct, frozen=True, kw_only=True):
     target_index_topk: int
     draft_index_topk: int
     block_size: int
+    # Draft FFN width, present only when the checkpoint does not carry the
+    # dfly weights (dummy / sharded-state loads); None means weights drive it.
+    intermediate_size: int | None = None
 
 
 def parse_dfly_config(
@@ -425,6 +428,11 @@ def parse_dfly_config(
         raise ValueError("DFly requires distinct target KV and index layers")
     if not 2 <= block_size <= 17:
         raise ValueError("DFly requires a draft block of 2..17 tokens")
+    intermediate_size = get("intermediate_size")
+    if intermediate_size is not None and (
+        type(intermediate_size) is not int or intermediate_size < 1
+    ):
+        raise ValueError("DFly dfly_intermediate_size must be a positive int")
     return HYV4FlashDFlyConfig(
         num_layers=num_layers,
         mask_token_id=mask_token_id,
@@ -433,6 +441,7 @@ def parse_dfly_config(
         target_index_topk=topk,
         draft_index_topk=-(-(topk + block_size) // 128) * 128,
         block_size=block_size,
+        intermediate_size=intermediate_size,
     )
 
 

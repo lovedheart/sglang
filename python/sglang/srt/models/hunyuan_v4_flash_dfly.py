@@ -248,6 +248,7 @@ class HYV4FlashDFly(nn.Module):
         target_hidden: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        self.ensure_absorb_weights()
         bs, width = block_ids.shape
         embeds = self.embed_tokens(block_ids.reshape(-1)).view(bs, width, -1)
         embeds[:, 0] = self.mtp_fusion(embeds[:, 0], target_hidden)
@@ -356,6 +357,32 @@ class HYV4FlashDFly(nn.Module):
             raise ValueError(f"Missing DFly weights: {sorted(missing)}")
         for layer in self.layers:
             _split_kv_b_proj(layer.self_attn)
+
+    def ensure_absorb_weights(self) -> None:
+        # load_weights binds the absorbed KV halves, but dummy-weights loads
+        # never call it; bind lazily so the first draft forward (tests,
+        # smoke launches) sees the same state a real load produces.
+        for layer in self.layers:
+            if layer.self_attn.w_kc is None:
+                _split_kv_b_proj(layer.self_attn)
+
+    def post_load_weights(self) -> None:
+        # Loaders that bypass load_weights (dummy / sharded state) never
+        # materialize the draft FFNs from checkpoint shapes; fall back to the
+        # dfly_intermediate_size config hint so such loads still run DFly.
+        if any(layer.mlp is None for layer in self.layers):
+            width = self.dfly_config.intermediate_size
+            if width is None:
+                raise ValueError(
+                    "DFly draft FFNs are absent and the config has no "
+                    "dfly_intermediate_size to materialize them from"
+                )
+            for layer in self.layers:
+                ref = layer.input_layernorm.weight
+                layer.materialize_mlp(width, ref.device, ref.dtype)
+                for p in layer.mlp.parameters():
+                    torch.nn.init.normal_(p, std=0.02)
+        self.ensure_absorb_weights()
 
     @staticmethod
     def _load_mapped(load, name, value):
