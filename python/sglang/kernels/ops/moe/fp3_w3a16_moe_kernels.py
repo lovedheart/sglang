@@ -824,6 +824,17 @@ def _invoke_fp3_gemm(
 _gemv_unavailable = False
 
 
+def _gemv_scale_bytes(sf: torch.Tensor):
+    """Raw sf bytes for the GEMV host contract, or None if sf is not byte
+    storage (e.g. float32 block scales, which no unpacking rule is defined
+    for here): the caller then keeps the Triton path for this call."""
+    if sf.dtype == torch.uint8:
+        return sf
+    if sf.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return sf.view(torch.uint8)
+    return None
+
+
 def _gemv_blocks(num_slots: int):
     # (rows_per_block, lanes_per_row) per GEMM, tuned on sm_120 with the
     # Qwen3.8-Flash-Next-FP3 expert shape: LN = 8 lanes/row doubles the
@@ -1004,23 +1015,28 @@ def fused_experts_fp3_w3a16(
                     f"failures ({exc}); using GEMV/Triton"
                 )
 
-    # The quad-load GEMV needs 12-byte-aligned row slices (K/8 % 4 == 0).
+    # The quad-load GEMV needs 12-byte-aligned row slices (K/8 % 4 == 0) and
+    # byte-storage block scales; float32 scales have no unpacking rule here,
+    # so those layers keep the Triton path.
+    sf13, sf2 = _gemv_scale_bytes(w13_sf), _gemv_scale_bytes(w2_sf)
     if (
         config is None
         and slots <= _GEMV_MAX_SLOTS
         and w13_gs.dim() == 2
         and (k // 8) % 4 == 0
         and (inter // 8) % 4 == 0
+        and sf13 is not None
+        and sf2 is not None
         and not _gemv_unavailable
     ):
         try:
             return _gemv_fused_experts(
                 hidden_states,
                 w13,
-                w13_sf,
+                sf13,
                 w13_gs,
                 w2,
-                w2_sf,
+                sf2,
                 w2_gs,
                 topk_weights,
                 topk_ids,
@@ -1029,7 +1045,12 @@ def fused_experts_fp3_w3a16(
             )
         except Exception as exc:  # noqa: BLE001  (JIT build/host: stay on Triton)
             _gemv_unavailable = True
-            print(f"fp3_w3a16 grouped GEMV unavailable, using Triton: {exc}")
+            print(
+                "fp3_w3a16 grouped GEMV unavailable, using Triton: "
+                f"{exc} (w13_sf={w13_sf.dtype}{tuple(w13_sf.shape)}, "
+                f"w2_sf={w2_sf.dtype}{tuple(w2_sf.shape)}, "
+                f"w13_gs={tuple(w13_gs.shape)})"
+            )
 
     config = dict(config or _default_config(slots))
     assert (n13 // 2) % config["BLOCK_SIZE_N"] == 0, (
