@@ -552,6 +552,7 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_storage_head_partition",
     "hicache_storage_layer_partition",
     "engram_config",
+    "hy4_engram_offload",
     "moe_ascend_ops_config",
     "cp_kv_layout",
     "enable_prefill_weight_versions",

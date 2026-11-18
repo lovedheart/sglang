@@ -22,8 +22,9 @@ _BF16_EPS = torch.finfo(torch.bfloat16).eps
 def _engram_lookup_kernel(
     hash_ptr,  # [T, n_hash] int
     hash_stride,
-    table_ptr,  # [rows, D] bf16 or fp8
-    scale_ptr,  # [rows] per-row scale (HAS_SCALE)
+    table_ptr,  # int64 address of [rows, D] bf16 or fp8 (host VAs of
+    # cudaHostRegister'd tables work: they are addressable from the device)
+    scale_ptr,  # int64 address of [rows] per-row scale (HAS_SCALE)
     gamma_ptr,  # [heads, D] bf16
     out_ptr,  # [T, heads * D] bf16
     head_start,
@@ -34,20 +35,72 @@ def _engram_lookup_kernel(
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     HAS_SCALE: tl.constexpr,
+    TABLE_FP8: tl.constexpr,
+    SCALE_F32: tl.constexpr,
 ):
+    table = table_ptr.to(tl.int64).to(
+        tl.pointer_type(tl.float8e4nv if TABLE_FP8 else tl.bfloat16)
+    )
     t = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1)
     d = tl.arange(0, BLOCK_D)
     mask = d < D
     idx = tl.load(hash_ptr + t * hash_stride + head_start + h).to(tl.int64)
     row = tl.minimum(tl.maximum(idx - vocab_start, 0), rows - 1)
-    x = tl.load(table_ptr + row * D + d, mask=mask, other=0.0).to(tl.float32)
+    x = tl.load(table + row * D + d, mask=mask, other=0.0).to(tl.float32)
     if HAS_SCALE:
-        x = x * tl.load(scale_ptr + row).to(tl.float32)
+        scale = scale_ptr.to(tl.int64).to(
+            tl.pointer_type(tl.float32 if SCALE_F32 else tl.bfloat16)
+        )
+        x = x * tl.load(scale + row).to(tl.float32)
     x = tl.where(idx < 0, 0.0, x)
     gamma = tl.load(gamma_ptr + h * D + d, mask=mask, other=0.0).to(tl.float32)
     y = x * tl.rsqrt(tl.sum(x * x, axis=0) / D + eps) * gamma
     tl.store(out_ptr + t * HEADS * D + h * D + d, y.to(tl.bfloat16), mask=mask)
+
+
+def hy4_flash_engram_lookup_at(
+    hashes: torch.Tensor,
+    head_start: int,
+    heads: int,
+    vocab_start: int,
+    table_ptr: int,
+    scale_ptr: int,
+    rows: int,
+    dim: int,
+    table_fp8: bool,
+    scale_f32: bool,
+    gamma: torch.Tensor,
+) -> torch.Tensor:
+    """[T, heads * D] bf16: per-head RMSNorm'd table rows of this rank's hash
+    heads; a negative hash gives a zero row. The table and its per-row scales
+    are addressed by raw int64 pointers so host-resident (registered) tables
+    and device tables share this one entry point."""
+    tokens = hashes.shape[0]
+    out = torch.empty((tokens, heads * dim), dtype=torch.bfloat16, device=hashes.device)
+    if tokens == 0 or heads == 0:
+        return out
+    assert hashes.stride(1) == 1 and gamma.is_contiguous()
+    _engram_lookup_kernel[(tokens, heads)](
+        hashes,
+        hashes.stride(0),
+        table_ptr,
+        scale_ptr,
+        gamma,
+        out,
+        head_start,
+        vocab_start,
+        rows,
+        _FP32_EPS,
+        HEADS=heads,
+        D=dim,
+        BLOCK_D=triton.next_power_of_2(dim),
+        HAS_SCALE=scale_ptr != 0,
+        TABLE_FP8=table_fp8,
+        SCALE_F32=scale_f32,
+        num_warps=1,
+    )
+    return out
 
 
 def hy4_flash_engram_lookup(
@@ -59,33 +112,21 @@ def hy4_flash_engram_lookup(
     table_scale: torch.Tensor | None,
     gamma: torch.Tensor,
 ) -> torch.Tensor:
-    """[T, heads * D] bf16: per-head RMSNorm'd table rows of this rank's hash
-    heads; a negative hash gives a zero row."""
-    tokens = hashes.shape[0]
-    dim = table.shape[1]
-    out = torch.empty((tokens, heads * dim), dtype=torch.bfloat16, device=hashes.device)
-    if tokens == 0 or heads == 0:
-        return out
-    assert hashes.stride(1) == 1 and table.is_contiguous() and gamma.is_contiguous()
+    assert table.is_contiguous()
     has_scale = table_scale is not None and table_scale.numel() > 0
-    _engram_lookup_kernel[(tokens, heads)](
+    return hy4_flash_engram_lookup_at(
         hashes,
-        hashes.stride(0),
-        table,
-        table_scale if has_scale else table,
-        gamma,
-        out,
         head_start,
+        heads,
         vocab_start,
+        table.data_ptr(),
+        table_scale.data_ptr() if has_scale else 0,
         table.shape[0],
-        _FP32_EPS,
-        HEADS=heads,
-        D=dim,
-        BLOCK_D=triton.next_power_of_2(dim),
-        HAS_SCALE=has_scale,
-        num_warps=1,
+        table.shape[1],
+        table_fp8=table.dtype == torch.float8_e4m3fn,
+        scale_f32=has_scale and table_scale.dtype == torch.float32,
+        gamma=gamma,
     )
-    return out
 
 
 @triton.jit

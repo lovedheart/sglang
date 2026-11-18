@@ -1300,6 +1300,15 @@ class ExecOffload(msgspec.Struct):
             type_parser=json.loads,
         ),
     ] = None
+    hy4_engram_offload: A[
+        bool,
+        (
+            "Hunyuan-Flash: keep the FP6/FP8-packed Engram embedding tables and "
+            "their row scales in huge-paged, cudaHostRegister-pinned host memory "
+            "instead of VRAM; lookups read them from the host across PCIe (the "
+            "DeepSeek-V4.1 engram placement=cpu backing). CUDA only."
+        ),
+    ] = False
 
 
 class ExecDllm(msgspec.Struct):

@@ -27,6 +27,7 @@ from sglang.kernels.ops.attention.dsa import hy4_flash_indexpool as indexpool_ke
 from sglang.kernels.ops.embeddings.hy4_flash_engram import (
     hy4_flash_engram_combine,
     hy4_flash_engram_lookup,
+    hy4_flash_engram_lookup_at,
 )
 from sglang.kernels.ops.layernorm.hy4_ihc import (
     fused_hy4_ihc_post,
@@ -86,7 +87,7 @@ from sglang.srt.models.hunyuan_v4 import (
 )
 from sglang.srt.models.hunyuan_v4_vl import HYV4VisionTransformer
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 from sglang.srt.utils import BumpAllocator
 
 logger = logging.getLogger(__name__)
@@ -833,6 +834,62 @@ class FlashEngramEmbedding(nn.Module):
         # counted per sub-leaf, and the flags flip when the table is whole.
         self._fp6_seen = {"weight": 0, "scale": 0}
         self._fp6_done = {"weight": False, "scale": False}
+        # Set by offload_to_host(): table lives in registered host memory.
+        self.offloaded = False
+
+    def offload_to_host(self, name: str) -> None:
+        """Move the FP6/FP8 table and its fp32 row scales into huge-paged,
+        cudaHostRegister-pinned host memory (the DeepSeek-V4.1 engram
+        ``placement: cpu`` backing), leaving empty device parameters behind.
+        The mapping's address is fixed for the process lifetime, so the
+        pointers baked into a CUDA graph stay valid across replays."""
+        import numpy as np
+
+        from sglang.srt.arg_groups.engram_config import EngramReplication
+        from sglang.srt.layers.engram import _HostTable
+
+        if self.offloaded or self.weight.numel() == 0:
+            return
+        if not self.weight.is_cuda:
+            raise RuntimeError("--hy4-engram-offload requires CUDA weights")
+        if (
+            self.weight.dtype != torch.float8_e4m3fn
+            or self.weight_scale_inv.dtype != torch.float32
+        ):
+            raise NotImplementedError(
+                "--hy4-engram-offload supports only FP6/FP8-packed Engram "
+                "tables with fp32 row scales; got table="
+                f"{self.weight.dtype}, scale={self.weight_scale_inv.dtype}"
+            )
+        table = _HostTable(
+            EngramReplication.NONE, self.rows * self.dim, f"hy4_engram_{name}", None
+        )
+        scale = _HostTable(
+            EngramReplication.NONE, self.rows * 4, f"hy4_engram_{name}_sc", None
+        )
+        with torch.no_grad():
+            np.frombuffer(table.mm, dtype=np.uint8)[:] = (
+                self.weight.view(torch.uint8).detach().cpu().reshape(-1).numpy()
+            )
+            np.frombuffer(scale.mm, dtype=np.float32)[:] = (
+                self.weight_scale_inv.detach().cpu().reshape(-1).numpy()
+            )
+        self._host_backing = (table, scale)
+        self._host_ptrs = (table.device_ptr, scale.device_ptr)
+        self.weight = nn.Parameter(
+            torch.empty(0, self.dim, dtype=torch.float8_e4m3fn), requires_grad=False
+        )
+        self.weight_scale_inv = nn.Parameter(
+            torch.empty(0, dtype=torch.float32), requires_grad=False
+        )
+        self.offloaded = True
+
+    def host_lookup(self):
+        """Kernel args addressing the host-resident table
+        (hy4_flash_engram_lookup_at's table/scale/rows/dim/dtype parameters)."""
+        table_ptr, scale_ptr = self._host_ptrs
+        # The dtype guard in offload_to_host fixes fp8 rows / fp32 scales.
+        return table_ptr, scale_ptr, self.rows, self.dim, True, True
 
     def load_fp6_part(self, leaf: str, value: torch.Tensor, row_start: int) -> None:
         """Row part of an fp6-E2M3 packed table (quant algo
@@ -895,6 +952,11 @@ class FlashEngramEmbedding(nn.Module):
         param.data.copy_(value[self.vocab_start : self.vocab_end])
 
     def forward(self, hashes: torch.Tensor) -> torch.Tensor:
+        if self.offloaded:
+            raise RuntimeError(
+                "Eager Engram lookup cannot index the host-resident table; "
+                "serve through the FlashEngram kernel path instead."
+            )
         local = hashes[:, self.head_start : self.head_end].to(torch.int64)
         if self.weight.numel() == 0:
             # Dummy weights never materialize the table.
@@ -985,7 +1047,16 @@ class FlashEngram(nn.Module):
         if hidden.shape[0] == 0:
             return hidden
         table = self.multi_head_embedding
-        if table.weight.numel() and hidden.is_cuda:
+        if table.offloaded:
+            x = hy4_flash_engram_lookup_at(
+                hashes,
+                table.head_start,
+                self.local_heads,
+                table.vocab_start,
+                *table.host_lookup(),
+                gamma=self.lookup_gamma,
+            )
+        elif table.weight.numel() and hidden.is_cuda:
             x = hy4_flash_engram_lookup(
                 hashes,
                 table.head_start,
@@ -1676,6 +1747,13 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
         for layer in model.layers:
             if getattr(layer, "engram_layer", None) is not None:
                 layer.engram_layer.multi_head_embedding.check_fp6_complete()
+        if get_exec().offload.hy4_engram_offload:
+            for layer in model.layers:
+                engram = getattr(layer, "engram_layer", None)
+                if engram is not None:
+                    engram.multi_head_embedding.offload_to_host("loaded")
+            # Hand the freed table blocks back before the KV pool is sized.
+            torch.cuda.empty_cache()
 
     def _load_engram_fp6_part(self, prefix, engram, part, leaf, value):
         entries = getattr(self.quant_config, "quantized_layers", None) or {}
