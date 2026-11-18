@@ -1792,7 +1792,11 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
                     (".experts.gate_up_proj_scale_inv", ".experts.down_proj_scale_inv")
                 ):
                     name = name.removesuffix("_inv")
-                elif name.endswith(".weight_scale"):
+                elif name.endswith(".weight_scale") and ".experts." not in name:
+                    # Only FP8 LINEAR sinks take weight_scale_inv; expert
+                    # scales load through the stacked loader as
+                    # w{13,2}_weight_scale (renaming them here drops the W3A16
+                    # block scales).
                     name += "_inv"
                 yield name, loaded_weight
 
