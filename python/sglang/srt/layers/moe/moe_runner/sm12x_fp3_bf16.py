@@ -111,7 +111,11 @@ def fused_experts_none_to_sm12x_fp3_bf16(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         activation=cfg.activation,
-        routed_scaling_factor=cfg.routed_scaling_factor,
+        # Every ModelOpt NvFp4 method sets should_fuse_routed_scaling_factor_
+        # in_topk (fused_moe_triton/layer.py), so topk_weights already carry
+        # the scaling factor; multiplying again would double-count it. Same
+        # contract as the sm12x_nvfp4_bf16 runner, which never scales.
+        routed_scaling_factor=1.0,
         swiglu_limit=cfg.swiglu_limit or None,
     )
     return StandardCombineInput(hidden_states=output)
