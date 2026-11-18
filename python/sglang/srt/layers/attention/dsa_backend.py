@@ -3872,16 +3872,13 @@ class DeepseekSparseAttnBackend(
 
     def _resolve_sparse_extend_impl(self, dsa_impl: str) -> str:
         # flash_mla's sparse prefill/verify binaries are SM90a/SM100f only, so
-        # on SM12x route the bf16 sparse-MLA extend leg -- plain prefill and
-        # the target-verify / draft-extend legs that carry the decode
-        # backend -- into the Triton sink kernel, which consumes the same
-        # inputs with the same math. FP8 pools keep their existing paths.
-        if (
-            dsa_impl == "flashmla_sparse"
-            and self.device_sm_major == 12
-            and not _is_hip
-            and not self.dsa_kv_cache_store_fp8
-        ):
+        # on SM12x route the sparse-MLA extend leg -- plain prefill and the
+        # target-verify / draft-extend legs that carry the decode backend --
+        # into the Triton sink kernel, which consumes the same inputs with the
+        # same math. On an fp8 pool the shared RAGGED branch has already
+        # dequantized the selected rows to bf16 by this point, so the reroute
+        # applies to both pool dtypes.
+        if dsa_impl == "flashmla_sparse" and self.device_sm_major == 12 and not _is_hip:
             return "triton_sparse_mla"
         return dsa_impl
 
@@ -4249,7 +4246,16 @@ class DeepseekSparseAttnBackend(
     def _use_triton_sink_decode(self, q_nope, kv_cache, page_table_1, attn_sink):
         if attn_sink is None or not _is_cuda:
             return False
-        if q_nope.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
+        # The triton decode kernel dequantizes scaled fp8_ds_mla rows itself.
+        # SM12x has no flash_mla binaries at all, so triton is the only
+        # sink-carrying sparse-decode path there, on either pool dtype.
+        fp8_pool = self.device_sm_major == 12 and kv_cache.dtype in (
+            torch.float8_e4m3fn,
+            torch.uint8,
+        )
+        if q_nope.dtype != torch.bfloat16 or not (
+            kv_cache.dtype == torch.bfloat16 or fp8_pool
+        ):
             return False
         if (
             q_nope.shape[1] <= 16
@@ -5166,7 +5172,11 @@ class DeepseekSparseAttnBackend(
         # Set MLA implementation only if not using MHA
         if not self.use_mha and self.enable_auto_select_prefill_impl:
             if self.dsa_kv_cache_store_fp8:
-                if (
+                if self.device_sm_major == 12 and not _is_hip:
+                    # No flash_mla binaries on SM12x; the triton sparse path
+                    # consumes the fp8 pool through per-batch dequant staging.
+                    self.dsa_prefill_impl = "triton_sparse_mla"
+                elif (
                     is_blackwell()
                     and forward_batch is not None
                     and forward_batch.forward_mode == ForwardMode.EXTEND

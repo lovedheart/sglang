@@ -543,10 +543,15 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
 
     kv_cache_dtype = view.kv_cache_dtype
     has_attention_sinks = bool(getattr(hf_config, "learnable_sink", False))
-    if has_attention_sinks and kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+    if has_attention_sinks and kv_cache_dtype not in (
+        "auto",
+        "bf16",
+        "bfloat16",
+        "fp8_e4m3",
+    ):
         raise ValueError(
-            "Learnable DSA attention sinks require a bfloat16 KV cache; "
-            f"got kv_cache_dtype={kv_cache_dtype}."
+            "Learnable DSA attention sinks require a bfloat16 or fp8_e4m3 KV "
+            f"cache; got kv_cache_dtype={kv_cache_dtype}."
         )
     if kv_cache_dtype == "auto":
         # gfx950 reports capability 9.x, but its triton/tilelang DSA kernels

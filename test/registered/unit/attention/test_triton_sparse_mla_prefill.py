@@ -292,14 +292,54 @@ class TestTritonSparseMLASM120ExtendReroute(CustomTestCase):
     def test_bf16_sparse_reroutes_on_sm120(self):
         self.assertEqual(self._resolved("flashmla_sparse"), "triton_sparse_mla")
 
+    def test_fp8_sparse_reroutes_on_sm120(self):
+        # The RAGGED branch dequantizes the fp8 pool to bf16 before the
+        # kernel runs, so the SM12x reroute applies to fp8 pools too.
+        self.assertEqual(
+            self._resolved("flashmla_sparse", store_fp8=True), "triton_sparse_mla"
+        )
+
     def test_other_hardware_and_pool_keep_flashmla(self):
         self.assertEqual(self._resolved("flashmla_sparse", sm=9), "flashmla_sparse")
         self.assertEqual(self._resolved("flashmla_sparse", sm=10), "flashmla_sparse")
         self.assertEqual(
-            self._resolved("flashmla_sparse", store_fp8=True), "flashmla_sparse"
+            self._resolved("flashmla_sparse", sm=10, store_fp8=True),
+            "flashmla_sparse",
         )
         self.assertEqual(self._resolved("flashmla_sparse", hip=True), "flashmla_sparse")
         self.assertEqual(self._resolved("triton_sparse_mla"), "triton_sparse_mla")
+
+
+class TestTritonSinkDecodeFP8Routing(CustomTestCase):
+    """On SM12x the triton sink decode must take fp8 pools as well:
+    flash_mla (the only other sink-carrying sparse decode) has no SM12x
+    binaries, so an fp8 pool that fell to it would crash at dispatch.
+    """
+
+    def _use_triton(self, *, kv_dtype, sm=12, q_dtype=torch.bfloat16):
+        from sglang.srt.layers.attention import dsa_backend as m
+
+        backend = m.DeepseekSparseAttnBackend.__new__(m.DeepseekSparseAttnBackend)
+        backend.device_sm_major = sm
+        q_nope = torch.empty(1, 8, 128, dtype=q_dtype)
+        kv_cache = torch.empty(4, 64, 1, 656, dtype=kv_dtype)
+        page_table_1 = torch.zeros(1, 64, dtype=torch.int32)
+        attn_sink = torch.zeros(8, dtype=torch.float32)
+        with patch.object(m, "_is_cuda", True):
+            return backend._use_triton_sink_decode(
+                q_nope, kv_cache, page_table_1, attn_sink
+            )
+
+    def test_sm120_accepts_fp8_and_bf16_pools(self):
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.uint8):
+            with self.subTest(dtype=dtype):
+                self.assertTrue(self._use_triton(kv_dtype=dtype))
+
+    def test_other_hardware_stays_on_flashmla_for_fp8(self):
+        self.assertFalse(self._use_triton(kv_dtype=torch.float8_e4m3fn, sm=10))
+        self.assertFalse(self._use_triton(kv_dtype=torch.uint8, sm=9))
+        # bf16 pools on other hardware keep the small-batch tuned caps only.
+        self.assertTrue(self._use_triton(kv_dtype=torch.bfloat16, sm=10))
 
 
 class TestTritonSparseMLARegistration(CustomTestCase):
