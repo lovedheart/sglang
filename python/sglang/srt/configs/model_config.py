@@ -2127,9 +2127,13 @@ class ModelConfig:
             quantized_layers = json_quant_configs.get("quantized_layers") or {}
             # Algos that only ModelOptMixedPrecisionConfig dispatches per
             # layer. Pure FP8/INT4-W4AFP8 exports keep the w4afp8 convention.
+            # FP8_PB_WO_E3M4 (block-FP8 with e3m4 weight codes) is only
+            # dispatched per layer by the mixed config too: the w4afp8 path
+            # treats every linear as block-FP8, which rejects narrow fused
+            # linears such as linear_attn.in_proj_ba.
             has_modelopt_mixed_layers = any(
                 str(layer_info.get("quant_algo", "")).upper()
-                in ("NVFP4", "W4A16_NVFP4", "W4A8_MXFP4_FP8")
+                in ("NVFP4", "W4A16_NVFP4", "W4A8_MXFP4_FP8", "FP8_PB_WO_E3M4")
                 for layer_info in quantized_layers.values()
                 if isinstance(layer_info, dict)
             )
