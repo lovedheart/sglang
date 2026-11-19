@@ -596,5 +596,11 @@ POSITIONAL_FIELD_ORDER = (
     "enable_qsa_kv_offload",
     "qsa_kv_offload_host_size",
     "qsa_kv_offload_hot_blocks",
+    "lm_head_dtype",
+    "enable_nvfp4_draft_lm_head",
+    "enable_fp8_shared_expert",
+    "enable_fp8_shared_expert_mtp",
+    "enable_fp8_hc_mix",
+    "enable_mm_dtype",
 )
 # fmt: on
