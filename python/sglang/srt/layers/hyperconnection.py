@@ -229,6 +229,11 @@ class GatedResidual(nn.Module):
         self._w_inject_fold = None
         # Set by fp8_hc_mix.quantize_hc_mix_to_mxfp8 at load time.
         self._mxfp8_mix = False
+        # bf16 dequant of the mxfp8 mix weights, materialized on first use by
+        # the unfused fallback (the mxfp8 swap happens before any forward, so
+        # the cache is filled in eager warmup and CUDA-graph safe).
+        self._mix_mxfp8_bf16: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._mix_mxfp8_key = None
 
         def _mix_compute(
             hyper_input_normed: torch.Tensor,
@@ -478,20 +483,28 @@ class GatedResidual(nn.Module):
                     self.hidden_size,
                 ).to(self.params_dtype)
             else:
-                # Prefill / long-batch / CPU / triton-off: dequantize on the
-                # fly and keep the torch.compile chain.
+                # Unfused: dequantize the mix weights once and keep the
+                # torch.compile chain. Re-dequantizing per call was ~4.8 ms
+                # of pure copy/mul/shift glue per decode step.
                 from sglang.srt.layers.fp8_hc_mix import mxfp8_dequantize_to_bf16
 
+                down = self.input_mix_weight_down
+                up = self.input_mix_weight_up
+                key = weight_cache_key(down.weight, up.weight) + (
+                    down._mxfp8_scale.data_ptr(),
+                    up._mxfp8_scale.data_ptr(),
+                )
+                if self._mix_mxfp8_key != key:
+                    self._mix_mxfp8_bf16 = (
+                        mxfp8_dequantize_to_bf16(down.weight, down._mxfp8_scale),
+                        mxfp8_dequantize_to_bf16(up.weight, up._mxfp8_scale),
+                    )
+                    self._mix_mxfp8_key = key
+                down_bf16, up_bf16 = self._mix_mxfp8_bf16
                 mixed_input = self._mix_compute(
                     hyper_input_normed,
-                    mxfp8_dequantize_to_bf16(
-                        self.input_mix_weight_down.weight,
-                        self.input_mix_weight_down._mxfp8_scale,
-                    ),
-                    mxfp8_dequantize_to_bf16(
-                        self.input_mix_weight_up.weight,
-                        self.input_mix_weight_up._mxfp8_scale,
-                    ),
+                    down_bf16,
+                    up_bf16,
                     self.hc_count,
                     self.hidden_size,
                 ).to(self.params_dtype)
