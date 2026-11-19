@@ -709,7 +709,11 @@ def fused_hc_mix_fp8(
     rows, k = hyper_input_normed.shape
     lowrank = w_down.shape[0]
     device = hyper_input_normed.device
-    t_raw = torch.empty((16, lowrank), dtype=torch.float32, device=device)
+    # The persistent kernel handles all rows in one ROWS-wide tile; pad the
+    # scratch (and the ROWS constexpr) up from the decode-typical 16 so larger
+    # row counts stay correct -- a fixed 16 silently left rows >= 16 unwritten.
+    rows_pad = max(16, triton.next_power_of_2(rows))
+    t_raw = torch.empty((rows_pad, lowrank), dtype=torch.float32, device=device)
     out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
     if rows == 0:
         return out
@@ -729,7 +733,7 @@ def fused_hc_mix_fp8(
         rows,
         num_ctas,
         1.0 / hc,
-        ROWS=16,
+        ROWS=rows_pad,
         HC=hc,
         BLOCK_N=32,
         BLOCK_K=256,
@@ -755,8 +759,9 @@ def fused_hc_mix_fold_fp8(
     rows, k = hyper_input.shape
     lowrank = w_down.shape[0]
     device = hyper_input.device
-    t_raw = torch.empty((16, lowrank), dtype=torch.float32, device=device)
-    ss = _get_ss(device, 16 * hc)
+    rows_pad = max(16, triton.next_power_of_2(rows))
+    t_raw = torch.empty((rows_pad, lowrank), dtype=torch.float32, device=device)
+    ss = _get_ss(device, rows_pad * hc)
     g = torch.empty((rows, hc), dtype=torch.float32, device=device)
     out = torch.empty((rows, hs), dtype=hyper_input.dtype, device=device)
     if rows == 0:
@@ -787,10 +792,12 @@ def fused_hc_mix_fold_fp8(
         1.0 / hc,
         1.0 / hs,
         eps,
-        ROWS=16,
+        ROWS=rows_pad,
         HC=hc,
         BLOCK_N=128,
-        BLOCK_K=256,
+        # The staged tiles scale with ROWS; at padded tiles past 16 rows the
+        # 256-wide K tile exceeds the 100 KB shared-memory cap on sm_120.
+        BLOCK_K=256 if rows_pad <= 16 else 128,
         BLOCK_J=16,
         BLOCK_R=64,
         num_warps=8,
