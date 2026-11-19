@@ -148,15 +148,18 @@ def _resolve_kernel(
     slot = tl.load(blk_slot_ptr + req * MAXB + ubc, mask=uniq, other=-1).to(tl.int64)
     hit = uniq & (slot >= 0)
     miss = uniq & (slot < 0)
-    stale = tl.zeros([BLOCK_U], dtype=tl.int1)
-    for j in tl.static_range(CR):
-        cj = tl.load(r2t_ptr + req * stride_r2t + ubc * CR + j, mask=uniq, other=-1)
-        rj = tl.load(
-            slot_src_ptr + (req * H + tl.where(hit, slot, 0)) * CR + j,
-            mask=hit,
-            other=-2,
-        )
-        stale = stale | (hit & (rj != cj))
+    jj = tl.arange(0, CR)
+    cj_map = tl.load(
+        r2t_ptr + req * stride_r2t + ubc[:, None] * CR + jj[None, :],
+        mask=uniq[:, None],
+        other=-1,
+    )
+    rj_slot = tl.load(
+        slot_src_ptr + (req * H + tl.where(hit, slot, 0))[:, None] * CR + jj[None, :],
+        mask=hit[:, None],
+        other=-2,
+    )
+    stale = hit & (tl.max((rj_slot != cj_map).to(tl.int32), axis=1) != 0)
     nh = tl.sum(hit.to(tl.int32), axis=0)
     m = tl.sum(miss.to(tl.int32), axis=0)
     tl.store(mark_ptr + req * H + slot, step, mask=hit)
@@ -207,14 +210,21 @@ def _resolve_kernel(
     planned = miss | stale
     k = tl.where(miss, mr, m + tl.cumsum(si32, axis=0) - si32)
     dslot = tl.where(miss, v, slot)
-    for j in tl.static_range(CR):
-        cj = tl.load(r2t_ptr + req * stride_r2t + ubc * CR + j, mask=planned, other=0)
-        tl.store(
-            plan_src_ptr + (g * BLOCK_U + k) * CR + j, cj.to(tl.int64), mask=planned
-        )
-        tl.store(
-            slot_src_ptr + (req * H + dslot) * CR + j, cj.to(tl.int32), mask=planned
-        )
+    cj_plan = tl.load(
+        r2t_ptr + req * stride_r2t + ubc[:, None] * CR + jj[None, :],
+        mask=planned[:, None],
+        other=0,
+    )
+    tl.store(
+        plan_src_ptr + (g * BLOCK_U + k)[:, None] * CR + jj[None, :],
+        cj_plan.to(tl.int64),
+        mask=planned[:, None],
+    )
+    tl.store(
+        slot_src_ptr + (req * H + dslot)[:, None] * CR + jj[None, :],
+        cj_plan.to(tl.int32),
+        mask=planned[:, None],
+    )
     tl.store(
         plan_dst_ptr + g * BLOCK_U + k, base + ring_rows + dslot * CR, mask=planned
     )
@@ -393,6 +403,9 @@ class QSAKVFusedResolve:
             self.host_vsf_addr = [host_vsf[i].data_ptr() for i in range(layers)]
         nr, hot, cr = num_request_slots, hot_blocks, compress_ratio
         self.num_request_slots, self.hot_blocks, self.cr = nr, hot, cr
+        # the LRU re-pack is a masked prefix scan, so one BH-wide vector yields
+        # the same order as BH-stepped loops over the full list
+        self.lru_bh = triton.next_power_of_2(hot)
         self.region_rows = region_rows
         self.block_topk = token_topk // cr
         self.max_blocks = width // cr + _RING
@@ -491,7 +504,7 @@ class QSAKVFusedResolve:
             BLOCK_U=block_u,
             CR=self.cr,
             NRING=_RING,
-            BH=1024,
+            BH=self.lru_bh,
             num_warps=8,
         )
         _copy_plan_kernel[(groups, triton.cdiv(block_u, _PLAN_PER_PROGRAM))](
