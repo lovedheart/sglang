@@ -18,7 +18,14 @@ from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
-_FUSED_MIX_MAX_ROWS = 16
+# Covers the speculative-verify row counts decode hits at bs <= 8 (rows are
+# always a multiple of num_draft_tokens, so 32 is the practical decode max
+# here). The launchers pad the ROWS-wide tile to the next power of two, so
+# anything past a power of two pays the next tile size: the MXFP8 fold arm
+# matches the compiled BF16 chain up to 32 rows warm and wins in-situ on the
+# cold-weight streaming path (half the weight bytes), then regresses at 40+
+# (tiled 64 wide), so larger rows stay on the torch.compile / w8a8 paths.
+_FUSED_MIX_MAX_ROWS = 32
 
 
 def hc_norm_fold_enabled() -> bool:
@@ -219,7 +226,9 @@ def fused_hc_mix(
 ) -> torch.Tensor:
     rows, k = hyper_input_normed.shape
     lowrank = w_down.shape[0]
-    rows_pad = 16
+    # Pad the ROWS-wide tile (and scratch) beyond the decode-typical 16;
+    # a fixed 16 silently left rows >= 16 unwritten.
+    rows_pad = max(16, triton.next_power_of_2(rows))
     device = hyper_input_normed.device
     num_ctas = current_arch().num_sms
     t_raw = torch.empty((rows_pad, lowrank), dtype=torch.float32, device=device)
@@ -463,7 +472,7 @@ def fused_hc_mix_fold(
     # Returns (mixed_input [rows, hs], per-branch norm factors g [rows, hc]).
     rows, k = hyper_input.shape
     lowrank = w_down_fold.shape[0]
-    rows_pad = 16
+    rows_pad = max(16, triton.next_power_of_2(rows))
     device = hyper_input.device
     num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
     t_raw = torch.empty((rows_pad, lowrank), dtype=torch.float32, device=device)
