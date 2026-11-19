@@ -195,9 +195,13 @@ def _workspace(
 
 
 def _hybrid_buckets(max_num_tokens: int) -> tuple[int, ...]:
-    """Bucket ladder mirroring flashinfer's hybrid policy: powers of 2 up to
-    256, steps of 256 to 2048, steps of 512 to 4096, powers of 2 beyond."""
+    """Bucket ladder mirroring flashinfer's hybrid policy: multiples of 4 up
+    to 128, of 8 to 256, steps of 256 to 2048, steps of 512 to 4096, powers
+    of 2 beyond. The fine low end keeps decode token counts (batch x draft
+    tokens, e.g. 6 x 4 = 24) from padding up a whole octave."""
     buckets = []
+    buckets += range(4, min(max_num_tokens, 128) + 1, 4)
+    buckets += range(136, min(max_num_tokens, 256) + 1, 8)
     m = 1
     while m <= min(max_num_tokens, 256):
         buckets.append(m)
