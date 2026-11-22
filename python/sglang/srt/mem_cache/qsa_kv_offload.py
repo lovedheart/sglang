@@ -63,6 +63,43 @@ class _PrefillSlab(msgspec.Struct):
     slot0: int = -1
 
 
+class _QsaGatherPlan(msgspec.Struct):
+    """One extend forward's context rows, resolved once at forward entry.
+
+    ``slots`` mirrors the per-layer index ``gather_offloaded_context`` reads
+    out of ``req_to_token``: the scheduler (that table's only writer) runs on
+    this thread between forwards, so the rows stay what every layer's gather
+    will read. Plane 0 is prefetched right after the plan is built (its
+    runway: the embedding and the first GDN run) and each layer's gather
+    triggers the plane after it. ``seqs``/``exts`` mirror the request
+    lengths, so the chunk tail refills per request without a host sync.
+    """
+
+    seqs: list[int]  # context length per request, as the gather sees them
+    exts: list[int]  # rows this forward stores itself, per request
+    num_rows: int  # sum(seqs): context rows per layer gather
+    slots: torch.Tensor  # (num_rows,) int64 device, the slot of each row
+    next_layer: int = 0  # the next plane whose gather may be prefetched
+
+
+class _QsaPrefetch(msgspec.Struct):
+    """A scheduled host -> device gather of one plane's context K/V rows.
+
+    The copy runs on the prefetch stream, chained behind the compute stream
+    at issue time; ``done`` is recorded when it ends. The rows holding this
+    forward's own chunk are copied too but always overwritten from the
+    device scratch at consume time, so their (possibly stale) host bytes
+    never reach the attention. The scale planes of a quantized K/V are not
+    prefetched: they are too small for the fused transfer kernel and are
+    copied inline at consume, exactly as the un-prefetched gather does.
+    """
+
+    layer_idx: int
+    k: torch.Tensor
+    v: torch.Tensor
+    done: torch.cuda.Event
+
+
 class QSAKVOffloadLayout(msgspec.Struct, frozen=True):
     """Device-row layout of an offloaded QSA K/V pool."""
 
@@ -394,6 +431,13 @@ class QSAKVHostOffload:
             layout.scratch_rows,
         )
         self.req_to_token: Optional[torch.Tensor] = None
+        # Layer-ahead gather prefetch (see SGLANG_QSA_OFFLOAD_PREFETCH_*):
+        # the per-forward plan, the one outstanding copy, and the event the
+        # next host write must wait on (see the top of write_through).
+        self._gather_plan: Optional[_QsaGatherPlan] = None
+        self._prefetched: Optional[_QsaPrefetch] = None
+        self._prefetch_write_gate: Optional[torch.cuda.Event] = None
+        self._prefetch_stream = None  # the "qsa_kv_h2d" lease, taken eagerly
         # The fused resolve reads the host store through raw UVA pointers,
         # validated on CUDA only.
         self.use_fused = (
@@ -499,6 +543,12 @@ class QSAKVHostOffload:
 
     def destroy(self) -> None:
         """Unpin the host K/V (see HostKVCache.destroy). Idempotent."""
+        if self._prefetch_stream is not None:
+            # A last copy may still be reading the host planes about to be
+            # unpinned; join it (there is no later write to ride the gate).
+            self._prefetch_stream.synchronize()
+            self._prefetched = None
+            self._prefetch_write_gate = None
         if self.verify:
             self._verify_logged = 0.0
             self.poll_verify()
@@ -600,6 +650,8 @@ class QSAKVHostOffload:
         reset_req_pool_indices: Optional[torch.Tensor] = None,
     ) -> None:
         """Per-forward setup; an extend passes its requests to reset."""
+        self._gather_plan = None
+        self._prefetched = None
         if (
             self.fused is None
             and self.device.type == "cuda"
@@ -664,6 +716,13 @@ class QSAKVHostOffload:
         self, layer_idx: int, rows: torch.Tensor, loc: torch.Tensor
     ) -> None:
         """Device rows ``rows`` -> host rows ``loc`` (their logical slots)."""
+        if self._prefetch_write_gate is not None:
+            # The scheduler may have freed a row from the radix tree between
+            # forwards while a prefetch copy still reads it, and ``loc`` can
+            # be that row now. The copies are FIFO on one stream, so the
+            # newest event drains all of them.
+            torch.cuda.current_stream().wait_event(self._prefetch_write_gate)
+            self._prefetch_write_gate = None
         if self.fused is not None:
             self.fused.write_through(layer_idx=layer_idx, rows=rows, loc=loc)
             return
@@ -760,6 +819,222 @@ class QSAKVHostOffload:
             vs_src=self.dev_vsf[layer_idx] if self.quantized else None,
         )
         return k, v, ksf, vsf
+
+    # ---- layer-ahead gather prefetch ------------------------------------------
+
+    def _prefetch_stream_lease(self) -> torch.cuda.Stream:
+        # The gather copies own their stream — sharing the weights
+        # offloader's "offload" lease would serialize unrelated copy work.
+        if self._prefetch_stream is None:
+            from sglang.srt.runtime_context import get_stream
+
+            self._prefetch_stream = get_stream("qsa_kv_h2d")
+        return self._prefetch_stream
+
+    def _prefetch_eligible(self, forward_batch) -> bool:
+        """Whether this extend forward may prefetch its context gathers.
+
+        The plan mirrors the dense/hot-tail gather row-for-row, so the same
+        fields the gather reads must exist, and no branch that would not
+        consume the copy (verify, slab, union, a captured graph) may be in
+        play. The row cap bounds the extra device buffers and the window in
+        which the copy stream reads host rows the scheduler may recycle.
+        """
+        if not envs.SGLANG_QSA_OFFLOAD_PREFETCH_GATHER.get():
+            return False
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            is_in_breakable_cuda_graph,
+        )
+
+        if (
+            self.verify
+            or self.slab_rows > 0
+            or envs.SGLANG_QSA_OFFLOAD_UNION_GATHER.get()
+            or self.device.type != "cuda"
+            or not self.pin_memory
+            # Like the slab and hot-tail gathers: inside a BCG prefill the
+            # consume could land in a captured segment, where waiting on an
+            # event recorded outside the capture is unsupported.
+            or is_in_breakable_cuda_graph()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return False
+        row = self.host_k[0][0]
+        if row.numel() * row.element_size() % 128:
+            # The fused transfer kernel wants 128-byte rows; its fallback
+            # index copy syncs, which has no place on the copy stream.
+            return False
+        seqs = forward_batch.seq_lens_cpu
+        exts = forward_batch.extend_seq_lens_cpu
+        if seqs is None or exts is None or forward_batch.extend_seq_lens is None:
+            return False
+        if len(seqs) != len(exts):
+            return False
+        total = sum(int(x) for x in seqs)
+        if not 0 < total <= envs.SGLANG_QSA_OFFLOAD_PREFETCH_MAX_ROWS.get():
+            return False
+        # forward_extend hands the new K/V straight to the kernel when no
+        # request has a cached prefix: no gather ever runs to take a copy.
+        return any(s > e for s, e in zip((int(x) for x in seqs), exts))
+
+    def prefetch_prepare(self, forward_batch) -> None:
+        """Resolve this extend forward's context rows once and prefetch the
+        first QSA layer's gather on the copy stream (its runway: the
+        embedding and the first GDN run)."""
+        if not self._prefetch_eligible(forward_batch):
+            return
+        seqs = [int(x) for x in forward_batch.seq_lens_cpu]
+        exts = [int(x) for x in forward_batch.extend_seq_lens_cpu]
+        total = sum(seqs)
+        starts_list = [0]
+        for seq in seqs[:-1]:
+            starts_list.append(starts_list[-1] + seq)
+        starts = torch.tensor(starts_list, dtype=torch.int64, device=self.device)
+        owner = torch.repeat_interleave(
+            torch.arange(len(seqs), device=self.device),
+            torch.tensor(seqs, dtype=torch.int64, device=self.device),
+            output_size=total,
+        )
+        positions = torch.arange(total, device=self.device) - starts[owner]
+        slots = self.req_to_token[
+            forward_batch.req_pool_indices.long()[owner], positions
+        ].long()
+        self._gather_plan = _QsaGatherPlan(
+            seqs=seqs, exts=exts, num_rows=total, slots=slots, next_layer=0
+        )
+        self._issue_prefetch(0)
+
+    def maybe_prefetch_next(self, layer_idx: int) -> None:
+        """Trigger from a QSA layer's gather: the plane after it gets a
+        copy runway of the attention and GDN layers before its gather.
+        Must run after that gather took its record: one record slot."""
+        if self._gather_plan is not None:
+            self._issue_prefetch(layer_idx + 1)
+
+    def _issue_prefetch(self, layer_idx: int) -> None:
+        plan = self._gather_plan
+        if (
+            plan is None
+            or plan.next_layer != layer_idx
+            or layer_idx >= self.num_layers
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return
+        plan.next_layer += 1
+        shape = (plan.num_rows, *self.dev_k[layer_idx].shape[1:])
+        k = torch.empty(shape, dtype=self.dev_k[layer_idx].dtype, device=self.device)
+        v = torch.empty_like(k)
+        stream = self._prefetch_stream_lease()
+        done = torch.cuda.Event()
+        # Chain the copy behind everything enqueued so far: those are the
+        # writes to the host rows it reads. A *later* store could land on a
+        # host row the scheduler freed from the radix tree while this copy
+        # still reads it; that writer, not this reader, is gated — see the
+        # wait at the top of write_through.
+        stream.wait_stream(torch.cuda.current_stream())
+        plan.slots.record_stream(stream)
+        # Allocated on the compute stream, written on the copy stream: lease
+        # both so the allocator cannot hand them to a third party mid-copy.
+        k.record_stream(stream)
+        v.record_stream(stream)
+        with torch.cuda.stream(stream):
+            # The index vector is allocated on the copy stream too, so the
+            # caching allocator returns it to *this* stream's pool: a
+            # compute-stream reuse would otherwise need no event for the
+            # copy's still-pending read of it.
+            _copy_plane(
+                k_dst=k,
+                v_dst=v,
+                dst=torch.arange(plan.num_rows, dtype=torch.int64, device=self.device),
+                k_src=self.host_k[layer_idx],
+                v_src=self.host_v[layer_idx],
+                src=plan.slots,
+            )
+            done.record(stream)
+        self._prefetched = _QsaPrefetch(layer_idx, k, v, done)
+        self._prefetch_write_gate = done
+
+    def take_prefetch(self, layer_idx: int) -> Optional[_QsaPrefetch]:
+        """The scheduled copy for this layer's gather, if one was issued;
+        ``finish_prefetched_gather`` assembles the planes from it. The
+        stream wait behind the copy's completion rides on the current
+        stream, as does everything the caller launches after it."""
+        rec = self._prefetched
+        if rec is None or rec.layer_idx != layer_idx:
+            return None
+        self._prefetched = None
+        torch.cuda.current_stream().wait_event(rec.done)
+        return rec
+
+    def finish_prefetched_gather(
+        self,
+        rec: _QsaPrefetch,
+        layer_idx: int,
+        slots: torch.Tensor,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
+    ]:
+        """Assemble one layer's gather from its copy: the chunk tail (whose
+        host rows the copy could not have seen written) is overwritten from
+        the device-scratch rows the hot-tail gather reads, and the scale
+        planes of a quantized K/V are read from the host exactly as the
+        un-prefetched gather reads them. Bit-identical to
+        ``gather_context``; all index math rides on the plan's host-side
+        lengths, so no extra host sync enters the forward."""
+        plan = self._gather_plan
+        dst_rows = []
+        dst_rows_src = []
+        off = scr = 0
+        base = self.layout.scratch_base
+        for seq, ext in zip(plan.seqs, plan.exts):
+            if ext:
+                dst_rows += [
+                    rec.k[off + seq - ext : off + seq],
+                    rec.v[off + seq - ext : off + seq],
+                ]
+                dst_rows_src += [
+                    self.dev_k[layer_idx][base + scr : base + scr + ext],
+                    self.dev_v[layer_idx][base + scr : base + scr + ext],
+                ]
+                scr += ext
+            off += seq
+        if dst_rows:
+            torch._foreach_copy_(dst_rows, dst_rows_src)
+        k_sf = v_sf = None
+        if self.quantized:
+            k_sf = torch.empty(
+                (plan.num_rows, *self.dev_ksf[layer_idx].shape[1:]),
+                dtype=self.dev_ksf[layer_idx].dtype,
+                device=self.device,
+            )
+            v_sf = torch.empty_like(k_sf)
+            _copy_rows(
+                k_dst=k_sf,
+                v_dst=v_sf,
+                dst=torch.arange(plan.num_rows, device=self.device),
+                k_src=self.host_ksf[layer_idx],
+                v_src=self.host_vsf[layer_idx],
+                src=slots,
+            )
+        if envs.SGLANG_QSA_OFFLOAD_PREFETCH_DEBUG.get():
+            # The all-host gather reads the same rows *now* (after all this
+            # forward's host writes): a difference means the copy raced a
+            # host-plane write or read a row the plan should not have held.
+            ref = self.gather_context(layer_idx, slots)
+            for name, got, want in (
+                ("k", rec.k, ref[0]),
+                ("v", rec.v, ref[1]),
+                ("k_sf", k_sf, ref[2]),
+                ("v_sf", v_sf, ref[3]),
+            ):
+                if got is None and want is None:
+                    continue
+                if not torch.equal(got, want):
+                    raise RuntimeError(
+                        f"QSA gather prefetch: layer {layer_idx} {name} differs "
+                        "from the inline all-host gather"
+                    )
+        return rec.k, rec.v, k_sf, v_sf
 
     # ---- decode / target verify ----------------------------------------------
 
@@ -1068,9 +1343,7 @@ class QSAKVHostOffload:
             slab.base = base
             slab.length = taken
         else:
-            slab = _PrefillSlab(
-                base=base, length=taken, cursors=[0] * self.num_layers
-            )
+            slab = _PrefillSlab(base=base, length=taken, cursors=[0] * self.num_layers)
             self._slabs[req] = slab
         return slab
 

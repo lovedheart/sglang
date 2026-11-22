@@ -1207,6 +1207,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 ),
             )
             self._kv_offload.set_num_real(forward_batch.batch_size)
+            if is_extend:
+                self._kv_offload.prefetch_prepare(forward_batch)
 
     def init_forward_metadata_out_graph(
         self,
