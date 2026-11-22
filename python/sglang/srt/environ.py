@@ -366,6 +366,22 @@ class Envs:
     # back to the all-host gather for that chunk. 300K rows (~2 GB packed
     # across the QSA layers) covers 4 concurrent 61K prefills or one 262K.
     SGLANG_QSA_OFFLOAD_PREFILL_SLAB_ROWS = EnvInt(0)
+    # Prefetch the next QSA layer's prefill-context gather one layer ahead:
+    # when a QSA layer's gather completes, the next QSA layer's context rows
+    # cross PCIe host -> device on a copy stream, overlapped with that
+    # layer's attention and the GDN layers that run before the next gather. The current chunk's rows are then
+    # re-read from the device scratch (exactly what the hot-tail gather
+    # does), so the assembled rows are bit-identical to the inline gather;
+    # the pinned-host store is unchanged. Requires CUDA + a pinned host tier.
+    SGLANG_QSA_OFFLOAD_PREFETCH_GATHER = EnvBool(False)
+    # Skip the prefetch when a forward's whole context exceeds this many
+    # rows: it bounds the extra device buffers and the window in which the
+    # copy stream reads host rows the scheduler may free and reuse.
+    SGLANG_QSA_OFFLOAD_PREFETCH_MAX_ROWS = EnvInt(32768)
+    # Debug: byte-compare every consumed prefetch against the inline
+    # all-host gather and raise on any divergence. This host-syncs once per
+    # prefetched layer; run it to validate a new host-plane write path.
+    SGLANG_QSA_OFFLOAD_PREFETCH_DEBUG = EnvBool(False)
     # Give the QSA sparse-prefill kernels two warps and a 3-deep pipeline instead of
     # the one-warp tail of the tuning tables.  With one warp Triton has nowhere to put
     # the head_dim-deep QK reduction, so it serialises it; splitting it across two

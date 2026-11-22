@@ -469,9 +469,7 @@ def _gather_prefill_context_slab(
                     dst=span(start + prior, start + seq),
                     k_src=offload.dev_k[layer_idx],
                     v_src=offload.dev_v[layer_idx],
-                    src=(
-                        offload.layout.scratch_base + ext_seen + span(0, ext)
-                    ),
+                    src=(offload.layout.scratch_base + ext_seen + span(0, ext)),
                     **(
                         {
                             "ks_src": offload.dev_ksf[layer_idx],
@@ -541,12 +539,19 @@ def gather_offloaded_context(
         and extend_lens is not None
         and extend_lens.numel() == sequence_lens.numel()
     )
+    prefetched = None if slab_on else offload.take_prefetch(layer_idx)
     if slab_on:
         k, v, k_sf, v_sf = _gather_prefill_context_slab(
             offload=offload,
             layer_idx=layer_idx,
             slots=slots,
             forward_batch=forward_batch,
+        )
+    elif prefetched is not None:
+        # This layer's context rows were copied on the prefetch stream at
+        # their schedule point; assemble the parts the copy could not carry.
+        k, v, k_sf, v_sf = offload.finish_prefetched_gather(
+            prefetched, layer_idx=layer_idx, slots=slots
         )
     elif hot_tail:
         # The current chunk's rows are in the device mirror scratch right now
@@ -559,9 +564,9 @@ def gather_offloaded_context(
         starts = seq[owner] - e[owner]
         tail_mask = positions >= starts
         rows_before = torch.cumsum(e, 0) - e
-        tail_rows = (offload.layout.scratch_base + rows_before[owner] + (positions - starts))[
-            tail_mask
-        ]
+        tail_rows = (
+            offload.layout.scratch_base + rows_before[owner] + (positions - starts)
+        )[tail_mask]
         k, v, k_sf, v_sf = offload.gather_context_hot_tail(
             layer_idx=layer_idx,
             slots=slots,
@@ -570,6 +575,10 @@ def gather_offloaded_context(
         )
     else:
         k, v, k_sf, v_sf = offload.gather_context(layer_idx=layer_idx, slots=slots)
+    # This layer's record is consumed; give the next QSA layer's copy the
+    # runway of the attention and GDN layers before its gather (a no-op
+    # unless the gather prefetch is enabled).
+    offload.maybe_prefetch_next(layer_idx)
     if k_sf is not None:
         if offload.verify:
             # Packed rows compare bit for bit against the full pool's rows of
