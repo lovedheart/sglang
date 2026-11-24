@@ -1429,6 +1429,29 @@ class TestInt8MambaCheckpointCompatibility(unittest.TestCase):
             ServerArgs(model_path="dummy", enable_unified_memory=True)
         )
 
+    def test_accepts_offload_with_extra_buffer_lazy(self):
+        # The RAM tier hangs off checkpoint slots, which are orthogonal to
+        # how many tracking rows a live request holds; lazy growth is
+        # admission-gated like it is for swap. GPU-verified 2026-11-16.
+        handle_int8_mamba_checkpoint(
+            ServerArgs(
+                model_path="dummy",
+                enable_int8_mamba_checkpoint=True,
+                enable_int8_mamba_checkpoint_offload=True,
+                int8_mamba_ckpt_host_size=8,
+                mamba_radix_cache_strategy="extra_buffer_lazy",
+            )
+        )
+
+    def test_rejects_offload_without_int8(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_int8_mamba_checkpoint_offload=True,
+            int8_mamba_ckpt_host_size=8,
+        )
+        with self.assertRaisesRegex(ValueError, "int8"):
+            handle_int8_mamba_checkpoint(server_args)
+
     def test_rejects_host_pool_retraction_backup(self):
         """host_pool retraction backup brings up the HiCache controller, a
         second door to the not-int8-aware host loader that

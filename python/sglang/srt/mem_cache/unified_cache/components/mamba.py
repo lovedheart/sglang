@@ -219,8 +219,11 @@ class MambaComponent(TreeComponent):
                 if cd.value is not None:
                     self.tree_core.lru_lists[ct].reset_node_mru(node)
                     self._cost_mark_used(node)
-                elif cd.host_value is not None and self._ckpt_host_tier():
-                    # A RAM-checkpoint hit: keep it hot in the RAM tier's LRU.
+                elif cd.host_value is not None and (
+                    self._mamba_host_only_checkpoint() or self._ckpt_host_tier()
+                ):
+                    # A RAM-checkpoint or host-only-checkpoint hit: keep it hot
+                    # in the host tier's LRU (mirrors the rust core's gate).
                     # An admitted match's host lock DELISTED the node, so the
                     # refresh must not assume membership.
                     host_lru = self.tree_core.host_lru_lists[ct]
@@ -286,27 +289,18 @@ class MambaComponent(TreeComponent):
         # Copy-on-write the matched device mamba state into a per-request slot.
         if not params.cow_mamba:
             return result
-        if params.req is not None and params.req.kv.mamba_cow_src_index is not None:
-            # This request re-matches: return a promoted RAM-checkpoint slot
-            # staged by an earlier unadmitted match, or the id it held is
-            # orphaned off both ledgers forever. No-op for tree-owned sources.
-            storage, sub_pool = self._state()
-            pool = storage.checkpoint_pool(sub_pool)
-            if pool is not None:
-                pool.release_promotion(
-                    int(params.req.kv.mamba_cow_src_index.reshape(-1)[0])
-                )
-            params.req.kv.mamba_cow_src_index = None
         src_index = self.tree_core.get_component_device_value(
             result.best_match_node, self.component_type
         )
+        promoted = False
         if src_index is None and self._ckpt_host_tier():
             src_index = self._promote_match_checkpoint(result.best_match_node)
+            promoted = src_index is not None
         if src_index is None:
             # A source from an earlier match of an unadmitted request may have
             # been evicted and its slot reused since; never carry it over.
             if params.req is not None:
-                params.req.kv.mamba_cow_src_index = None
+                self._stage_cow_source(params.req, None, False)
             return result
         req = params.req
         assert req is not None
@@ -327,12 +321,28 @@ class MambaComponent(TreeComponent):
                 )
                 assert dst_index is not None, "Can not alloc mamba cache"
             req.kv.mamba_pool_idx = dst_index[0]
-        req.kv.mamba_cow_src_index = src_index
+        self._stage_cow_source(req, src_index, promoted)
         req.kv.mamba_needs_clear = False
         return result
 
     def _mamba_host_only_checkpoint(self) -> bool:
         return self.host_only_checkpoint
+
+    def _stage_cow_source(self, req: Req, src_index, promoted: bool) -> None:
+        """(Re)stage a request's deferred CoW source. Only a source this req
+        received from ``_promote_match_checkpoint`` is pool-owned (vs a
+        tree-owned row), so it is released only for THIS req's flag: a
+        pool-wide pending count would free a promotion another request
+        staged into the same recycled slot id."""
+        old = req.kv.mamba_cow_src_index
+        if old is not None and req.kv.mamba_cow_src_promoted:
+            storage, sub_pool = self._state()
+            pool = storage.checkpoint_pool(sub_pool)
+            if pool is not None:
+                # No-op if the CoW already consumed (and freed) the slot.
+                pool.release_promotion(int(old.reshape(-1)[0]))
+        req.kv.mamba_cow_src_index = src_index
+        req.kv.mamba_cow_src_promoted = promoted if src_index is not None else False
 
     def _promote_match_checkpoint(self, best_match_node):
         """Serve a RAM-tier checkpoint hit: copy it back to the GPU checkpoint
@@ -1048,14 +1058,18 @@ class MambaComponent(TreeComponent):
         ckpt_slot = self._alloc_int8_ckpt_slot()
         storage, sub_pool = self._state()
         pool = storage.checkpoint_pool(sub_pool)
-        ckpt_id = int(ckpt_slot.reshape(-1)[0].item())
-        if pool.is_host_slot(ckpt_id):
+        ckpt_id = None
+        if pool.host_slots > 0:
+            # Only the tiered pool can name a RAM slot; keep the GPU-only
+            # config free of this per-store D2H sync.
+            ckpt_id = int(ckpt_slot.reshape(-1)[0].item())
+        if ckpt_id is not None and pool.is_host_slot(ckpt_id):
             self._ram_ckpts_issued += 1
             insert_params.mamba_host_value = ckpt_slot
             logger.debug("int8 checkpoint spilled to RAM slot %d", ckpt_id)
         else:
             insert_params.mamba_value = ckpt_slot
-        storage.store_checkpoint(sub_pool, active_slots, ckpt_slot)
+        storage.store_checkpoint(sub_pool, active_slots, ckpt_slot, ckpt_id=ckpt_id)
 
     def _free_mamba_value(self, mamba_value: torch.Tensor) -> None:
         storage, sub_pool = self._state()
@@ -1313,12 +1327,17 @@ class MambaComponent(TreeComponent):
         storage, sub_pool = self._state()
         storage.restart_replay(sub_pool, req.kv.mamba_pool_idx.unsqueeze(0))
         if req.kv.mamba_cow_src_index is not None:
-            # The COW will not run: hand back a promoted slot if that was the
-            # source (no-op for tree-owned sources).
-            pool = storage.checkpoint_pool(sub_pool)
-            if pool is not None:
-                pool.release_promotion(int(req.kv.mamba_cow_src_index.reshape(-1)[0]))
+            # The COW will not run: hand back a promoted slot if this req
+            # staged one (no-op for tree-owned sources — the flag is the
+            # per-request ownership predicate, never a pool-wide count).
+            if req.kv.mamba_cow_src_promoted:
+                pool = storage.checkpoint_pool(sub_pool)
+                if pool is not None:
+                    pool.release_promotion(
+                        int(req.kv.mamba_cow_src_index.reshape(-1)[0])
+                    )
         req.kv.mamba_cow_src_index = None
+        req.kv.mamba_cow_src_promoted = False
         req.kv.mamba_needs_clear = False
 
     # ---- HiCache Hooks ----

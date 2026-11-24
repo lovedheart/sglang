@@ -225,6 +225,82 @@ class TestTieredCheckpointPool(unittest.TestCase):
         self.assertEqual(int(ids.max()), 8)
         self.assertIsNone(pool.alloc(1))
 
+    def test_release_promotion_is_noop_for_foreign_ids(self):
+        # release_promotion is safe to call with an id the pool does not own;
+        # it must not disturb genuinely pending promotions (the per-request
+        # ownership flag leans on this).
+        pool = self._pool(host_slots=4)
+        gpu_slot = int(pool.alloc_device_slot()[0])
+        pool.promote(pool.num_slots + 1, gpu_slot)
+        pool.release_promotion(12345)
+        self.assertEqual(pool.num_pending_promotions(), 1)
+        pool.release_promotion(gpu_slot)
+        self.assertEqual(pool.num_pending_promotions(), 0)
+
+
+class TestStaleCowSourceOwnership(unittest.TestCase):
+    """Round-6 B1: a stale TREE-OWNED CoW source must never release a
+    promoted slot a DIFFERENT request staged into the same recycled slot id.
+    Only the req whose flag says "I got this slot from promote()" may
+    release it (components/mamba.py _stage_cow_source)."""
+
+    def _component(self, pool):
+        from types import MethodType
+        from types import SimpleNamespace as NS
+
+        from sglang.srt.mem_cache.unified_cache.components.mamba import (
+            MambaComponent,
+        )
+
+        comp = MambaComponent.__new__(MambaComponent)
+        storage = NS(checkpoint_pool=lambda _sub: pool)
+        comp._state = MethodType(lambda self: (storage, None), comp)
+        return comp
+
+    def _req(self, src_index=None, promoted=False):
+        from types import SimpleNamespace
+
+        kv = SimpleNamespace(
+            mamba_cow_src_index=(
+                None if src_index is None else torch.tensor([src_index])
+            ),
+            mamba_cow_src_promoted=promoted,
+        )
+        return SimpleNamespace(kv=kv)
+
+    def test_stale_tree_owned_source_does_not_free_foreign_promotion(self):
+        pool = MambaCheckpointPool(device="cpu", **_pool_kwargs(host_slots=4))
+        gpu_id = int(pool.alloc_device_slot()[0])
+        pool.promote(pool.num_slots + 1, gpu_id)
+        comp = self._component(pool)
+
+        # Req A holds a stale tree-owned source colliding with B's freshly
+        # promoted slot id (LIFO alloc reuses freed ids exactly).
+        req_a = self._req(src_index=gpu_id, promoted=False)
+        comp._stage_cow_source(req_a, None, False)
+        self.assertEqual(
+            pool.num_pending_promotions(),
+            1,
+            "stale tree-owned source released another request's promotion",
+        )
+        # Req B, the actual owner, releases it and only it.
+        req_b = self._req(src_index=gpu_id, promoted=True)
+        comp._stage_cow_source(req_b, None, False)
+        self.assertEqual(pool.num_pending_promotions(), 0)
+        self.assertFalse(req_b.kv.mamba_cow_src_promoted)
+
+    def test_stage_sets_and_clears_ownership_flag(self):
+        pool = MambaCheckpointPool(device="cpu", **_pool_kwargs(host_slots=4))
+        comp = self._component(pool)
+        req = self._req()
+        comp._stage_cow_source(req, pool.alloc_device_slot(), True)
+        self.assertTrue(req.kv.mamba_cow_src_promoted)
+        comp._stage_cow_source(req, pool.alloc_device_slot(), False)
+        self.assertFalse(req.kv.mamba_cow_src_promoted)
+        req.kv.mamba_cow_src_promoted = True
+        comp._stage_cow_source(req, None, False)
+        self.assertFalse(req.kv.mamba_cow_src_promoted)
+
 
 if __name__ == "__main__":
     unittest.main()
