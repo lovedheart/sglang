@@ -1055,21 +1055,48 @@ class MambaComponent(TreeComponent):
         """Quantize an active slot into the tiered checkpoint pool and bind the
         resulting id onto ``insert_params`` under the owning value slot (GPU ->
         device value, RAM -> host value)."""
-        ckpt_slot = self._alloc_int8_ckpt_slot()
         storage, sub_pool = self._state()
         pool = storage.checkpoint_pool(sub_pool)
-        ckpt_id = None
-        if pool.host_slots > 0:
-            # Only the tiered pool can name a RAM slot; keep the GPU-only
-            # config free of this per-store D2H sync.
+        # A tiered pool must know its slot's tier to route a spill to the RAM
+        # path, but reading the id is a D2H sync that waits on every queued
+        # kernel — in decode that serialises the pipeline behind each store.
+        # The allocator is device-first, so the host-side free count decides
+        # the tier up front: a store taken while the GPU tier has a free row
+        # is provably a GPU slot and needs no read at all. Only a genuine
+        # spill (GPU tier full) pays for the id.
+        # (A group pre-allocation hands out a fixed batch whose tier mix is
+        # decided at begin time, so the counter only decides outside a group.
+        # The checkpoint pool is never group-allocated; this keeps the fast
+        # path honest if that ever changes.)
+        device_free_before = (
+            pool.device_available_size()
+            if pool.host_slots > 0 and not pool.allocator.alloc_group_open
+            else -1
+        )
+        ckpt_slot = self._alloc_int8_ckpt_slot()
+        if pool.host_slots > 0 and device_free_before <= 0:
+            # Tier undecidable up front (device tier full, or a group batch in
+            # flight): read the id. This is the only path that syncs, and in a
+            # healthy tiered pool it is as rare as a spill.
             ckpt_id = int(ckpt_slot.reshape(-1)[0].item())
+        else:
+            ckpt_id = None
         if ckpt_id is not None and pool.is_host_slot(ckpt_id):
             self._ram_ckpts_issued += 1
             insert_params.mamba_host_value = ckpt_slot
             logger.debug("int8 checkpoint spilled to RAM slot %d", ckpt_id)
+            storage.store_checkpoint(sub_pool, active_slots, ckpt_slot, ckpt_id=ckpt_id)
         else:
             insert_params.mamba_value = ckpt_slot
-        storage.store_checkpoint(sub_pool, active_slots, ckpt_slot, ckpt_id=ckpt_id)
+            # Only a saturated device tier can yield a RAM id, and that case
+            # took the branch above; assume_device keeps the store sync-free.
+            storage.store_checkpoint(
+                sub_pool,
+                active_slots,
+                ckpt_slot,
+                ckpt_id=ckpt_id,
+                assume_device=True,
+            )
 
     def _free_mamba_value(self, mamba_value: torch.Tensor) -> None:
         storage, sub_pool = self._state()

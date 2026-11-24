@@ -65,6 +65,35 @@ import torch
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.runtime_context import get_exec
 
+_FUSED_CKPT_KERNELS: Optional[tuple] = False  # None: probed, unavailable
+
+
+def _fused_ckpt_kernels():
+    """The fused Triton quant/dequant pair, or None to use the eager path.
+    Resolved once (import is lazy and cached); unsupported shapes/devices
+    fall back per call via the kernels' bool return."""
+    global _FUSED_CKPT_KERNELS
+    if _FUSED_CKPT_KERNELS is False:
+        if not torch.cuda.is_available():
+            _FUSED_CKPT_KERNELS = None
+        else:
+            try:
+                from sglang.kernels.selector import get_kernel
+
+                _FUSED_CKPT_KERNELS = (
+                    get_kernel("quantization.int8_mamba_ckpt_quant"),
+                    get_kernel("quantization.int8_mamba_ckpt_dequant"),
+                )
+            except Exception:
+                logger.warning(
+                    "fused int8 checkpoint kernels unavailable; using the "
+                    "eager quantize path",
+                    exc_info=True,
+                )
+                _FUSED_CKPT_KERNELS = None
+    return _FUSED_CKPT_KERNELS
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -167,6 +196,11 @@ class Int8CheckpointStore:
         """Dequantize checkpoints at ``src_slots`` directly into the active pool
         tensor ``dst_temporal`` [L, pool_slots, H, d_v, d_k] at ``dst_slots`` (the
         copy-on-write on a cache hit). Output dtype follows ``dst_temporal``."""
+        kernels = _fused_ckpt_kernels()
+        if kernels is not None and kernels[1](
+            self.qdata, src_slots, self.scale, dst_temporal, dst_slots
+        ):
+            return
         dst_temporal[:, dst_slots] = self.load(src_slots, dst_temporal.dtype)
 
     def store_from_pool(
@@ -177,6 +211,11 @@ class Int8CheckpointStore:
     ) -> None:
         """Quantize states from an active pool tensor into checkpoint slots (cache
         store / donate)."""
+        kernels = _fused_ckpt_kernels()
+        if kernels is not None and kernels[0](
+            src_temporal, src_slots, self.qdata, self.scale, dst_slots
+        ):
+            return
         self.store(dst_slots, src_temporal[:, src_slots])
 
     def mem_usage_bytes(self) -> int:
@@ -268,6 +307,10 @@ class MambaCheckpointPool:
         # release_promotion); an event retiring does NOT free it, because the
         # consumer may still reference it as its COW source.
         self._pending_promotions: list[tuple[int, object]] = []
+        # Host tier buffers registered (pinned) by _alloc_host; unregistered
+        # when the pool dies, or the caching CPU allocator handing these
+        # addresses back to a later pool trips cudaHostRegister (rc=712).
+        self._registered_host_buffers: list[torch.Tensor] = []
         if host_slots > 0:
             self._build_host_tier(
                 num_layers=num_layers,
@@ -288,13 +331,18 @@ class MambaCheckpointPool:
             alloc_with_host_register,
         )
 
-        return alloc_with_host_register(
+        buf = alloc_with_host_register(
             dims=tuple(shape),
             dtype=dtype,
             device="cpu",
             pin_memory=True,
             allocator=HostTensorAllocator(),
         )
+        # Tracked so the finalizer can unregister: the caching CPU allocator
+        # hands a freed-but-registered address range to a later pool, whose
+        # cudaHostRegister then fails with rc=712 (HostMemoryAlreadyRegistered).
+        self._registered_host_buffers.append(buf)
+        return buf
 
     def _build_host_tier(
         self, *, num_layers, num_heads, head_v_dim, head_k_dim, scale_dtype
@@ -407,19 +455,60 @@ class MambaCheckpointPool:
         self._staging_busy_event = None
         self.allocator.clear()
 
+    def _release_host_registrations(self) -> None:
+        """Undo every cudaHostRegister done by _alloc_host. The host tier
+        mirrors are pinned so D2H/H2D stays async; leaving them registered
+        past teardown lets the caching CPU allocator recycle the addresses
+        into a later pool's registration (rc=712)."""
+        buffers, self._registered_host_buffers = self._registered_host_buffers, []
+        if not buffers:
+            return
+        try:
+            # A D2H/H2D still queued on the copy stream may be mid-DMA over
+            # these pages; unregistering then is the stale-data hazard the
+            # registration warns about. The refcycle means __del__ fires at
+            # an arbitrary gc point, so drain first.
+            if self._copy_stream is not None:
+                self._copy_stream.synchronize()
+            from sglang.srt.mem_cache.pool_host.common import _cuda_host_unregister
+
+            for buf in buffers:
+                _cuda_host_unregister(buf)
+        except Exception:
+            logger.warning(
+                "int8 checkpoint pool: host unregister failed", exc_info=True
+            )
+
+    def __del__(self):
+        # The store's buffer_factory closure keeps pool->store->pool in a
+        # reference cycle, so this runs from gc, not refcounting.
+        try:
+            if torch.cuda.is_initialized():
+                self._release_host_registrations()
+        except Exception:
+            pass
+
     # ---- state transfer between the active MambaPool and this store ----
 
     def store_from_active(
-        self, active_mamba_pool, active_slots, ckpt_slots, ckpt_id=None
+        self,
+        active_mamba_pool,
+        active_slots,
+        ckpt_slots,
+        ckpt_id=None,
+        assume_device=False,
     ) -> None:
         """Quantize temporal + copy conv from the active pool into checkpoint slots
         (the radix donate / cache-store). A RAM-tier destination quantizes into the
         GPU staging row and D2H-copies the int8 planes unchanged; the RAM slot is
         safe to publish because every later reader chains on the pool copy
         stream. ``ckpt_id`` lets a caller that already read the slot id skip the
-        D2H sync; the GPU-only config (no host tier) never needs the value."""
+        D2H sync; ``assume_device`` asserts a GPU-tier destination (the pool is
+        device-first, so an alloc while the GPU tier has free rows qualifies),
+        keeping every GPU-slot store — and the GPU-only config — free of the
+        per-store .item() pipeline sync."""
         assert ckpt_slots.numel() == 1, "one checkpoint per store"
-        if self.host_slots > 0:
+        if self.host_slots > 0 and not assume_device:
             if ckpt_id is None:
                 ckpt_id = int(ckpt_slots.reshape(-1)[0].item())
             if ckpt_id > self.num_slots:

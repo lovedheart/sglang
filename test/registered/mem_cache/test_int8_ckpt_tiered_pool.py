@@ -139,6 +139,25 @@ class TestTieredCheckpointPool(unittest.TestCase):
         self.assertEqual(pool.device_available_size(), 0)
         self.assertEqual(pool.host_available_size(), 3)
 
+    def test_device_tier_store_makes_no_host_reads(self):
+        # The decode-path fast case: a tiered pool store that provably lands
+        # on the GPU tier must not call Tensor.item() at all (any read waits
+        # on queued kernels and drains the pipeline per store).
+        pool = self._pool(host_slots=4)
+        active = _active_pool()
+        active.mamba_cache.temporal[:, 1] = torch.randn(
+            L, H, V, K, dtype=torch.bfloat16
+        )
+        slot = pool.alloc(1)
+        spy = mock.patch.object(
+            torch.Tensor,
+            "item",
+            side_effect=AssertionError("device-tier store synced to host"),
+        )
+        with spy:
+            pool.store_from_active(active, torch.tensor([1]), slot, assume_device=True)
+        self.assertGreater(pool.temporal.qdata[:, 1].abs().sum(), 0)
+
     def test_promote_roundtrip_and_drain(self):
         pool = self._pool(host_slots=4)
         active = _active_pool()
@@ -300,6 +319,93 @@ class TestStaleCowSourceOwnership(unittest.TestCase):
         req.kv.mamba_cow_src_promoted = True
         comp._stage_cow_source(req, None, False)
         self.assertFalse(req.kv.mamba_cow_src_promoted)
+
+
+class TestCommitInt8TierRouting(unittest.TestCase):
+    """_commit_int8_checkpoint decides the tier from the host-side free count
+    and only reads the slot id when that count is 0/unknown. A wrong decision
+    is silent corruption, so pin the three routings (components/mamba.py)."""
+
+    def setUp(self):
+        # Deterministic host tier on CUDA dev boxes too: a leaked
+        # cudaHostRegister range poisons later host pools (same convention
+        # as the sibling classes).
+        patcher = mock.patch.object(
+            MambaCheckpointPool,
+            "_alloc_host",
+            lambda self, shape, dtype: torch.empty(shape, dtype=dtype, device="cpu"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _component(self, pool, store_spy, take=None):
+        from types import MethodType
+        from types import SimpleNamespace as NS
+
+        from sglang.srt.mem_cache.unified_cache.components.mamba import (
+            MambaComponent,
+        )
+
+        comp = MambaComponent.__new__(MambaComponent)
+        comp._ram_ckpts_issued = 0
+        take = take if take is not None else pool.alloc
+        storage = NS(
+            checkpoint_pool=lambda _sub: pool,
+            take_checkpoint_slot=lambda _sub: take(1),
+            store_checkpoint=lambda sub, active, slot, ckpt_id=None, assume_device=False: (
+                store_spy.append({"ckpt_id": ckpt_id, "assume_device": assume_device})
+            ),
+        )
+        comp._state = MethodType(lambda self: (storage, None), comp)
+        return comp
+
+    def _pool(self):
+        return MambaCheckpointPool(device="cpu", **_pool_kwargs(host_slots=4))
+
+    def test_free_device_row_routes_device_without_id_read(self):
+        pool = self._pool()
+        spy = []
+        comp = self._component(pool, spy)
+        ip = SimpleNamespace(mamba_value=None, mamba_host_value=None)
+        with mock.patch.object(
+            torch.Tensor, "item", side_effect=AssertionError("synced to host")
+        ):
+            comp._commit_int8_checkpoint(torch.tensor([1]), ip)
+        self.assertIsNone(spy[0]["ckpt_id"])
+        self.assertTrue(spy[0]["assume_device"])
+        self.assertIsNotNone(ip.mamba_value)
+        self.assertIsNone(ip.mamba_host_value)
+        self.assertEqual(comp._ram_ckpts_issued, 0)
+
+    def test_saturated_device_tier_spills_to_ram_with_id(self):
+        pool = self._pool()
+        pool.alloc(pool.num_slots)  # saturate the GPU tier
+        spy = []
+        comp = self._component(pool, spy)
+        ip = SimpleNamespace(mamba_value=None, mamba_host_value=None)
+        comp._commit_int8_checkpoint(torch.tensor([1]), ip)
+        self.assertTrue(pool.is_host_slot(spy[0]["ckpt_id"]))
+        self.assertFalse(spy[0]["assume_device"])
+        self.assertIsNone(ip.mamba_value)
+        self.assertIsNotNone(ip.mamba_host_value)
+        self.assertEqual(comp._ram_ckpts_issued, 1)
+
+    def test_evicted_device_id_after_full_sample_stays_on_device(self):
+        # Sample says the device tier is full, but the allocator hands back a
+        # device id (eviction raced the alloc): the read id must route to the
+        # device binding, still with assume_device for the store.
+        pool = self._pool()
+        device_slot = pool.alloc_device_slot()
+        pool.alloc(pool.num_slots - 1)
+        spy = []
+        comp = self._component(pool, spy, take=lambda _n: device_slot)
+        comp._alloc_int8_ckpt_slot = lambda: device_slot
+        ip = SimpleNamespace(mamba_value=None, mamba_host_value=None)
+        comp._commit_int8_checkpoint(torch.tensor([1]), ip)
+        self.assertEqual(spy[0]["ckpt_id"], int(device_slot[0]))
+        self.assertTrue(spy[0]["assume_device"])
+        self.assertIs(ip.mamba_value, device_slot)
+        self.assertIsNone(ip.mamba_host_value)
 
 
 if __name__ == "__main__":

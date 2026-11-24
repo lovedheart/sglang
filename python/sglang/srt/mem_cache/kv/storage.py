@@ -716,11 +716,16 @@ class KVStorage:
         active: torch.Tensor,
         checkpoint: torch.Tensor,
         ckpt_id: Optional[int] = None,
+        assume_device: bool = False,
     ) -> None:
         """Quantize the state in slots ``active`` into ``checkpoint``."""
         state = self._allocator.state
         state.ckpt_pool.store_from_active(
-            state.pool, active.view(-1), checkpoint, ckpt_id=ckpt_id
+            state.pool,
+            active.view(-1),
+            checkpoint,
+            ckpt_id=ckpt_id,
+            assume_device=assume_device,
         )
 
     def free_checkpoints(self, sub_pool: str, checkpoints: torch.Tensor) -> None:
