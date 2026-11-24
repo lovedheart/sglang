@@ -2877,6 +2877,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         ple_warned_downcast = False
 
         def load_qwen4_exp_ple_shard(name: str, loaded_weight: torch.Tensor) -> bool:
+            nonlocal ple_warned_downcast
             if ".ngram_embedding.shard_" not in name:
                 return False
             import re
