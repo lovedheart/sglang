@@ -58,6 +58,8 @@ counted against it.
 from __future__ import annotations
 
 import logging
+import time
+from types import SimpleNamespace
 from typing import List, Optional
 
 import torch
@@ -283,6 +285,9 @@ class MambaCheckpointPool:
         self.staging_row = num_slots + 1
         self.num_staging = _STAGING_RING_DEPTH if host_slots > 0 else 0
         gpu_rows = num_slots + 1 + self.num_staging
+        self.temporal_dtype = (
+            temporal_dtype if temporal_dtype is not None else torch.bfloat16
+        )
         self.temporal = Int8CheckpointStore(
             num_layers=num_layers,
             # the store's slot dim IS the row count: slot 0 + one per slot (+ staging)
@@ -293,9 +298,7 @@ class MambaCheckpointPool:
             device=device,
             # store the scale in the temporal state's own dtype so quantize and
             # dequantize use the identical scale (not hard-coded to bf16)
-            scale_dtype=(
-                temporal_dtype if temporal_dtype is not None else torch.bfloat16
-            ),
+            scale_dtype=self.temporal_dtype,
         )
         # conv windows stay at their native dtype (small); one buffer per conv
         # tensor in the State
@@ -365,9 +368,7 @@ class MambaCheckpointPool:
                 num_heads=num_heads,
                 head_v_dim=head_v_dim,
                 head_k_dim=head_k_dim,
-                scale_dtype=(
-                    temporal_dtype if temporal_dtype is not None else torch.bfloat16
-                ),
+                scale_dtype=self.temporal_dtype,
             )
 
     def _alloc_host(self, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
@@ -558,6 +559,83 @@ class MambaCheckpointPool:
         self._staging_busy_sides = [None] * self.num_staging
         self._staging_next = 0
         self.allocator.clear()
+
+    def warmup(self) -> None:
+        """Boot-time pass of one dummy checkpoint through every kernel path.
+
+        The fused Triton quant/dequant pair JIT-compiles on FIRST use
+        (measured ~0.8 s on the first store and ~0.1 s on the first load on a
+        dev box) and the first RAM spill lazily cudaHostAllocs the pinned
+        side scratches; without this those host stalls land on the scheduler
+        thread at the first real checkpoint boundary, mid-decode of the first
+        request. Checkpoint ids are cut from the free lists exactly as the
+        allocator cuts them, so the runtime reuses warmup's compiled
+        Triton specializations. Everything runs on dummy active rows and
+        throwaway slots; clear() hands the tree a pristine pool afterwards.
+        (CPU pools have nothing to compile.)"""
+        if not (isinstance(self.device, str) and self.device.startswith("cuda")):
+            return
+        t0 = time.perf_counter()
+        try:
+            st = self.temporal
+            L, H, dv, dk = st.num_layers, st.H, st.d_v, st.d_k
+            # Dummy active pool: two rows so the COW destination is a distinct
+            # row. (Allocations live inside the try: a boot-time OOM here must
+            # degrade to "no warmup", not crash the server.)
+            active = SimpleNamespace(
+                mamba_cache=SimpleNamespace(
+                    temporal=torch.zeros(
+                        L, 2, H, dv, dk, dtype=self.temporal_dtype, device=self.device
+                    ),
+                    conv=[
+                        torch.zeros(
+                            L, 2, *c.shape[2:], dtype=c.dtype, device=self.device
+                        )
+                        for c in self.conv
+                    ],
+                )
+            )
+            i1 = torch.tensor([1], dtype=torch.int64, device=self.device)
+            # Odd-offset view of row 1: Triton keys compiled variants on
+            # 16-byte pointer divisibility, and the donate path can pass
+            # req.kv.mamba_pool_idx as an UNCLONED view with a per-request
+            # storage offset (odd slot positions -> ptr % 16 == 8). Warming
+            # only fresh (16-aligned) index tensors would leave that
+            # specialization's ~0.1-0.8 s JIT to the first batched store.
+            odd_i1 = torch.zeros(2, dtype=torch.int64, device=self.device)[1:]
+            # GPU tier: stores on both free-list cut alignments (head vs tail
+            # slice) plus the misaligned source, then one dequant load (load
+            # slot args are cat products, always aligned: one variant covers).
+            g_tail = self.alloc_device_slot()
+            g_head = self.allocator.free_slots[:1]
+            for slots in (g_tail, g_head):
+                self.store_from_active(active, i1, slots, assume_device=True)
+            self.store_from_active(active, odd_i1, g_head, assume_device=True)
+            self.load_to_active(active, g_tail, i1)
+            if self.host_slots:
+                # RAM tier: staging quantize + plane D2H + sides spill (this
+                # allocates the pinned scratches and first-touches the copy
+                # and sides streams). TWO spills cycle the staging ring to
+                # position 1, whose index slice is 8 bytes in (misaligned)
+                # regardless of num_slots parity. Re-spilling the same host id
+                # is legal and keeps this working with a 1-slot host tier.
+                h = self.allocator.free_host_slots[-1:]
+                self.allocator.free_host_slots = self.allocator.free_host_slots[:-1]
+                hid = int(h[0])
+                self.store_from_active(active, i1, h, ckpt_id=hid)
+                self.store_from_active(active, odd_i1, h, ckpt_id=hid)
+                g = self.alloc_device_slot()
+                self.promote(hid, int(g[0]))
+                self.load_to_active(active, g, i1)
+            torch.cuda.synchronize()
+        except Exception:
+            # A failed warmup only costs the first request some latency.
+            logger.warning("int8 checkpoint pool: warmup failed", exc_info=True)
+        self.clear()
+        logger.info(
+            "int8 mamba checkpoint pool: warmup %.2f s (JIT + lazy allocs drained)",
+            time.perf_counter() - t0,
+        )
 
     def _release_host_registrations(self) -> None:
         """Undo every cudaHostRegister done by _alloc_host. The host tier
@@ -1067,6 +1145,9 @@ def maybe_init_int8_mamba_checkpoint_pool(
             )
 
     pool = MambaCheckpointPool(device=device, host_slots=host_slots, **kwargs)
+    # Drain the Triton JIT and lazy pinned-alloc host stalls now (seconds),
+    # not at the first request's first checkpoint boundary mid-decode.
+    pool.warmup()
     # NOTE: this pool's HBM is NOT subtracted from the KV-cache budget
     # (max_total_num_tokens); it is allocated from --mem-fraction-static headroom.
     # The estimate check above guards against an oversized pool; accounting it in
