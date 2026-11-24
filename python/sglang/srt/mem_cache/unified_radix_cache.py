@@ -510,6 +510,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self._discard_restore_backups()
         self.tree_core.reset()
         self.session_refs.reset()
+        # Nodes are dropped without per-value frees; the pools are cleared
+        # wholesale elsewhere, so component slot ledgers zero out now.
+        for component in self.components.values():
+            component.on_cache_reset()
 
         # Reset Controller.
         self.session.slots.clear()
@@ -4543,6 +4547,14 @@ class UnifiedRadixCache(BasePrefixCache):
         if comp is None:
             return False
         return comp._mamba_host_only_checkpoint()
+
+    def mamba_ram_checkpoint_slots(self) -> tuple[int, int]:
+        """(RAM checkpoint slots held, RAM tier capacity) of the tiered int8
+        checkpoint pool; (0, 0) without the tier."""
+        comp = self.components.get(ComponentType.MAMBA)
+        if comp is None:
+            return (0, 0)
+        return comp.ram_checkpoint_slots()
 
     # ---- HiCache: Scheduler Entry Points ----
 

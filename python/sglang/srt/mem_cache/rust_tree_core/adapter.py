@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
     MambaEvictExcessPathStates,
+    MambaReleaseSupersededHostValue,
     RebuildFullToSWAMapping,
     RecoverSWAWithLockedFull,
     SWARebuild,
@@ -212,6 +213,8 @@ def _cache_action_from_tagged(action: tuple, ids: _CoreIds) -> CacheAction:
         return BackupKV(node_ids=list(action[1]))
     if tag == "mamba_evict_excess_path_states":
         return MambaEvictExcessPathStates(tail_node_id=action[1])
+    if tag == "mamba_release_superseded_host_value":
+        return MambaReleaseSupersededHostValue(node_id=action[1])
     if tag == "update_pending_backup_on_node_split":
         return UpdatePendingBackupOnNodeSplit(
             ack_id=action[1],
@@ -587,6 +590,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         has_mamba = TREE_STATE in families
         from sglang.srt.mem_cache.kv_cache_configurator import (
             host_only_mamba_checkpoint,
+            int8_ckpt_offload,
         )
 
         mamba_max_states_per_path = (
@@ -626,7 +630,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                     else None
                 ),
                 mamba_host_only_checkpoint=(
-                    host_only_mamba_checkpoint() if has_mamba else False
+                    # A RAM checkpoint (host-only mode or the tiered int8 pool)
+                    # is a tree value in the host slot that matches.
+                    (host_only_mamba_checkpoint() or int8_ckpt_offload())
+                    if has_mamba
+                    else False
                 ),
                 # The joint Full/SWA LRU, kept only where uses_joint_lru holds.
                 joint_lru=uses_joint_lru(params, self.tree_components),
@@ -1429,6 +1437,20 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId, component_type: ComponentType
     ) -> Optional[torch.Tensor]:
         return self._binding.get_component_device_value(
+            node_id, self._ids.core(component_type)
+        )
+
+    def get_component_host_value(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> Optional[torch.Tensor]:
+        return self._binding.get_component_host_value(
+            node_id, self._ids.core(component_type)
+        )
+
+    def clear_component_host_value(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> Optional[torch.Tensor]:
+        return self._binding.clear_component_host_value(
             node_id, self._ids.core(component_type)
         )
 

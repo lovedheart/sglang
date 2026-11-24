@@ -29,21 +29,40 @@ import torch
 
 class MambaSlotAllocator:
     """Free-list of Mamba pool slot indices. Deliberately not a subclass of
-    ``BaseTokenToKVPoolAllocator``: slots are per request, not per token."""
+    ``BaseTokenToKVPoolAllocator``: slots are per request, not per token.
 
-    def __init__(self, size: int, device: str):
+    With ``host_slots > 0`` (the int8 checkpoint pool's RAM tier) it is one
+    allocator over two tiers: logical slot ids [1, size] are device slots
+    (physical row = id), ids [size+1, size+host_slots] are host slots
+    (physical row = id - size). Slot 0 is reserved on the device tier only.
+    ``alloc`` is device-first; with the default ``host_slots=0`` every
+    behavior (ids, ordering, identity translate) is unchanged."""
+
+    def __init__(self, size: int, device: str, host_slots: int = 0):
         self.size = size
         self.device = device
+        self.host_slots = host_slots
         # Set by alloc_group_begin(); alloc(1) drains it until alloc_group_end().
         self._alloc_iter: Optional[Iterator] = None
         self.clear()
 
     def translate(self, slot_ids: torch.Tensor) -> torch.Tensor:
-        """Static slot ids already index physical storage."""
+        """Static slot ids already index physical storage.
+
+        Valid for the DEVICE tier only (row == id there). RAM-tier ids
+        address a different plane at row ``id - size``; callers holding
+        host values resolve them through the checkpoint pool, never here.
+        """
         return slot_ids
 
+    def tier_of(self, slot_id: int) -> tuple[str, int]:
+        """``("device"|"host", physical_row)`` for a logical slot id."""
+        if slot_id <= self.size:
+            return ("device", slot_id)
+        return ("host", slot_id - self.size)
+
     def available_size(self) -> int:
-        return len(self.free_slots)
+        return len(self.free_slots) + len(self.free_host_slots)
 
     def schedulable_available_size(self) -> int:
         """Planner-facing free count. Same as ``available_size`` for a static pool;
@@ -78,20 +97,46 @@ class MambaSlotAllocator:
         return self._do_alloc(need_size)
 
     def _do_alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        if need_size > len(self.free_slots):
+        if need_size > self.available_size():
             return None
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
-        return select_index
+        if need_size == 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        from_device = min(need_size, len(self.free_slots))
+        parts = []
+        if from_device > 0:
+            parts.append(self.free_slots[:from_device])
+            self.free_slots = self.free_slots[from_device:]
+        from_host = need_size - from_device
+        if from_host > 0:
+            parts.append(self.free_host_slots[:from_host])
+            self.free_host_slots = self.free_host_slots[from_host:]
+        return parts[0] if len(parts) == 1 else torch.cat(parts)
 
     def free(self, free_index: torch.Tensor, *, owned: bool = False):
         # ``owned`` matters only to a deferred free; this one frees at once.
         if free_index.numel() == 0:
             return
-        self.free_slots = torch.cat((self.free_slots, free_index))
+        if self.host_slots == 0:
+            self.free_slots = torch.cat((self.free_slots, free_index))
+            return
+        # Split by tier without ANY host sync (no bool()/any()): both cats run
+        # and a possibly-empty selection is a no-op.
+        is_host = free_index > self.size
+        self.free_slots = torch.cat(
+            (self.free_slots, free_index.masked_select(~is_host))
+        )
+        self.free_host_slots = torch.cat(
+            (self.free_host_slots, free_index.masked_select(is_host))
+        )
 
     def clear(self):
         # Slot 0 is reserved as a dummy write target for padded tokens.
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
+        )
+        self.free_host_slots = torch.arange(
+            self.size + 1,
+            self.size + self.host_slots + 1,
+            dtype=torch.int64,
+            device=self.device,
         )

@@ -358,12 +358,31 @@ class SchedulerInvariantChecker:
         )
         int8_leak, int8_msg = self._check_pool_invariant(
             "mamba-int8",
-            ckpt_pool.available_size(),
+            ckpt_pool.device_available_size(),
             self.tree_cache.mamba_evictable_size(),
             self.tree_cache.mamba_protected_size(),
             0,
             ckpt_pool.num_slots,
+            ckpt_pool.num_pending_promotions(),
         )
+        if ckpt_pool.host_slots:
+            # The RAM tier is a checkpoint tier like the GPU one: every RAM
+            # slot is either free or held by a tree checkpoint (counted by the
+            # component's issued-slot ledger, which also covers the brief
+            # window between alloc and commit).
+            ram_held, ram_total = self.tree_cache.mamba_ram_checkpoint_slots()
+            ram_leak, ram_msg = self._check_pool_invariant(
+                "mamba-int8-ram",
+                ckpt_pool.host_available_size(),
+                ram_held,
+                0,
+                0,
+                ram_total,
+            )
+            return (
+                active_leak or int8_leak or ram_leak,
+                active_msg + "\n" + int8_msg + "\n" + ram_msg,
+            )
         return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
     def _requests_owning_rows(self) -> List[Req]:

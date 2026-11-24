@@ -93,6 +93,14 @@ pub struct MambaEvictExcessPathStates {
     pub tail_node_id: NodeId,
 }
 
+/// A device commit onto a Mamba node that only had a host checkpoint
+/// superseded it; python frees the RAM slot (the RAM ledger lives there)
+/// and, only for the checkpoint tier, clears the node's host value.
+#[derive(Debug)]
+pub struct MambaReleaseSupersededHostValue {
+    pub node_id: NodeId,
+}
+
 /// Free only the given component's device KV slots.
 #[derive(Debug)]
 pub struct FreeComponentDeviceSlot {
@@ -152,6 +160,10 @@ self::impl_cache_action!(
     insert_barrier = false
 );
 self::impl_cache_action!(MambaEvictExcessPathStates, "mamba_evict_excess_path_states");
+self::impl_cache_action!(
+    MambaReleaseSupersededHostValue,
+    "mamba_release_superseded_host_value"
+);
 self::impl_cache_action!(FreeComponentDeviceSlot, "free_component_device_slot");
 self::impl_cache_action!(FreeComponentHostSlot, "free_component_host_slot");
 self::impl_cache_action!(RebuildFullToSwaMapping, "rebuild_full_to_swa_mapping");

@@ -7716,6 +7716,60 @@ fn get_component_device_value_panics_on_an_unregistered_component() {
 }
 
 #[test]
+fn get_component_host_value_reads_the_full_value() {
+    let mut tc = core();
+    let (a, _b) = matched_chain(&mut tc);
+    assert!(
+        tc.get_component_host_value(tc.arena.node(a).id, FULL)
+            .expect("live test node")
+            .is_none()
+    );
+    tc.arena
+        .set_host_value(a, FULL, Tensor::from_slice(&[7i64, 8]));
+    assert!(
+        tc.get_component_host_value(tc.arena.node(a).id, FULL)
+            .expect("live test node")
+            .expect("host value")
+            .equal(&Tensor::from_slice(&[7i64, 8]))
+    );
+}
+
+#[test]
+#[should_panic(expected = "Swa component is not enabled")]
+fn get_component_host_value_panics_on_an_unregistered_component() {
+    let tc = core();
+    let root = tc.arena.root();
+    let _ = tc.get_component_host_value(tc.arena.node(root).id, SWA);
+}
+
+#[test]
+fn clear_component_host_value_returns_the_value_and_delists_the_host_lru() {
+    let mut tc = core();
+    let (a, _b) = matched_chain(&mut tc);
+    assert!(
+        tc.clear_component_host_value(tc.arena.node(a).id, FULL)
+            .expect("live test node")
+            .is_none()
+    );
+    tc.arena
+        .set_host_value(a, FULL, Tensor::from_slice(&[7i64, 8]));
+    tc.host_lru_list_mut(FULL).insert_mru(a);
+    let cleared = tc
+        .clear_component_host_value(tc.arena.node(a).id, FULL)
+        .expect("live test node")
+        .expect("host value");
+    assert!(cleared.equal(&Tensor::from_slice(&[7i64, 8])));
+    assert!(!tc.host_lru_list(FULL).in_list(Some(a)));
+    assert!(!tc.arena.has_host_value(a, FULL));
+    // A second clear finds nothing left to take.
+    assert!(
+        tc.clear_component_host_value(tc.arena.node(a).id, FULL)
+            .expect("live test node")
+            .is_none()
+    );
+}
+
+#[test]
 fn get_component_device_value_reads_the_registered_components_slot() {
     let mut tc = core();
     tc.register_component_(Arc::new(SwaComponentForTest));

@@ -1419,6 +1419,42 @@ macro_rules! tree_core_methods {
                 value.map(|value| tensor_to_py(py, value)).transpose()
             }
 
+            /// A component's host value on a node, if set.
+            fn get_component_host_value(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<Option<Py<PyAny>>> {
+                let component_type = parse_component_type(component_type)?;
+                let value = py
+                    .detach(|| {
+                        self.core()
+                            .get_component_host_value(node_id, component_type)
+                            .map(|value| value.map(|tensor| tensor.shallow_clone()))
+                    })
+                    .map_err(node_access_error)?;
+                value.map(|value| tensor_to_py(py, value)).transpose()
+            }
+
+            /// Take a component's host value off the node (detaching it from
+            /// the host LRU) and return it; None when unset.
+            fn clear_component_host_value(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<Option<Py<PyAny>>> {
+                let component_type = parse_component_type(component_type)?;
+                let value = py.detach(|| {
+                    self.core()
+                        .clear_component_host_value(node_id, component_type)
+                });
+                value.map_err(node_access_error)?
+                    .map(|value| tensor_to_py(py, value))
+                    .transpose()
+            }
+
             // TODO(jialino): batch a full no-backup eviction round in Rust (one crossing
             // instead of 2N+2); step-wise stays for the write-back interleave.
             /// Begin a component's device-eviction walk for up to request_cnt tokens.
@@ -2970,6 +3006,32 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| {
                     self.inner
                         .get_component_device_value(py, node_id, component_type)
+                })
+            }
+
+            /// A component's host value on a node, if set.
+            fn get_component_host_value(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<Option<Py<PyAny>>> {
+                catch_native_panic(|| {
+                    self.inner
+                        .get_component_host_value(py, node_id, component_type)
+                })
+            }
+
+            /// Take a component's host value off the node and return it.
+            fn clear_component_host_value(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<Option<Py<PyAny>>> {
+                catch_native_panic(|| {
+                    self.inner
+                        .clear_component_host_value(py, node_id, component_type)
                 })
             }
 

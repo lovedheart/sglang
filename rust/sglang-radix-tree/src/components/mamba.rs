@@ -7,7 +7,9 @@ use std::collections::HashMap;
 
 use tch::Tensor;
 
-use crate::cache_action::{FreeComponentHostSlot, MambaEvictExcessPathStates};
+use crate::cache_action::{
+    FreeComponentHostSlot, MambaEvictExcessPathStates, MambaReleaseSupersededHostValue,
+};
 use crate::components::TreeComponent;
 use crate::components::{ComponentType, FULL, Family, MAMBA};
 use crate::node::ChildKeyType;
@@ -363,6 +365,17 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 if tree_core.arena.has_device_value(node_id, MAMBA) {
                     tree_core.device_lru_list_mut(MAMBA).reset_node_mru(node_id);
                     self.cost_mark_used_(tree_core, node_id);
+                } else if self.mamba_host_only_checkpoint
+                    && tree_core.arena.node(node_id).has_host_value(MAMBA)
+                {
+                    // A host-tier checkpoint hit (host-only mode, or a tiered
+                    // int8 RAM checkpoint): keep it hot in the host LRU. An
+                    // admitted match's host lock may have DELISTED the node,
+                    // so the refresh must not assume membership.
+                    let host_lru = tree_core.host_lru_list_mut(MAMBA);
+                    if host_lru.in_list(Some(node_id)) {
+                        host_lru.reset_node_mru(node_id);
+                    }
                 }
             }
             LRURefreshPhase::InsertEnd => {}
@@ -458,6 +471,15 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             return;
         }
         if !tree_core.arena.has_device_value(node_id, MAMBA) {
+            if tree_core.arena.node(node_id).has_host_value(MAMBA) {
+                // The device commit supersedes the node's host checkpoint.
+                // Python frees it (only the python pool knows the RAM ledger);
+                // with a HiCache host pool the handler leaves it attached,
+                // matching the python core's tier gate.
+                cache_actions.push(Box::new(MambaReleaseSupersededHostValue {
+                    node_id: tree_core.arena.node(node_id).id,
+                }));
+            }
             tree_core.set_component_device_value_(node_id, MAMBA, mamba_value.shallow_clone());
             let tick = tree_core.arena.get_and_bump_access_counter();
             tree_core.arena.node_mut(node_id).last_access_counter = tick;

@@ -1,5 +1,7 @@
 use super::*;
-use crate::cache_action::{BackupKV, FreeComponentHostSlot, MambaEvictExcessPathStates};
+use crate::cache_action::{
+    BackupKV, FreeComponentHostSlot, MambaEvictExcessPathStates, MambaReleaseSupersededHostValue,
+};
 use crate::components::{ComponentSet, FULL, MAMBA, SWA};
 use crate::test_utils::{accumulate_step, action_kinds, expect_action};
 use crate::unified_lru_list::UnifiedLRUList;
@@ -644,6 +646,29 @@ fn tombstone_refill_moves_the_node_from_host_to_device_lru() {
 fn insert_without_a_mamba_value_panics() {
     let mut tc = mamba_core(/* page_size = */ 1);
     tc.insert(&insert_params_mamba(&vec![1], &[10], None));
+}
+
+#[test]
+fn device_commit_over_a_host_checkpoint_emits_the_release_action() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    tc.set_hicache_enabled();
+    let key = vec![1, 2];
+    let mut params = insert_params_mamba(&key, &[10, 11], None);
+    params.mamba_host_value = Some(Tensor::from_slice(&[42i64]));
+    tc.insert(&params);
+    let best = tc.match_prefix(&match_params(&key)).best_match_node_id;
+    let leaf = tc.arena.resolve(best).expect("host-only node");
+    assert!(tc.arena.node(leaf).has_host_value(MAMBA));
+
+    // A device checkpoint committed onto the host-only node supersedes the
+    // host slot; the free is deferred to python (the RAM ledger lives there).
+    let result = tc.insert(&insert_params_mamba(&key, &[10, 11], Some(7)));
+    let action = result
+        .cache_actions
+        .iter()
+        .find_map(|a| a.as_any().downcast_ref::<MambaReleaseSupersededHostValue>())
+        .expect("release action");
+    assert_eq!(action.node_id, tc.arena.node(leaf).id);
 }
 
 #[test]

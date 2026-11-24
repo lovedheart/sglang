@@ -1413,6 +1413,28 @@ class TestInt8MambaCheckpointCompatibility(unittest.TestCase):
             ServerArgs(model_path="dummy", enable_unified_memory=True)
         )
 
+    def test_rejects_host_pool_retraction_backup(self):
+        """host_pool retraction backup brings up the HiCache controller, a
+        second door to the not-int8-aware host loader that
+        --enable-hierarchical-cache opens."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_int8_mamba_checkpoint=True,
+            disaggregation_decode_retraction_backup="host_pool",
+        )
+
+        with self.assertRaisesRegex(ValueError, "host_pool"):
+            handle_int8_mamba_checkpoint(server_args)
+
+    def test_cpu_tensor_retraction_backup_alone_is_accepted(self):
+        handle_int8_mamba_checkpoint(
+            ServerArgs(
+                model_path="dummy",
+                enable_int8_mamba_checkpoint=True,
+                disaggregation_decode_retraction_backup="cpu_tensor",
+            )
+        )
+
 
 class TestKV4Compatibility(unittest.TestCase):
     def setUp(self):

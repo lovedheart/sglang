@@ -597,5 +597,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_fp8_shared_expert_mtp",
     "enable_fp8_hc_mix",
     "enable_mm_dtype",
+    "enable_int8_mamba_checkpoint_offload",
+    "int8_mamba_ckpt_host_size",
 )
 # fmt: on
