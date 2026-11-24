@@ -22,18 +22,27 @@ sys.path.insert(0, "/home/lovedheart/sglang-fork-dev/python")
 def build_inputs(nseq, ctx, chunk, topk, nq, nkv, hd, seed=0):
     g = torch.Generator(device="cuda").manual_seed(seed)
     total_q = nseq * chunk
-    q = torch.randn(total_q, nq, hd, device="cuda", generator=g, dtype=torch.float32).to(torch.bfloat16) * 0.1
-    kp = torch.randint(0, 255, (nseq * ctx, nkv, hd // 2), device="cuda", dtype=torch.uint8)
-    ksf = (
-        torch.randint(100, 130, (nseq * ctx, nkv, hd // 16), device="cuda", dtype=torch.uint8)
-        .view(torch.float8_e4m3fn)
+    q = (
+        torch.randn(
+            total_q, nq, hd, device="cuda", generator=g, dtype=torch.float32
+        ).to(torch.bfloat16)
+        * 0.1
     )
-    vp = torch.randint(0, 255, (nseq * ctx, nkv, hd // 2), device="cuda", dtype=torch.uint8)
-    vsf = (
-        torch.randint(100, 130, (nseq * ctx, nkv, hd // 16), device="cuda", dtype=torch.uint8)
-        .view(torch.float8_e4m3fn)
+    kp = torch.randint(
+        0, 255, (nseq * ctx, nkv, hd // 2), device="cuda", dtype=torch.uint8
     )
-    indices = torch.randint(0, ctx, (total_q, nkv, topk), device="cuda", dtype=torch.int32)
+    ksf = torch.randint(
+        100, 130, (nseq * ctx, nkv, hd // 16), device="cuda", dtype=torch.uint8
+    ).view(torch.float8_e4m3fn)
+    vp = torch.randint(
+        0, 255, (nseq * ctx, nkv, hd // 2), device="cuda", dtype=torch.uint8
+    )
+    vsf = torch.randint(
+        100, 130, (nseq * ctx, nkv, hd // 16), device="cuda", dtype=torch.uint8
+    ).view(torch.float8_e4m3fn)
+    indices = torch.randint(
+        0, ctx, (total_q, nkv, topk), device="cuda", dtype=torch.int32
+    )
     # sprinkle padding
     mask = torch.rand(total_q, nkv, topk, device="cuda", generator=g) < 0.05
     indices[mask] = -1
@@ -41,9 +50,19 @@ def build_inputs(nseq, ctx, chunk, topk, nq, nkv, hd, seed=0):
     cu_k = torch.arange(0, nseq + 1, device="cuda", dtype=torch.int32) * ctx
     kv_lens = torch.full((nseq,), ctx, device="cuda", dtype=torch.int32)
     return dict(
-        q=q, k_pk=kp, k_sf=ksf, v_pk=vp, v_sf=vsf, k_gs=1.0, v_gs=1.0,
-        indices=indices, cu_q=cu_q, cu_k=cu_k, kv_lens=kv_lens,
-        scale=1.0 / 16.0, max_q=chunk,
+        q=q,
+        k_pk=kp,
+        k_sf=ksf,
+        v_pk=vp,
+        v_sf=vsf,
+        k_gs=1.0,
+        v_gs=1.0,
+        indices=indices,
+        cu_q=cu_q,
+        cu_k=cu_k,
+        kv_lens=kv_lens,
+        scale=1.0 / 16.0,
+        max_q=chunk,
     )
 
 
@@ -87,12 +106,16 @@ def main():
     ap.add_argument("--hd", type=int, default=256)
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--reps", type=int, default=5)
-    ap.add_argument("--check", action="store_true", help="also compare outputs between variants")
+    ap.add_argument(
+        "--check", action="store_true", help="also compare outputs between variants"
+    )
     args = ap.parse_args()
 
     from sglang.srt.layers.attention.qsa import sparse_attn as sa
 
-    inp = build_inputs(args.nseq, args.ctx, args.chunk, args.topk, args.nq, args.nkv, args.hd)
+    inp = build_inputs(
+        args.nseq, args.ctx, args.chunk, args.topk, args.nq, args.nkv, args.hd
+    )
 
     variants = [("baseline", sa.sparse_gqa_fwd_interface_triton_ck_nvfp4)]
     # extra variants can be registered by importing a module given in QSA_VARIANTS
@@ -103,11 +126,15 @@ def main():
 
     med, spread = abba(variants, inp, iters=args.iters, reps=args.reps)
     base = med["baseline"]
-    print(f"shape rows={args.nseq*args.chunk} ctx={args.ctx} topk={args.topk} "
-          f"nq={args.nq} nkv={args.nkv} hd={args.hd}")
+    print(
+        f"shape rows={args.nseq * args.chunk} ctx={args.ctx} topk={args.topk} "
+        f"nq={args.nq} nkv={args.nkv} hd={args.hd}"
+    )
     for name, _ in variants:
         win = (base - med[name]) / base * 100.0
-        print(f"  {name:32s} {med[name]:9.1f} us   spread={spread[name][0]:.0f}-{spread[name][1]:.0f}  win={win:+.1f}%")
+        print(
+            f"  {name:32s} {med[name]:9.1f} us   spread={spread[name][0]:.0f}-{spread[name][1]:.0f}  win={win:+.1f}%"
+        )
 
     if args.check and len(variants) > 1:
         ref = variants[0][1](**inp).float()
@@ -115,8 +142,10 @@ def main():
             got = fn(**inp).float()
             d = (got - ref).abs()
             rel = d / ref.abs().clamp_min(1e-6)
-            print(f"  diff[{name}] max_abs={d.max().item():.3e} "
-                  f"mean_abs={d.mean().item():.3e} max_rel={rel[d > 1e-6].max().item() if (d>1e-6).any() else 0:.3e}")
+            print(
+                f"  diff[{name}] max_abs={d.max().item():.3e} "
+                f"mean_abs={d.mean().item():.3e} max_rel={rel[d > 1e-6].max().item() if (d > 1e-6).any() else 0:.3e}"
+            )
 
 
 if __name__ == "__main__":

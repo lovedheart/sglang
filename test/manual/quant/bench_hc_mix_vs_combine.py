@@ -67,12 +67,10 @@ def main():
                 x, wd_q, wu_q, wn.to(torch.bfloat16), HC, HS, EPS, wd_s, wu_s
             )
         )
-        t_comb = timeit(
-            lambda: hc_combine_split_fold(
-                block, x, g, wi_fold, HC, HS
-            )
+        t_comb = timeit(lambda: hc_combine_split_fold(block, x, g, wi_fold, HC, HS))
+        print(
+            f"{rows:>5} {t_mix:8.2f} {t_comb:11.2f} {100 * t_comb / (t_mix + t_comb):7.1f}%"
         )
-        print(f"{rows:>5} {t_mix:8.2f} {t_comb:11.2f} {100*t_comb/(t_mix+t_comb):7.1f}%")
 
 
 if __name__ == "__main__":

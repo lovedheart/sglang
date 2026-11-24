@@ -24,6 +24,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
+
 from sglang.srt.utils.device import is_sm120_supported
 
 if TYPE_CHECKING:

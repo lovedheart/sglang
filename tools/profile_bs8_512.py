@@ -18,6 +18,7 @@ Env knobs: PROFILE_ROOT, PORT, BS, PREFILL_TOKENS, DECODE_TOKENS.
 Known API traps (do not "fix" them): /start_profile answers plain text, and
 /stop_profile with nothing armed returns HTTP 500.
 """
+
 import glob
 import json
 import os
@@ -140,7 +141,9 @@ def spec_stats(results):
         if h:
             hist = [a + b for a, b in zip(hist, h)] if hist else list(h)
     summary = {}
-    summary.update({k: round(sum(v) / len(v), 4) for k, v in agg.items() if k in mean_keys})
+    summary.update(
+        {k: round(sum(v) / len(v), 4) for k, v in agg.items() if k in mean_keys}
+    )
     summary.update({k: sum(v) for k, v in agg.items() if k in sum_keys})
     if "spec_num_proposed_drafts" in summary:
         summary["spec_accept_rate_recomputed"] = round(
@@ -248,7 +251,11 @@ def collect(report, stage, workload, capture_steps, gate):
 def make_prefill_workload():
     def workload(round_base, tag):
         return [
-            (synthetic_prompt(PREFILL_TOKENS, f"{tag}{round_base}{i}"), 1, 1000 + round_base * BS + i)
+            (
+                synthetic_prompt(PREFILL_TOKENS, f"{tag}{round_base}{i}"),
+                1,
+                1000 + round_base * BS + i,
+            )
             for i in range(BS)
         ]
 
@@ -262,15 +269,29 @@ def make_prefill_workload():
 
 def make_decode_workload():
     def workload(round_base, tag):
-        return [(synthetic_prompt(1, f"{tag}{round_base}{i}"), DECODE_TOKENS, 5000 + round_base * BS + i) for i in range(BS)]
+        return [
+            (
+                synthetic_prompt(1, f"{tag}{round_base}{i}"),
+                DECODE_TOKENS,
+                5000 + round_base * BS + i,
+            )
+            for i in range(BS)
+        ]
 
     def throughput(results, wall, rounds):
-        toks = sum((r or {}).get("meta_info", {}).get("completion_tokens", DECODE_TOKENS) for r in results)
-        verify = sum((r or {}).get("meta_info", {}).get("spec_verify_ct", 0) for r in results)
+        toks = sum(
+            (r or {}).get("meta_info", {}).get("completion_tokens", DECODE_TOKENS)
+            for r in results
+        )
+        verify = sum(
+            (r or {}).get("meta_info", {}).get("spec_verify_ct", 0) for r in results
+        )
         # verify_ct is per request and every request in the batch advances on the
         # same forward, so scheduler steps per round ~= one request's verify_ct.
         # Each EAGLE verify step is 1 verify + (num_draft_tokens-1) draft forwards.
-        steps_per_round = verify / len(results) if verify else max(1.0, toks / max(1, BS))
+        steps_per_round = (
+            verify / len(results) if verify else max(1.0, toks / max(1, BS))
+        )
         return {
             "decode_tokens": toks,
             "tok_per_s": round(toks / wall, 1),
@@ -301,9 +322,13 @@ if __name__ == "__main__":
     report = {}
     ok = True
     if stage in ("both", "prefill"):
-        ok &= collect(report, "prefill", make_prefill_workload(), PREFILL_CAPTURE_STEPS, None)
+        ok &= collect(
+            report, "prefill", make_prefill_workload(), PREFILL_CAPTURE_STEPS, None
+        )
     if stage in ("both", "decode"):
-        ok &= collect(report, "decode", make_decode_workload(), DECODE_CAPTURE_STEPS, decode_gate)
+        ok &= collect(
+            report, "decode", make_decode_workload(), DECODE_CAPTURE_STEPS, decode_gate
+        )
     with open(f"{ROOT}/control.json", "w") as fh:
         json.dump(report, fh, indent=2)
     print("REPORT " + json.dumps(report), flush=True)

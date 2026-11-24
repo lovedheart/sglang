@@ -44,12 +44,12 @@ def flush_l2():
 def make_weights(gs_scale=1e-2):
     w13 = torch.randint(0, 256, (E, N13, H // 2), dtype=torch.uint8, device=DEV)
     w13_sf = (
-        torch.rand(E, N13, H // 16, device=DEV) * 0.2
-    ).float().to(torch.float8_e4m3fn)
+        (torch.rand(E, N13, H // 16, device=DEV) * 0.2).float().to(torch.float8_e4m3fn)
+    )
     gs13 = (10 ** torch.empty(E, device=DEV).uniform_(-3, -2)).float()
     w2 = torch.randint(0, 256, (E, H, I // 2), dtype=torch.uint8, device=DEV)
-    w2_sf = (torch.rand(E, H, I // 16, device=DEV) * 0.2).float().to(
-        torch.float8_e4m3fn
+    w2_sf = (
+        (torch.rand(E, H, I // 16, device=DEV) * 0.2).float().to(torch.float8_e4m3fn)
     )
     gs2 = (10 ** torch.empty(E, device=DEV).uniform_(-3, -2)).float()
     from sglang.srt.layers.quantization.utils import swizzle_blockscale
@@ -150,11 +150,7 @@ def w4a16_variants(T):
     # what the heuristics pick today
     BM0 = K._pick_bm(S, E)
     sf13, sf2 = K._scale_shape(E, N13, H), K._scale_shape(E, H, I)
-    p0 = (
-        K._persistent_plan(T, H, I, N13, TOPK, S, DEV, sf13, sf2)
-        if BM0 == 1
-        else None
-    )
+    p0 = K._persistent_plan(T, H, I, N13, TOPK, S, DEV, sf13, sf2) if BM0 == 1 else None
     if p0 is not None:
         out.append(("heuristic", (p0[0], p0[1], p0[2], True)))
     else:
@@ -171,23 +167,51 @@ def w4a16_variants(T):
             (_s1, TPR1, TN1, SP1, NST1, NT1), (_s2, TPR2, TN2, SP2, NST2, NT2) = tiles
             KT1, KT2 = TPR1 * K.KPT * NST1, TPR2 * K.KPT * NST2
             num_items = max(S * NT1 * SP1, S * NT2 * SP2)
-            grid_max = torch.cuda.get_device_properties(DEV).multi_processor_count * K.GMUL
+            grid_max = (
+                torch.cuda.get_device_properties(DEV).multi_processor_count * K.GMUL
+            )
             per_cta = (num_items + grid_max - 1) // grid_max
             OOF = S * N13
             consts = {
-                "S": S, "TOPK": TOPK, "H": H, "I": I, "N13": N13, "E": E, "SWIGLU": True,
-                "CP13": sf13[2], "NSF13": sf13[1] * sf13[2], "CP2": sf2[2], "NSF2": sf2[1] * sf2[2],
-                "KT1": KT1, "KTP1": KT1 + (KT1 // 32) * 8, "TPR1": TPR1, "TN1": TN1, "NT1": NT1,
-                "SP1": SP1, "NST1": NST1, "KT2": KT2, "KTP2": KT2 + (KT2 // 32) * 8, "TPR2": TPR2,
-                "TN2": TN2, "NT2": NT2, "SP2": SP2, "NST2": NST2, "OOF": OOF, "CTROFF": 0, "SDOFF": 4,
-                "TCOFF": 4 + S, "G": (num_items + per_cta - 1) // per_cta,
+                "S": S,
+                "TOPK": TOPK,
+                "H": H,
+                "I": I,
+                "N13": N13,
+                "E": E,
+                "SWIGLU": True,
+                "CP13": sf13[2],
+                "NSF13": sf13[1] * sf13[2],
+                "CP2": sf2[2],
+                "NSF2": sf2[1] * sf2[2],
+                "KT1": KT1,
+                "KTP1": KT1 + (KT1 // 32) * 8,
+                "TPR1": TPR1,
+                "TN1": TN1,
+                "NT1": NT1,
+                "SP1": SP1,
+                "NST1": NST1,
+                "KT2": KT2,
+                "KTP2": KT2 + (KT2 // 32) * 8,
+                "TPR2": TPR2,
+                "TN2": TN2,
+                "NT2": NT2,
+                "SP2": SP2,
+                "NST2": NST2,
+                "OOF": OOF,
+                "CTROFF": 0,
+                "SDOFF": 4,
+                "TCOFF": 4 + S,
+                "G": (num_items + per_cta - 1) // per_cta,
                 "SMEL": max(KT1 + (KT1 // 32) * 8, KT2 + (KT2 // 32) * 8),
                 "FALGN": K._algn(OOF * 4, H * 4),
                 "MBPM": max(1, 65536 // (K.REGCAP * (TN1 * TPR1))),
                 "STREAM": bool(E >= S * 4),
             }  # order must match moe_jitA constexprs
             if TN1 * TPR1 <= 256 and TN2 * TPR2 <= 256:  # SM max block width
-                out.append((f"persist_tpb{tpb}", (consts, OOF + T * H, 4 + S + T, True)))
+                out.append(
+                    (f"persist_tpb{tpb}", (consts, OOF + T * H, 4 + S + T, True))
+                )
     # tiled: force BM ladder
     for BM in (1, 2, 4, 8, 16, 32, 64):
         if BM == BM0 and BM0 != 1:
@@ -254,14 +278,20 @@ def w4a4_source_patch(mod, bm=None, budget1=None, budget2=None, gy_div=None):
     if bm is not None:
         s = s.replace("BM = 32 if P <= 24 * E else 64", f"BM = {bm}")
     if budget1 is not None:
-        s = s.replace("TK1, ST1 = _pick(H, PANEL1, 128, 98000)",
-                      f"TK1, ST1 = _pick(H, PANEL1, 128, {budget1})")
+        s = s.replace(
+            "TK1, ST1 = _pick(H, PANEL1, 128, 98000)",
+            f"TK1, ST1 = _pick(H, PANEL1, 128, {budget1})",
+        )
     if budget2 is not None:
-        s = s.replace("TK2, ST2 = _pick(I, PANEL2, 256, 49152)",
-                      f"TK2, ST2 = _pick(I, PANEL2, 256, {budget2})")
+        s = s.replace(
+            "TK2, ST2 = _pick(I, PANEL2, 256, 49152)",
+            f"TK2, ST2 = _pick(I, PANEL2, 256, {budget2})",
+        )
     if gy_div is not None:
-        s = s.replace("GY = min(WMAX, min(E, P) + max(1, (P + 8 * BM - 1) // (8 * BM)))",
-                      f"GY = min(WMAX, min(E, P) + max(1, (P + {gy_div} * BM - 1) // ({gy_div} * BM)))")
+        s = s.replace(
+            "GY = min(WMAX, min(E, P) + max(1, (P + 8 * BM - 1) // (8 * BM)))",
+            f"GY = min(WMAX, min(E, P) + max(1, (P + {gy_div} * BM - 1) // ({gy_div} * BM)))",
+        )
     code_src = s
     fname = f"<w4a4_build_{bm}_{budget1}_{budget2}_{gy_div}>"
     code = compile(code_src, fname, "exec")
@@ -305,8 +335,19 @@ def run_w4a4(T, only=None):
 
             def fn():
                 M.run_moe_w4a4(
-                    x, ids, wts, W["w13"], W["w13_sf"], W["w13_gs"],
-                    W["w2"], W["w2_sf"], W["w2_gs"], a13, a2, out, workspace=ws,
+                    x,
+                    ids,
+                    wts,
+                    W["w13"],
+                    W["w13_sf"],
+                    W["w13_gs"],
+                    W["w2"],
+                    W["w2_sf"],
+                    W["w2_gs"],
+                    a13,
+                    a2,
+                    out,
+                    workspace=ws,
                 )
 
             t, best = timeit(fn)

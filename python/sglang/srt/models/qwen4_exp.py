@@ -13,6 +13,8 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from torch import nn
+
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
@@ -116,7 +118,6 @@ from sglang.srt.runtime_context import (
     linear_attn_parallel_group,
 )
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu, logger
-from torch import nn
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()

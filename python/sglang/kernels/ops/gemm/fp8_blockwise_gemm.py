@@ -112,9 +112,7 @@ def sm120_fp8_blockwise_fused_act_supported(
     if tuple(weight_scale.shape) != (n // 128, k // 128):
         return False
     num_sms = _num_sms(x2d.device.index if x2d.device.index is not None else 0)
-    warp_pr = (
-        n <= 32 * num_sms and (m <= 8 or k >= 6144) and n >= 4096 and k >= 4096
-    )
+    warp_pr = n <= 32 * num_sms and (m <= 8 or k >= 6144) and n >= 4096 and k >= 4096
     warp_flashnext = n <= 32 * num_sms and (k >= 6144 or n <= 1024)
     warp_small = n <= 32768 and (m <= 8 or n <= 4096)
     return warp_pr or warp_flashnext or warp_small
@@ -134,7 +132,9 @@ def sm120_fp8_blockwise_warp_fused_act(
     pass the same ``(x, weight [n, k] row-major, weight_scale [n/128, k/128]
     row-major)`` the two-kernel path would have used.
     """
-    out = torch.empty((x2d.shape[0], weight.shape[0]), dtype=out_dtype, device=x2d.device)
+    out = torch.empty(
+        (x2d.shape[0], weight.shape[0]), dtype=out_dtype, device=x2d.device
+    )
     _sm120_fp8_blockwise_warp_fused_act_custom_op(out, x2d, weight, weight_scale)
     return out
 

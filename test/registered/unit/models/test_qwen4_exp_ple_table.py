@@ -515,11 +515,7 @@ def _write_fake_ple_checkpoint(d, shards=3, rows=64, row_bytes=120, dtype="U8"):
             sc = torch.linspace(0.5, 2.0, rows, dtype=torch.float32).reshape(rows, 1)
             tensors[key[: -len(".weight")] + ".scale"] = sc
         elif dtype == "F8_E4M3":
-            w = (
-                torch.randn(rows, row_bytes)
-                .clamp(-4, 4)
-                .to(torch.float8_e4m3fn)
-            )
+            w = torch.randn(rows, row_bytes).clamp(-4, 4).to(torch.float8_e4m3fn)
         else:
             raise ValueError(dtype)
         tensors[key] = w
@@ -689,9 +685,7 @@ class TestPleSafetensorsAllocator(CustomTestCase):
             _write_fake_ple_checkpoint(d, shards=4, rows=40000)
             tbl = self._alloc(d, shards=4, rows=40000)
             self.assertEqual(len(tbl.segments), 4)
-            prefetcher = PleFilePrefetcher(
-                row_bytes=120, segments=tbl, min_rows=1
-            )
+            prefetcher = PleFilePrefetcher(row_bytes=120, segments=tbl, min_rows=1)
             for seg in tbl.segments:
                 ctypes.string_at(seg.buffer._addr, seg.buffer._nbytes)
             # Only rows of the last segment count as hot.
@@ -868,9 +862,7 @@ class TestPleSafetensorsGatherOnDevice(CustomTestCase):
                 return (v.cuda() * scales[row]).to(torch.bfloat16)
 
             for i, row in enumerate(picks):
-                torch.testing.assert_close(
-                    out[i], golden(row), atol=0, rtol=0
-                )
+                torch.testing.assert_close(out[i], golden(row), atol=0, rtol=0)
 
     def test_fp8_segment_gather_matches_tensor_reads(self):
         import json

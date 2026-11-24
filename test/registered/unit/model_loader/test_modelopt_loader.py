@@ -530,9 +530,7 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         # topology gives Mxfp4MoEMethod.__init__ its runtime-context reads.
         layer = FusedMoE.__new__(FusedMoE)
         with published_topology():
-            method = quant_config.get_quant_method(
-                layer, "model.layers.0.mlp.experts"
-            )
+            method = quant_config.get_quant_method(layer, "model.layers.0.mlp.experts")
         self.assertIsInstance(method, Mxfp4MoEMethod)
 
     def test_block_fp8_block_size_follows_checkpoint_group_size(self):

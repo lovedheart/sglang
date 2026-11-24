@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.kv_offload_attention import (
     gather_offloaded_context,
@@ -153,12 +154,14 @@ def _run_pair(seed, lens, chunks, topk, state=None, pos_cap=None):
         torch.arange(len(lens), device="cuda"),
         torch.tensor(chunks, device="cuda"),
     )
-    q_rel = torch.arange(num_q, device="cuda") - torch.tensor(starts, device="cuda")[
-        owner
-    ]
-    visible = (torch.tensor(lens, device="cuda") - torch.tensor(chunks, device="cuda"))[
-        owner
-    ] + q_rel + 1
+    q_rel = (
+        torch.arange(num_q, device="cuda") - torch.tensor(starts, device="cuda")[owner]
+    )
+    visible = (
+        (torch.tensor(lens, device="cuda") - torch.tensor(chunks, device="cuda"))[owner]
+        + q_rel
+        + 1
+    )
     if pos_cap is not None:  # harness: un-stored chunk rows cannot be referenced
         visible = visible.clamp(max=pos_cap)
     pick = (torch.rand(num_q, topk, device="cuda", generator=g) * visible[:, None]).to(

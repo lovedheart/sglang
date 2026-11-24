@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import (
-    _FUSED_MIX_MAX_ROWS,
     fused_hc_mix,
     fused_hc_mix_fold,
     fused_hc_mix_fold_supported,

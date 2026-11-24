@@ -74,7 +74,9 @@ def _jit_module(
     if layout == "flat":
         # Extra entry on the same instantiation: quantize a shorter input into
         # a row-padded output, zeroing the tail rows in the same launch.
-        wrappers.append(("per_token_group_quant_padded", f"{launcher}<{trait_args}>::run_padded"))
+        wrappers.append(
+            ("per_token_group_quant_padded", f"{launcher}<{trait_args}>::run_padded")
+        )
     return load_jit(
         "per_token_group_quant",
         *trait_args,
@@ -191,7 +193,9 @@ def _per_token_group_quant_custom_op(
             # padded): the outputs have more rows than the input; the kernel
             # quantizes the real rows and writes exact zeros to the tail in
             # one launch. The legacy run() would reject the shape mismatch.
-            assert not fuse_silu_and_mul, "padded rows are only supported for plain quantization"
+            assert not fuse_silu_and_mul, (
+                "padded rows are only supported for plain quantization"
+            )
             module.per_token_group_quant_padded(
                 input, output_q, output_s, int(input.shape[-2])
             )

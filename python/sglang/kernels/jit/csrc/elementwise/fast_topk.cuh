@@ -240,8 +240,7 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
             int rank = 0;
             for (int j = 0; j < tie_count; ++j) {
               const auto idx2 = tie_list[j];
-              if (idx2 < idx &&
-                  convert_to_uint32(input[idx2 + row_start]) == key) {
+              if (idx2 < idx && convert_to_uint32(input[idx2 + row_start]) == key) {
                 ++rank;
               }
             }

@@ -10,6 +10,7 @@ Speed: real kernels, real shapes (Qwen3.8-Flash-Next: HC=4 HS=2560 LR=320;
 down N=320 K=10240, up N=10240 K=320 -> pad to 384 for the cute_ws K%128=0
 rule; the 64 zero columns are masked by predication, scale=1 code=0).
 """
+
 import glob
 import json
 import math
@@ -110,7 +111,9 @@ def dq_w_1x32_pow2_e4m3(x):  # production MXFP8 weight storage
     x = x.float()
     n, k = x.shape
     xb = x.view(n, k // 32, 32)
-    e = torch.ceil(torch.log2(xb.abs().amax(-1, keepdim=True).clamp_min(1e-30) / E4M3_MAX)).clamp(-126, 126)
+    e = torch.ceil(
+        torch.log2(xb.abs().amax(-1, keepdim=True).clamp_min(1e-30) / E4M3_MAX)
+    ).clamp(-126, 126)
     s = torch.exp2(e)
     return (xb / s).to(torch.float8_e4m3fn).float().mul(s).view(n, k)
 
@@ -134,7 +137,9 @@ def dq_w_1x32_pow2_e3m4(x):  # isolates mantissa vs scale-granularity
     x = x.float()
     n, k = x.shape
     xb = x.view(n, k // 32, 32)
-    e = torch.ceil(torch.log2(xb.abs().amax(-1, keepdim=True).clamp_min(1e-30) / E3M4_MAX)).clamp(-126, 126)
+    e = torch.ceil(
+        torch.log2(xb.abs().amax(-1, keepdim=True).clamp_min(1e-30) / E3M4_MAX)
+    ).clamp(-126, 126)
     s = torch.exp2(e)
     return (decode_e3m4(encode_e3m4(xb / s)) * s).view(n, k)
 
@@ -232,7 +237,9 @@ def _silu_quant_pad_kernel(t_ptr, q_ptr, s_ptr, M, LO: tl.constexpr, KS: tl.cons
 
 
 @triton.jit
-def _combine_kernel(g_ptr, x_ptr, out_ptr, HSx: tl.constexpr, HCc: tl.constexpr, BJ: tl.constexpr):
+def _combine_kernel(
+    g_ptr, x_ptr, out_ptr, HSx: tl.constexpr, HCc: tl.constexpr, BJ: tl.constexpr
+):
     row = tl.program_id(0)
     jb = tl.program_id(1)
     j = jb * BJ + tl.arange(0, BJ)
@@ -263,14 +270,14 @@ def bench(fn, iters=50, warmup=10):
 def main():
     torch.manual_seed(0)
     from sglang.kernels.ops.gemm.hc_mix_fp8 import (
-        fused_hc_mix_fp8_w8a8,
-        _mxfp8_quant_act_kernel,
         _hc_mix_a8w8_down_kernel,
         _hc_mix_a8w8_up_kernel,
+        _mxfp8_quant_act_kernel,
+        fused_hc_mix_fp8_w8a8,
     )
     from sglang.kernels.ops.gemm.sm120_fp8_e3m4 import (
-        sm120_fp8_e3m4_gemm,
         _gemm_route,
+        sm120_fp8_e3m4_gemm,
     )
     from sglang.srt.layers.fp8_hc_mix import mxfp8_quantize_rowmajor
 
@@ -287,20 +294,26 @@ def main():
         ref = mix_math(x, wd, wu)
         cases = {
             "w8a8 e4m3 1x32 pow2 (prod)": (
-                mix_math(dq_a_1x32_pow2(x), dq_w_1x32_pow2_e4m3(wd), dq_w_1x32_pow2_e4m3(wu))
+                mix_math(
+                    dq_a_1x32_pow2(x), dq_w_1x32_pow2_e4m3(wd), dq_w_1x32_pow2_e4m3(wu)
+                )
             ),
             "w8a8 e3m4 b128 fp32 (new)": (
-                mix_math(dq_a_b128_fp32(x), dq_w_b128_fp32_e3m4(wd), dq_w_b128_fp32_e3m4(wu))
+                mix_math(
+                    dq_a_b128_fp32(x), dq_w_b128_fp32_e3m4(wd), dq_w_b128_fp32_e3m4(wu)
+                )
             ),
             "w8a8 e3m4 1x32 pow2 (isolate)": (
-                mix_math(dq_a_1x32_pow2(x), dq_w_1x32_pow2_e3m4(wd), dq_w_1x32_pow2_e3m4(wu))
+                mix_math(
+                    dq_a_1x32_pow2(x), dq_w_1x32_pow2_e3m4(wd), dq_w_1x32_pow2_e3m4(wu)
+                )
             ),
             "w8a8 e3m4 1x64 fp32": (
-                mix_math(dq_a_b64_fp32(x), dq_w_b64_fp32_e3m4(wd), dq_w_b64_fp32_e3m4(wu))
+                mix_math(
+                    dq_a_b64_fp32(x), dq_w_b64_fp32_e3m4(wd), dq_w_b64_fp32_e3m4(wu)
+                )
             ),
-            "act-only e4m3 b128 (w fp32)": (
-                mix_math(dq_a_b128_fp32(x), wd, wu)
-            ),
+            "act-only e4m3 b128 (w fp32)": (mix_math(dq_a_b128_fp32(x), wd, wu)),
         }
         for nm, out in cases.items():
             rel, cos, snr = metrics(out, ref)
@@ -326,16 +339,20 @@ def main():
         blocks = wp.view(nb, 128, kb, 128)
         s = blocks.abs().amax(dim=(1, 3), keepdim=True).clamp_min(1e-30) / E3M4_MAX
         codes = encode_e3m4(blocks / s).view(nb * 128, kb * 128)
-        return codes.view(torch.float8_e4m3fn).contiguous(), s.view(nb, kb).contiguous().float()
+        return codes.view(torch.float8_e4m3fn).contiguous(), s.view(
+            nb, kb
+        ).contiguous().float()
 
     # up weight padded K 320->384
     wu_pad = torch.zeros(HS * HC, KP, device=DEV)
     wu_pad[:, :LR] = wu.float()
-    wd_codes, wd_scale = pack_b128(wd)          # [320->384,10240] rows pad -> scale [3,80]
-    wu_codes, wu_scale = pack_b128(wu_pad)      # [10240,384] -> scale [80,3]
+    wd_codes, wd_scale = pack_b128(wd)  # [320->384,10240] rows pad -> scale [3,80]
+    wu_codes, wu_scale = pack_b128(wu_pad)  # [10240,384] -> scale [80,3]
 
-    print(f"{'rows':>5s} {'prod_w8a8':>10s} {'e3m4_route':>11s} {'speedup':>8s}   "
-          f"{'actq':>6s} {'down':>6s} {'silu+q':>7s} {'up':>7s} {'comb':>6s}  route")
+    print(
+        f"{'rows':>5s} {'prod_w8a8':>10s} {'e3m4_route':>11s} {'speedup':>8s}   "
+        f"{'actq':>6s} {'down':>6s} {'silu+q':>7s} {'up':>7s} {'comb':>6s}  route"
+    )
     for M in ROWS:
         x = torch.randn(M, KD, device=DEV).to(torch.bfloat16)
 
@@ -349,14 +366,50 @@ def main():
         pt8 = torch.empty(M, LR, dtype=torch.float8_e4m3fn, device=DEV)
         ptsf = torch.empty(M, LR // 32, dtype=torch.uint8, device=DEV)
         pout = torch.empty(M, HS, dtype=torch.bfloat16, device=DEV)
-        t_pq = bench(lambda: _mxfp8_quant_act_kernel[(M, KD // 1024)](
-            x, p8, psf, M, K=KD, BLOCK=1024, num_warps=4))
-        t_pd = bench(lambda: _hc_mix_a8w8_down_kernel[(triton.cdiv(M, 128), LR // 64)](
-            p8, psf, wd8, wd8s, pt8, ptsf, M, KD, LR, 1.0 / HC,
-            BM=128, BN=64, BK=256, NKB=KD // 32, num_warps=8, num_stages=2))
-        t_pu = bench(lambda: _hc_mix_a8w8_up_kernel[(triton.cdiv(M, 64), HS // 64)](
-            pt8, ptsf, wu8, wu8s, x, pout, M, LOWRANK=LR, HS=HS, HC=HC,
-            BM=64, BN=64, BK=64, num_warps=4, num_stages=3))
+        t_pq = bench(
+            lambda: _mxfp8_quant_act_kernel[(M, KD // 1024)](
+                x, p8, psf, M, K=KD, BLOCK=1024, num_warps=4
+            )
+        )
+        t_pd = bench(
+            lambda: _hc_mix_a8w8_down_kernel[(triton.cdiv(M, 128), LR // 64)](
+                p8,
+                psf,
+                wd8,
+                wd8s,
+                pt8,
+                ptsf,
+                M,
+                KD,
+                LR,
+                1.0 / HC,
+                BM=128,
+                BN=64,
+                BK=256,
+                NKB=KD // 32,
+                num_warps=8,
+                num_stages=2,
+            )
+        )
+        t_pu = bench(
+            lambda: _hc_mix_a8w8_up_kernel[(triton.cdiv(M, 64), HS // 64)](
+                pt8,
+                ptsf,
+                wu8,
+                wu8s,
+                x,
+                pout,
+                M,
+                LOWRANK=LR,
+                HS=HS,
+                HC=HC,
+                BM=64,
+                BN=64,
+                BK=64,
+                num_warps=4,
+                num_stages=3,
+            )
+        )
 
         # e3m4 route, all real kernels
         a8 = torch.empty(M, KD, dtype=torch.float8_e4m3fn, device=DEV)
@@ -400,8 +453,11 @@ def main():
         t_comb = bench(comb)
         a8_64 = torch.empty(M, KD, dtype=torch.float8_e4m3fn, device=DEV)
         asf64 = torch.empty(M, KD // 64, dtype=torch.float32, device=DEV)
-        t_actq64 = bench(lambda: _quant_act_b64_kernel[(M, KD // 1024)](
-            x, a8_64, asf64, M, K=KD, B=1024))
+        t_actq64 = bench(
+            lambda: _quant_act_b64_kernel[(M, KD // 1024)](
+                x, a8_64, asf64, M, K=KD, B=1024
+            )
+        )
         t_route = bench(route)
         rt = _gemm_route(M, LR, KD)
         print(

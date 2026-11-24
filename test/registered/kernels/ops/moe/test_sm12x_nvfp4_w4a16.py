@@ -202,9 +202,7 @@ def test_sm12x_global_scale_fold():
     gs13, gs2 = fold(None, layer)
     torch.testing.assert_close(gs13, gate)
     # gate keeps its own scale into silu; up's residual rides on GEMM2.
-    torch.testing.assert_close(
-        gs2, torch.tensor([2e-3, 2e-3, 3e-3, 4e-3], device=DEV)
-    )
+    torch.testing.assert_close(gs2, torch.tensor([2e-3, 2e-3, 3e-3, 4e-3], device=DEV))
     assert torch.isfinite(gs2).all(), "a zero gate scale must not divide into inf"
     again = fold(None, layer)
     assert again[0] is gs13 and again[1] is gs2, "fold must be cached per layer"

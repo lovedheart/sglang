@@ -98,7 +98,13 @@ def test_accuracy(M, N, K, out_dtype):
 )
 @pytest.mark.parametrize(
     "M, N, K",
-    [(1, 2048, 2560), (4, 2560, 2048), (8, 512, 2560), (4, 16384, 2560), (16, 2560, 6144)],
+    [
+        (1, 2048, 2560),
+        (4, 2560, 2048),
+        (8, 512, 2560),
+        (4, 16384, 2560),
+        (16, 2560, 6144),
+    ],
 )
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
 def test_warp_arm_stability(M, N, K, out_dtype):
@@ -106,9 +112,16 @@ def test_warp_arm_stability(M, N, K, out_dtype):
     torch.manual_seed(0)
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     a = ((torch.rand(M, K, device=device) - 0.5) * 2 * fp8_max).to(torch.float8_e4m3fn)
-    b = ((torch.rand(N, K, device=device) - 0.5) * 2 * fp8_max).to(torch.float8_e4m3fn).t()
+    b = (
+        ((torch.rand(N, K, device=device) - 0.5) * 2 * fp8_max)
+        .to(torch.float8_e4m3fn)
+        .t()
+    )
     scale_a = torch.randn(M, cdiv(K, 128), device=device, dtype=torch.float32) * 0.001
-    scale_b = torch.randn(cdiv(K, 128), cdiv(N, 128), device=device, dtype=torch.float32) * 0.001
+    scale_b = (
+        torch.randn(cdiv(K, 128), cdiv(N, 128), device=device, dtype=torch.float32)
+        * 0.001
+    )
     # The blockwise kernels take col-major scale tensors (loader convention).
     scale_a = scale_a.t().contiguous().t()
     scale_b = scale_b.t().contiguous().t()
@@ -225,9 +238,7 @@ def test_fused_act_quant_gate_band():
     )
     # Non-contiguous activations.
     wide_x = torch.randn(4, 5120, device="cuda", dtype=torch.bfloat16)
-    assert not sm120_fp8_blockwise_fused_act_supported(
-        wide_x[:, :2560], b, scale_b
-    )
+    assert not sm120_fp8_blockwise_fused_act_supported(wide_x[:, :2560], b, scale_b)
     with envs.SGLANG_ENABLE_SM120_FUSED_ACT_QUANT.override(False):
         assert not sm120_fp8_blockwise_fused_act_supported(x, b, scale_b)
 

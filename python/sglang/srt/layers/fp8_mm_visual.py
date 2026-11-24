@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 
 import torch
+
 from sglang.srt.layers.fp8_lm_head import FP8_E3M4_MAX, _e3m4_tables, _encode_e3m4
 from sglang.srt.utils.device import is_sm120_supported
 

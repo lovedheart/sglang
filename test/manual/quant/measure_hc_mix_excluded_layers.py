@@ -12,6 +12,7 @@ is calibrated right.
 Usage:  python measure_hc_mix_excluded_layers.py [L]     (L = rows, default 256)
 Env:    HC_MIX_CKPT = checkpoint dir with BF16 hyper_connection weights.
 """
+
 import glob
 import json
 import os
@@ -20,7 +21,9 @@ import sys
 import numpy as np
 import torch
 
-sys.path.insert(0, os.environ.get("SGLANG_PY", "/home/lovedheart/sglang-fork-dev/python"))
+sys.path.insert(
+    0, os.environ.get("SGLANG_PY", "/home/lovedheart/sglang-fork-dev/python")
+)
 from sglang.srt.layers.fp8_hc_mix import (  # noqa: E402
     mxfp8_dequantize_to_bf16,
     mxfp8_quantize_rowmajor,
@@ -73,7 +76,9 @@ def mix(x, wd, wu):
     # x: [L, HC*HS] bf16-normed; same math as _mix_compute
     h = torch.nn.functional.linear(x, wd).float() / HC
     t = torch.nn.functional.silu(h)
-    g = torch.sigmoid(torch.nn.functional.linear(t.to(x.dtype), wu)).unflatten(-1, (HC, HS))
+    g = torch.sigmoid(torch.nn.functional.linear(t.to(x.dtype), wu)).unflatten(
+        -1, (HC, HS)
+    )
     return (g * x.unflatten(-1, (HC, HS))).mean(-2)
 
 
@@ -93,14 +98,19 @@ def check(name, base, seed):
     qu, su = mxfp8_quantize_rowmajor(Wu)
     got = mix(x, mxfp8_dequantize_to_bf16(qd, sd), mxfp8_dequantize_to_bf16(qu, su))
     e_mix = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
-    e_wd = ((mxfp8_dequantize_to_bf16(qd, sd).float() - Wd.float()).norm()
-            / Wd.float().norm()).item()
-    e_wu = ((mxfp8_dequantize_to_bf16(qu, su).float() - Wu.float()).norm()
-            / Wu.float().norm()).item()
+    e_wd = (
+        (mxfp8_dequantize_to_bf16(qd, sd).float() - Wd.float()).norm()
+        / Wd.float().norm()
+    ).item()
+    e_wu = (
+        (mxfp8_dequantize_to_bf16(qu, su).float() - Wu.float()).norm()
+        / Wu.float().norm()
+    ).item()
     gate_ref = torch.sigmoid(
         torch.nn.functional.linear(
-            torch.nn.functional.silu(torch.nn.functional.linear(x, Wd).float() / HC)
-            .to(x.dtype),
+            torch.nn.functional.silu(torch.nn.functional.linear(x, Wd).float() / HC).to(
+                x.dtype
+            ),
             Wu,
         )
     )
@@ -114,11 +124,31 @@ def check(name, base, seed):
 
 print(f"L={L} rows, MXFP8 (e4m3 + 1x32 UE8M0, shipped quantizer)")
 print("-" * 100)
-check("main layer 0 attn   (quantized in config)", "model.language_model.layers.0.attn_hyper_connection", 11)
-check("main layer 46 attn  (quantized in config)", "model.language_model.layers.46.attn_hyper_connection", 12)
-check("main layer 47 attn  (EXCLUDED: last layer)", "model.language_model.layers.47.attn_hyper_connection", 13)
-check("main layer 47 mlp   (EXCLUDED: last layer)", "model.language_model.layers.47.mlp_hyper_connection", 14)
-check("main final mixer    (EXCLUDED: final mixer)", "model.language_model.hyper_connection_mixer", 15)
+check(
+    "main layer 0 attn   (quantized in config)",
+    "model.language_model.layers.0.attn_hyper_connection",
+    11,
+)
+check(
+    "main layer 46 attn  (quantized in config)",
+    "model.language_model.layers.46.attn_hyper_connection",
+    12,
+)
+check(
+    "main layer 47 attn  (EXCLUDED: last layer)",
+    "model.language_model.layers.47.attn_hyper_connection",
+    13,
+)
+check(
+    "main layer 47 mlp   (EXCLUDED: last layer)",
+    "model.language_model.layers.47.mlp_hyper_connection",
+    14,
+)
+check(
+    "main final mixer    (EXCLUDED: final mixer)",
+    "model.language_model.hyper_connection_mixer",
+    15,
+)
 check("mtp layer 0 attn    (EXCLUDED: draft)", "mtp.layers.0.attn_hyper_connection", 16)
 check("mtp layer 0 mlp     (EXCLUDED: draft)", "mtp.layers.0.mlp_hyper_connection", 17)
 check("mtp final mixer     (EXCLUDED: draft)", "mtp.hyper_connection_mixer", 18)

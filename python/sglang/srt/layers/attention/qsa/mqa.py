@@ -972,9 +972,7 @@ def qsa_mqa_decode(
 
         return qsa_mqa_paged(q, k_cache, page_table, context_lens, max_model_len)
     page_size = int(k_cache.shape[1])
-    can_tilelang = (
-        q.is_cuda and HAS_TILELANG and page_size >= 8 and 64 % page_size == 0
-    )
+    can_tilelang = q.is_cuda and HAS_TILELANG and page_size >= 8 and 64 % page_size == 0
     if k_cache.dtype == torch.float8_e4m3fn and not can_tilelang:
         # Only reached where TileLang cannot run (absent, or a page size its
         # 64-row sub-page packing rejects): the DeepGEMM paged fp8 kernel

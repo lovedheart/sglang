@@ -15,6 +15,7 @@ sits idle between forwards). This tool streams the trace with ijson (traces are
 
 Usage: python tools/trace_duty.py <trace.json.gz> [more traces...]
 """
+
 import gzip
 import json
 import sys
@@ -23,7 +24,13 @@ from collections import Counter, defaultdict
 import ijson
 
 GPU_CATS = {"kernel", "gpu_memcpy", "gpu_memset"}
-BUCKETS = ((10, "ge10us"), (100, "ge100us"), (1000, "ge1ms"), (10000, "ge10ms"), (10**9, "ge100ms"))
+BUCKETS = (
+    (10, "ge10us"),
+    (100, "ge100us"),
+    (1000, "ge1ms"),
+    (10000, "ge10ms"),
+    (10**9, "ge100ms"),
+)
 
 
 def stream_events(path):
@@ -45,7 +52,14 @@ def analyse(path):
             if ts is None or dur is None:
                 continue
             ts, dur = float(ts), float(dur)
-            gpu.append((ts, ts + dur, ev.get("name", "?"), ev.get("args", {}).get("stream", -1)))
+            gpu.append(
+                (
+                    ts,
+                    ts + dur,
+                    ev.get("name", "?"),
+                    ev.get("args", {}).get("stream", -1),
+                )
+            )
         elif cat == "cuda_runtime":
             name = ev.get("name", "?")
             if name.startswith("cuda") or name.startswith("cuGraph"):
@@ -100,9 +114,18 @@ def analyse(path):
         "busy_ms": round(busy / 1000, 1),
         "duty_pct": round(100 * busy / span, 1),
         "max_concurrent_streams": mx,
-        "gap_buckets_us": {label: [bucket_counts.get(label, 0), round(bucket_time.get(label, 0) / 1000, 1)] for label in labels},
+        "gap_buckets_us": {
+            label: [
+                bucket_counts.get(label, 0),
+                round(bucket_time.get(label, 0) / 1000, 1),
+            ]
+            for label in labels
+        },
         "top_gaps_ms": [[round(g / 1000, 2)] for g, _t in gaps[:10]],
-        "cpu_launch_apis": {k: [api[k], round(api_dur[k] / 1000, 1)] for k in sorted(api_dur, key=lambda k: -api_dur[k])[:6]},
+        "cpu_launch_apis": {
+            k: [api[k], round(api_dur[k] / 1000, 1)]
+            for k in sorted(api_dur, key=lambda k: -api_dur[k])[:6]
+        },
     }
 
 

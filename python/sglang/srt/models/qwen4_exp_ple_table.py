@@ -36,7 +36,6 @@ import ctypes
 import ctypes.util
 import json
 import logging
-import mmap as _mmap
 import os
 import re
 import threading
@@ -265,12 +264,8 @@ def find_safetensors_ple_shards(
     else:
         for fname in sorted(os.listdir(model_dir)):
             if fname.endswith(".safetensors"):
-                header, _ = _safetensors_header_cached(
-                    os.path.join(model_dir, fname)
-                )
-                names_to_files.update(
-                    {k: fname for k in header if k != "__metadata__"}
-                )
+                header, _ = _safetensors_header_cached(os.path.join(model_dir, fname))
+                names_to_files.update({k: fname for k in header if k != "__metadata__"})
     out = []
     for name, fname in names_to_files.items():
         key = key_filter(name)
@@ -321,12 +316,14 @@ def _mmap_readonly(path: str, offset: int, length: int):
         libc = ctypes.CDLL(None, use_errno=True)
         libc.mmap.restype = ctypes.c_void_p
         libc.mmap.argtypes = [
-            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_longlong,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_longlong,
         ]
-        addr = libc.mmap(
-            None, pad + length, _PROT_READ, _MAP_SHARED, fd, aligned
-        )
+        addr = libc.mmap(None, pad + length, _PROT_READ, _MAP_SHARED, fd, aligned)
         if addr is None or addr == ctypes.c_void_p(-1).value:
             raise OSError(ctypes.get_errno(), "mmap", path)
     except Exception:
@@ -352,7 +349,7 @@ class PleFilePrefetcher:
         path: Optional[str] = None,
         row_bytes: int = 0,
         min_rows: int = PLE_FILE_PREFETCH_MIN_ROWS,
-        segments: Optional["PleSegmentTable"] = None,
+        segments: Optional[PleSegmentTable] = None,
     ) -> None:
         # A checkpoint-backed table spans many files; then PleSegmentTable maps
         # a row to (fd, file offset) and the page math happens there.
@@ -474,16 +471,14 @@ class PleFileRssTrimmer:
         budget_bytes: int = 0,
         interval_s: float = 30.0,
         chunk_bytes: int = PLE_FILE_RSS_TRIM_CHUNK_BYTES,
-        segments: Optional["PleSegmentTable"] = None,
-        prefetcher: Optional["PleFilePrefetcher"] = None,
+        segments: Optional[PleSegmentTable] = None,
+        prefetcher: Optional[PleFilePrefetcher] = None,
         lru: bool = True,
     ) -> None:
         # A checkpoint-backed table is many small mappings; the trim logic is
         # the same per mapping, so the ranges are kept as a list either way.
         self._ranges = (
-            segments.mappings()
-            if segments is not None
-            else [(int(addr), int(nbytes))]
+            segments.mappings() if segments is not None else [(int(addr), int(nbytes))]
         )
         self._addr = int(addr)
         self._nbytes = int(nbytes) if segments is None else segments.total_bytes()
@@ -689,7 +684,7 @@ def allocate_ple_safetensors_table(
     shard_size: int,
     vocab_start: int,
     vocab_end: int,
-) -> "PleSegmentTable":
+) -> PleSegmentTable:
     """Map this rank's rows of the checkpoint's own PLE tensors, read-only.
 
     The checkpoint stores the table as ``<prefix>.shard_<i>.weight`` tensors
@@ -704,9 +699,7 @@ def allocate_ple_safetensors_table(
             f"--ple-offload-backend safetensors cannot serve {dtype} tables; "
             "supported: bfloat16, float8_e4m3fn, packed fp6 (uint8)"
         )
-    shards = find_safetensors_ple_shards(
-        model_dir, _ple_shard_key_filter(prefix)
-    )
+    shards = find_safetensors_ple_shards(model_dir, _ple_shard_key_filter(prefix))
     if not shards:
         raise ValueError(
             f"--ple-offload-backend safetensors: no PLE shard weights matching "
@@ -788,7 +781,9 @@ def make_ple_file_prefetcher(table: torch.Tensor) -> Optional[PleFilePrefetcher]
     """A prefetcher for a table returned by ``allocate_ple_host_table(..., "file")``."""
     segments = getattr(table, "_sglang_ple_segments", None)
     path = getattr(table, "_sglang_ple_file_path", None)
-    if (path is None and segments is None) or not envs.SGLANG_QWEN4_PLE_FILE_PREFETCH.get():
+    if (
+        path is None and segments is None
+    ) or not envs.SGLANG_QWEN4_PLE_FILE_PREFETCH.get():
         return None
     if segments is not None:
         row_bytes = segments.row_bytes
@@ -812,7 +807,7 @@ def make_ple_file_prefetcher(table: torch.Tensor) -> Optional[PleFilePrefetcher]
 
 def make_ple_file_rss_trimmer(
     table: torch.Tensor,
-    prefetcher: Optional["PleFilePrefetcher"] = None,
+    prefetcher: Optional[PleFilePrefetcher] = None,
 ) -> Optional[PleFileRssTrimmer]:
     """A started trimmer for a table from ``allocate_ple_host_table(..., "file")``.
 
@@ -864,9 +859,7 @@ def make_ple_file_rss_trimmer(
     return trimmer
 
 
-def check_file_backend_supported(
-    device_index: int = 0, backend: str = "file"
-) -> None:
+def check_file_backend_supported(device_index: int = 0, backend: str = "file") -> None:
     """Fail fast at load time instead of silently reading garbage in the kernel."""
     if envs.SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK.get():
         logger.warning(
@@ -1099,8 +1092,11 @@ def _ranges_rss_bytes(
                     start = int(header.group(1), 16)
                     end = int(header.group(2), 16)
                     current = next(
-                        (i for i, (lo, hi) in enumerate(spans)
-                         if start < hi and end > lo),
+                        (
+                            i
+                            for i, (lo, hi) in enumerate(spans)
+                            if start < hi and end > lo
+                        ),
                         None,
                     )
                 elif current is not None:

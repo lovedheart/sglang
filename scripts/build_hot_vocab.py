@@ -77,8 +77,7 @@ def main():
     for text in corpus_texts():
         n_doc += 1
         cnt.update(tok(text)["input_ids"])
-    print(f"tokenized {n_doc} docs, {sum(cnt.values())} tokens, "
-          f"{len(cnt)} distinct")
+    print(f"tokenized {n_doc} docs, {sum(cnt.values())} tokens, {len(cnt)} distinct")
 
     # Forced tokens: digits, common punctuation/whitespace/math symbols.
     forced = set()

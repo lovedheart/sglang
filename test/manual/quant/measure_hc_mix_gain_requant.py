@@ -16,6 +16,7 @@ mixed relerr exceeds direct by more than ~1.5x.
 Usage:  python measure_hc_mix_gain_requant.py [L]
 Env:    HC_MIX_CKPT
 """
+
 import glob
 import json
 import os
@@ -24,7 +25,9 @@ import sys
 import numpy as np
 import torch
 
-sys.path.insert(0, os.environ.get("SGLANG_PY", "/home/lovedheart/sglang-fork-dev/python"))
+sys.path.insert(
+    0, os.environ.get("SGLANG_PY", "/home/lovedheart/sglang-fork-dev/python")
+)
 from sglang.srt.layers.fp8_hc_mix import (  # noqa: E402
     mxfp8_dequantize_to_bf16,
     mxfp8_quantize_rowmajor,
@@ -35,8 +38,11 @@ D = os.environ.get(
     "/media/lovedheart/models/Qwen3.8-Flash-Next-NVFP4-w4a16-4o6-attnFP8b128-full",
 )
 L = int(os.environ.get("L", "256"))
-LAYERS = ([int(x) for x in os.environ["LAYERS"].split(",")]
-          if "LAYERS" in os.environ else list(range(48)))
+LAYERS = (
+    [int(x) for x in os.environ["LAYERS"].split(",")]
+    if "LAYERS" in os.environ
+    else list(range(48))
+)
 HC, HS = 4, 2560
 EPS = 1e-6
 
@@ -103,7 +109,8 @@ targets = [
 targets.append(("model.language_model.hyper_connection_mixer", "mixer "))
 targets += [
     (f"mtp.layers.{i}.{k}_hyper_connection", f"MTP{i}.{k} ")
-    for i in LAYERS if i == 0
+    for i in LAYERS
+    if i == 0
     for k in ("attn", "mlp")
 ]
 targets.append(("mtp.hyper_connection_mixer", "MTPmixer"))
@@ -122,15 +129,17 @@ for base, tag in targets:
     gain = (1.0 + wn).reshape(HC, HS)
     gain_min, gain_max = min(gain_min, gain.min()), max(gain_max, gain.max())
     rng = np.random.default_rng(hash(tag) % 2**31)
-    Xr = (torch.from_numpy(rng.standard_normal((L, HC, HS)))
-          * gain).bfloat16().float()                     # raw hyper input
+    Xr = (
+        (torch.from_numpy(rng.standard_normal((L, HC, HS))) * gain).bfloat16().float()
+    )  # raw hyper input
     g = torch.rsqrt((Xr * Xr).mean(-1, keepdim=True) + EPS)  # [L,HC,1]
     xg = (Xr * gain.unsqueeze(0) * g).bfloat16().flatten(-2)  # norm(x)
     Wu_dq = deq(Wu)
 
     ref = mix_from_down(
         torch.nn.functional.linear(xg.float(), Wd.float()),
-        Wu_dq, xg,
+        Wu_dq,
+        xg,
     ).float()
 
     # direct (shipped): deq(Wd) on the normed tensor
@@ -139,20 +148,21 @@ for base, tag in targets:
 
     # foldrq: (1+wn) folded into Wd columns + requant; rsqrt after the GEMM,
     # per-branch partials (exactly _mix_folded on packed tiles)
-    Wd_fold = (Wd.reshape(HC, HS).T if False else
-               (Wd * gain.reshape(1, HC * HS)))
+    Wd_fold = Wd.reshape(HC, HS).T if False else (Wd * gain.reshape(1, HC * HS))
     Wd_fold_dq = deq(Wd_fold)
     partials = torch.matmul(
-        Xr.bfloat16().transpose(0, 1),                  # [HC, L, HS]
+        Xr.bfloat16().transpose(0, 1),  # [HC, L, HS]
         Wd_fold_dq.view(320, HC, HS).permute(1, 2, 0),  # [HC, HS, 320]
-    )                                                   # [HC, L, 320]
-    h_fold = torch.einsum("bnl,nb->nl", partials.float(), g.flatten(1))  # /HC inside mix_from_down
-    e_fq = ((mix_from_down(h_fold, Wu_dq, xg) - ref).norm()
-            / ref.norm()).item()
+    )  # [HC, L, 320]
+    h_fold = torch.einsum(
+        "bnl,nb->nl", partials.float(), g.flatten(1)
+    )  # /HC inside mix_from_down
+    e_fq = ((mix_from_down(h_fold, Wu_dq, xg) - ref).norm() / ref.norm()).item()
 
     e_wd_direct = ((deq(Wd).float() - Wd.float()).norm() / Wd.float().norm()).item()
-    e_wd_fold = ((Wd_fold_dq.float() - Wd_fold.float()).norm()
-                 / Wd_fold.float().norm()).item()
+    e_wd_fold = (
+        (Wd_fold_dq.float() - Wd_fold.float()).norm() / Wd_fold.float().norm()
+    ).item()
     rows.append((tag, e_dir, e_fq, e_wd_direct, e_wd_fold))
 
 d = np.array([[r[1], r[2], r[3], r[4]] for r in rows])

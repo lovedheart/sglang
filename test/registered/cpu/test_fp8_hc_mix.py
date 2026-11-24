@@ -23,7 +23,7 @@ from sglang.srt.layers.hyperconnection import GatedResidual, HyperConnectionConf
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=15, suite="extra-test-cpu-intel")
 
 HC, HS, LOWRANK = 4, 512, 320  # K = HC*HS = 2048: %32 == 0 and %2048 == 0
 
@@ -101,17 +101,13 @@ class TestHcMixSwap(CustomTestCase):
             if isinstance(mod, GatedResidual) and hasattr(mod, "input_mix_weight_down"):
                 normed = mod.hc_norm(self.x)
                 t = torch.nn.functional.silu(
-                    torch.nn.functional.linear(
-                        normed, mod.input_mix_weight_down.weight
-                    )
+                    torch.nn.functional.linear(normed, mod.input_mix_weight_down.weight)
                     / HC
                 )
                 gate = torch.sigmoid(
                     torch.nn.functional.linear(t, mod.input_mix_weight_up.weight)
                 ).unflatten(-1, (HC, HS))
-                self.ref[name] = (
-                    gate * normed.unflatten(-1, (HC, HS))
-                ).mean(-2)
+                self.ref[name] = (gate * normed.unflatten(-1, (HC, HS))).mean(-2)
 
     def test_exclusions_and_forward_equivalence(self):
         n = quantize_hc_mix_to_mxfp8(self.model, last_layer=2)

@@ -106,9 +106,7 @@ def _hc_mix_fp8_persistent_kernel(
             mask=mask_n[:, None],
             other=127,
         )
-        w = _mxfp8_tile_to_bf16(
-            w8, ws, BLOCK_N, BLOCK_K // 32, x_ptr.dtype.element_ty
-        )
+        w = _mxfp8_tile_to_bf16(w8, ws, BLOCK_N, BLOCK_K // 32, x_ptr.dtype.element_ty)
         acc = tl.dot(xt, tl.trans(w))
         tl.atomic_add(
             t_raw_ptr + offs_m[:, None] * LOWRANK + n[None, :],
@@ -274,9 +272,7 @@ def _hc_mix_fp8_persistent_fold_kernel(
         )
         wn_k = tl.load(wn_ptr + k, mask=k < K, other=0.0)
         w = (
-            _mxfp8_tile_to_bf16(
-                w8, ws, BLOCK_N, BLOCK_K // 32, x_ptr.dtype.element_ty
-            )
+            _mxfp8_tile_to_bf16(w8, ws, BLOCK_N, BLOCK_K // 32, x_ptr.dtype.element_ty)
             * wn_k[None, :]
         ).to(x_ptr.dtype.element_ty)
         ss_b = tl.load(ss_ptr + offs_m * HC + b, mask=mask_m, other=1.0)
@@ -430,9 +426,11 @@ def fused_hc_mix_fold_fp8_supported(
     w_down_scale,
     w_up_scale,
 ) -> bool:
-    return _inputs_ok(hyper_input) and _weights_ok(
-        w_down, w_down_scale, hyper_input.dtype
-    ) and _weights_ok(w_up, w_up_scale, hyper_input.dtype)
+    return (
+        _inputs_ok(hyper_input)
+        and _weights_ok(w_down, w_down_scale, hyper_input.dtype)
+        and _weights_ok(w_up, w_up_scale, hyper_input.dtype)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -581,7 +579,10 @@ def _hc_mix_a8w8_up_kernel(
                 other=0.0,
             )
             asf = tl.load(
-                tsf_ptr + offs_m[:, None] * (LOWRANK // 32) + r0 // 32 + offs_g[None, :],
+                tsf_ptr
+                + offs_m[:, None] * (LOWRANK // 32)
+                + r0 // 32
+                + offs_g[None, :],
                 mask=mask_m[:, None],
                 other=127,
             )
@@ -598,7 +599,9 @@ def _hc_mix_a8w8_up_kernel(
             acc = tl.dot_scaled(a, asf, "e4m3", b, bsf, "e4m3", acc)
         gate = tl.sigmoid(acc)
         n_i = tl.load(
-            n_ptr + offs_m[:, None].to(tl.int64) * (HC * HS) + (i * HS + offs_j)[None, :],
+            n_ptr
+            + offs_m[:, None].to(tl.int64) * (HC * HS)
+            + (i * HS + offs_j)[None, :],
             mask=mask_m[:, None] & mask_j[None, :],
             other=0.0,
         ).to(tl.float32)

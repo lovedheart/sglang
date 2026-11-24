@@ -64,20 +64,27 @@ def make_nvfp4_weights():
         n_e = min(slab, E - st)
         g = torch.randn(n_e * 2 * I, H, device="cuda", dtype=torch.bfloat16) * 0.05
         p, sf = fp4_quantize(g, ones, is_sf_swizzled_layout=True)
-        w13[st:st + n_e] = p.view(torch.uint8).view(n_e, 2 * I, H // 2)
-        s13[st:st + n_e] = sf.view(torch.uint8).view(n_e, 2 * I, H // 16)
+        w13[st : st + n_e] = p.view(torch.uint8).view(n_e, 2 * I, H // 2)
+        s13[st : st + n_e] = sf.view(torch.uint8).view(n_e, 2 * I, H // 16)
         del g, p, sf
         g = torch.randn(n_e * H, I, device="cuda", dtype=torch.bfloat16) * 0.05
         p, sf = fp4_quantize(g, ones, is_sf_swizzled_layout=True)
-        w2[st:st + n_e] = p.view(torch.uint8).view(n_e, H, I // 2)
-        s2[st:st + n_e] = sf.view(torch.uint8).view(n_e, H, I // 16)
+        w2[st : st + n_e] = p.view(torch.uint8).view(n_e, H, I // 2)
+        s2[st : st + n_e] = sf.view(torch.uint8).view(n_e, H, I // 16)
         del g, p, sf
     gs13 = (10 ** torch.empty(E, device="cuda").uniform_(-3, -2)).float()
     gs2 = (10 ** torch.empty(E, device="cuda").uniform_(-3, -2)).float()
     return dict(
-        w13=w13, gs13=gs13, w2=w2, gs2=gs2,
-        w13_sf=_swizzle_sf(s13).view(E, -1, (H // 16 + 3) // 4 * 4).view(torch.float8_e4m3fn),
-        w2_sf=_swizzle_sf(s2).view(E, -1, (I // 16 + 3) // 4 * 4).view(torch.float8_e4m3fn),
+        w13=w13,
+        gs13=gs13,
+        w2=w2,
+        gs2=gs2,
+        w13_sf=_swizzle_sf(s13)
+        .view(E, -1, (H // 16 + 3) // 4 * 4)
+        .view(torch.float8_e4m3fn),
+        w2_sf=_swizzle_sf(s2)
+        .view(E, -1, (I // 16 + 3) // 4 * 4)
+        .view(torch.float8_e4m3fn),
     )
 
 
@@ -99,25 +106,33 @@ def make_nvfp4_slabs():
         n_e = min(slab, E - st)
         g = torch.randn(n_e * 2 * I, H, device="cuda", dtype=torch.bfloat16) * 0.05
         p, sf = fp4_quantize(g, ones, is_sf_swizzled_layout=True)
-        w13[st:st + n_e] = p.view(torch.uint8).view(n_e, 2 * I, H // 2)
-        s13[st:st + n_e] = sf.view(torch.uint8).view(n_e, 2 * I, H // 16)
+        w13[st : st + n_e] = p.view(torch.uint8).view(n_e, 2 * I, H // 2)
+        s13[st : st + n_e] = sf.view(torch.uint8).view(n_e, 2 * I, H // 16)
         del g, p, sf
         g = torch.randn(n_e * H, I, device="cuda", dtype=torch.bfloat16) * 0.05
         p, sf = fp4_quantize(g, ones, is_sf_swizzled_layout=True)
-        w2[st:st + n_e] = p.view(torch.uint8).view(n_e, H, I // 2)
-        s2[st:st + n_e] = sf.view(torch.uint8).view(n_e, H, I // 16)
+        w2[st : st + n_e] = p.view(torch.uint8).view(n_e, H, I // 2)
+        s2[st : st + n_e] = sf.view(torch.uint8).view(n_e, H, I // 16)
         del g, p, sf
 
     def _mma(sf_lin, n_rows, k):
         return torch.stack(
-            [convert_sf_to_mma_layout(sf_lin[e], m=n_rows, k=k, num_groups=1,
-                                      sf_vec_size=16)[..., 0] for e in range(E)], -1
+            [
+                convert_sf_to_mma_layout(
+                    sf_lin[e], m=n_rows, k=k, num_groups=1, sf_vec_size=16
+                )[..., 0]
+                for e in range(E)
+            ],
+            -1,
         )
 
     out = dict(
-        w13=w13, gs13=torch.ones(E, dtype=torch.float32, device="cuda"),
-        w2=w2, gs2=torch.ones(E, dtype=torch.float32, device="cuda"),
-        w13_sf=_mma(s13, 2 * I, H), w2_sf=_mma(s2, H, I),
+        w13=w13,
+        gs13=torch.ones(E, dtype=torch.float32, device="cuda"),
+        w2=w2,
+        gs2=torch.ones(E, dtype=torch.float32, device="cuda"),
+        w13_sf=_mma(s13, 2 * I, H),
+        w2_sf=_mma(s2, H, I),
     )
     del s13, s2
     return out
@@ -137,28 +152,40 @@ def make_mxfp4_weights():
     for st in range(0, E, slab):
         n_e = min(slab, E - st)
         gu = torch.randn(2 * n_e * I, H, device="cuda", dtype=torch.bfloat16) * 0.05
-        pg, sg = mxfp4_quantize(gu[: n_e * I])   # gate half
-        pu, su = mxfp4_quantize(gu[n_e * I:])    # up half
+        pg, sg = mxfp4_quantize(gu[: n_e * I])  # gate half
+        pu, su = mxfp4_quantize(gu[n_e * I :])  # up half
         # b12x wants [up; gate] row order
-        w13[st:st + n_e] = torch.cat([pu, pg], 0).view(n_e, 2 * I, H // 2)
-        s13[st:st + n_e] = torch.cat([su, sg], 0).view(n_e, 2 * I, H // 32)
+        w13[st : st + n_e] = torch.cat([pu, pg], 0).view(n_e, 2 * I, H // 2)
+        s13[st : st + n_e] = torch.cat([su, sg], 0).view(n_e, 2 * I, H // 32)
         del gu, pg, sg, pu, su
         g = torch.randn(n_e * H, I, device="cuda", dtype=torch.bfloat16) * 0.05
         p, sf = mxfp4_quantize(g)
-        w2[st:st + n_e], s2[st:st + n_e] = p.view(n_e, H, I // 2), sf.view(n_e, H, I // 32)
+        w2[st : st + n_e], s2[st : st + n_e] = (
+            p.view(n_e, H, I // 2),
+            sf.view(n_e, H, I // 32),
+        )
         del g, p, sf
 
     def _mma(sf_lin, n_rows, k):
         return torch.stack(
-            [convert_sf_to_mma_layout(sf_lin[e], m=n_rows, k=k, num_groups=1,
-                                      sf_vec_size=32)[..., 0] for e in range(E)], -1
+            [
+                convert_sf_to_mma_layout(
+                    sf_lin[e], m=n_rows, k=k, num_groups=1, sf_vec_size=32
+                )[..., 0]
+                for e in range(E)
+            ],
+            -1,
         )
 
     out = dict(
-        w13=w13, gs13=torch.ones(E, dtype=torch.float32, device="cuda"),
-        w2=w2, gs2=torch.ones(E, dtype=torch.float32, device="cuda"),
-        w13_sf=_mma(s13, 2 * I, H), w2_sf=_mma(s2, H, I),
-        w13_sf_plain=s13, w2_sf_plain=s2,   # [E,N,K/32] for the fp4_e8m0_k32 arm
+        w13=w13,
+        gs13=torch.ones(E, dtype=torch.float32, device="cuda"),
+        w2=w2,
+        gs2=torch.ones(E, dtype=torch.float32, device="cuda"),
+        w13_sf=_mma(s13, 2 * I, H),
+        w2_sf=_mma(s2, H, I),
+        w13_sf_plain=s13,
+        w2_sf_plain=s2,  # [E,N,K/32] for the fp4_e8m0_k32 arm
     )
     return out
 
@@ -169,9 +196,19 @@ def make_b12x_arm(W, quant_mode="w4a16"):
 
     def call(x, ids, wts, out):
         return b12x_fused_moe(
-            x, W["w13"], W["w13_sf"], W["w2"], W["w2_sf"], ids, wts, E, TOPK,
-            w1_alpha=W["gs13"], w2_alpha=W["gs2"],
-            output=out, quant_mode=quant_mode,
+            x,
+            W["w13"],
+            W["w13_sf"],
+            W["w2"],
+            W["w2_sf"],
+            ids,
+            wts,
+            E,
+            TOPK,
+            w1_alpha=W["gs13"],
+            w2_alpha=W["gs2"],
+            output=out,
+            quant_mode=quant_mode,
         )
 
     return call
@@ -188,16 +225,28 @@ def make_b12x_mxfp4_wrapper_arm(M, max_tokens, quant_mode="mxfp4"):
         # MXFP4 weights, BF16 activations: b12x W4A16 arm with E8M0 K/32 scales
         quant_mode, sf = "w4a16", "fp4_e8m0_k32"
     w = B12xMoEWrapper(
-        num_experts=E, top_k=TOPK, hidden_size=H, intermediate_size=I,
-        use_cuda_graph=True, max_num_tokens=max_tokens, quant_mode=quant_mode,
+        num_experts=E,
+        top_k=TOPK,
+        hidden_size=H,
+        intermediate_size=I,
+        use_cuda_graph=True,
+        max_num_tokens=max_tokens,
+        quant_mode=quant_mode,
         source_format=sf,
     )
 
     def call(x, ids, wts, out):
         r = w.run(
-            x=x, w1_weight=M["w13"], w1_weight_sf=M["w13_sf"], w1_alpha=M["gs13"],
-            w2_weight=M["w2"], w2_weight_sf=M["w2_sf"], w2_alpha=M["gs2"],
-            token_selected_experts=ids, token_final_scales=wts, **kw,
+            x=x,
+            w1_weight=M["w13"],
+            w1_weight_sf=M["w13_sf"],
+            w1_alpha=M["gs13"],
+            w2_weight=M["w2"],
+            w2_weight_sf=M["w2_sf"],
+            w2_alpha=M["gs2"],
+            token_selected_experts=ids,
+            token_final_scales=wts,
+            **kw,
         )
         out[: x.shape[0]].copy_(r)
         return out
@@ -213,8 +262,12 @@ def make_sm12x_arm(W):
     )
 
     qi = Sm12xNvfp4W4A16MoeQuantInfo(
-        w13=W["w13"], w13_sf=W["w13_sf"], w13_gs=W["gs13"],
-        w2=W["w2"], w2_sf=W["w2_sf"], w2_gs=W["gs2"],
+        w13=W["w13"],
+        w13_sf=W["w13_sf"],
+        w13_gs=W["gs13"],
+        w2=W["w2"],
+        w2_sf=W["w2_sf"],
+        w2_gs=W["gs2"],
     )
 
     class TK:
@@ -247,14 +300,21 @@ def make_w2a16_arm():
     for mod in ("ts4", "cubin"):
         p = f"/tmp/w2a16_{mod}.py"
         subprocess.run(
-            ["git", "-C", "/home/lovedheart/sglang-fork-dev", "show",
-             f"{ref}:python/sglang/srt/layers/moe/w2a16/{mod}.py"],
-            stdout=open(p, "w"), check=True,
+            [
+                "git",
+                "-C",
+                "/home/lovedheart/sglang-fork-dev",
+                "show",
+                f"{ref}:python/sglang/srt/layers/moe/w2a16/{mod}.py",
+            ],
+            stdout=open(p, "w"),
+            check=True,
         )
 
     def load(name):
         spec = importlib.util.spec_from_file_location(
-            f"w2a16_{name}", f"/tmp/w2a16_{name}.py")
+            f"w2a16_{name}", f"/tmp/w2a16_{name}.py"
+        )
         m = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(m)
         return m
@@ -294,10 +354,19 @@ def make_sm12x_w4a4_arm(W):
                 T, H, I, E, TOPK, True, torch.device("cuda")
             )
         return run_moe_w4a4(
-            x, ids, wts,
-            W["w13"], W["w13_sf"], W["gs13"],
-            W["w2"], W["w2_sf"], W["gs2"],
-            _A13_GS, _A2_GS, out, workspace=ws_cache[T],
+            x,
+            ids,
+            wts,
+            W["w13"],
+            W["w13_sf"],
+            W["gs13"],
+            W["w2"],
+            W["w2_sf"],
+            W["gs2"],
+            _A13_GS,
+            _A2_GS,
+            out,
+            workspace=ws_cache[T],
         )
 
     return call
@@ -335,22 +404,42 @@ def bench_graph(fn, T, iters=50):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", default="1,2,4,8,16,32")
-    ap.add_argument("--w2a16", action="store_true",
-                    help="also run the w2a16_offload cubin arm (context only)")
-    ap.add_argument("--b12x-mxfp4", action="store_true",
-                    help="also run b12x MXFP4 W4A4 (random mxfp4 weights)")
-    ap.add_argument("--sm12x-w4a4", action="store_true",
-                    help="also run sm12x sibling NVFP4 W4A4 prefill kernel")
-    ap.add_argument("--wrapper-mxfp4", action="store_true",
-                    help="b12x mxfp4 via B12xMoEWrapper (preallocated graph buffers)")
-    ap.add_argument("--b12x-nvfp4-w4a4", action="store_true",
-                    help="also run b12x NVFP4 W4A4 (same weights as sm12x arms)")
-    ap.add_argument("--b12x-mxfp4-w4a16", action="store_true",
-                    help="also run b12x W4A16 on MXFP4 (e8m0 k32) weights")
+    ap.add_argument(
+        "--w2a16",
+        action="store_true",
+        help="also run the w2a16_offload cubin arm (context only)",
+    )
+    ap.add_argument(
+        "--b12x-mxfp4",
+        action="store_true",
+        help="also run b12x MXFP4 W4A4 (random mxfp4 weights)",
+    )
+    ap.add_argument(
+        "--sm12x-w4a4",
+        action="store_true",
+        help="also run sm12x sibling NVFP4 W4A4 prefill kernel",
+    )
+    ap.add_argument(
+        "--wrapper-mxfp4",
+        action="store_true",
+        help="b12x mxfp4 via B12xMoEWrapper (preallocated graph buffers)",
+    )
+    ap.add_argument(
+        "--b12x-nvfp4-w4a4",
+        action="store_true",
+        help="also run b12x NVFP4 W4A4 (same weights as sm12x arms)",
+    )
+    ap.add_argument(
+        "--b12x-mxfp4-w4a16",
+        action="store_true",
+        help="also run b12x W4A16 on MXFP4 (e8m0 k32) weights",
+    )
     args = ap.parse_args()
     Ts = [int(t) for t in args.tokens.split(",")]
 
-    print(f"device={torch.cuda.get_device_name()} cap={torch.cuda.get_device_capability()}")
+    print(
+        f"device={torch.cuda.get_device_name()} cap={torch.cuda.get_device_capability()}"
+    )
     print(f"geometry: E={E} H={H} I={I} topk={TOPK} | graph-replay median us\n")
 
     arms = {}
@@ -380,7 +469,8 @@ def main():
             N = make_nvfp4_slabs()
             if args.wrapper_mxfp4:
                 arms["b12x_nvfp4_w4a4"] = make_b12x_mxfp4_wrapper_arm(
-                    N, max(Ts), "nvfp4")
+                    N, max(Ts), "nvfp4"
+                )
                 del N
             else:
                 arms["b12x_nvfp4_w4a4"] = make_b12x_arm(N, "nvfp4")
@@ -391,7 +481,8 @@ def main():
             M2 = make_mxfp4_weights()
             M2["w13_sf"], M2["w2_sf"] = M2.pop("w13_sf_plain"), M2.pop("w2_sf_plain")
             arms["b12x_mxfp4_w4a16"] = make_b12x_mxfp4_wrapper_arm(
-                M2, max(Ts), "w4a16_e8m0")
+                M2, max(Ts), "w4a16_e8m0"
+            )
             del M2
         except Exception as ex:
             print(f"[warn] b12x mxfp4-w4a16 arm: {type(ex).__name__}: {ex}")

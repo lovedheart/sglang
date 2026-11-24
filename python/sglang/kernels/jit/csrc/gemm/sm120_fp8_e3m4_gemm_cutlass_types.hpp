@@ -11,13 +11,13 @@
 // bits are patched e4m3 -> e3m4 post-hoc by mix3.py 0 2.
 #pragma once
 
-#include <cutlass/cutlass.h>
 #include <cute/tensor.hpp>
-#include <cutlass/gemm/collective/collective_builder.hpp>
+#include <cutlass/cutlass.h>
+#include <cutlass/detail/blockwise_scale_layout.hpp>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
+#include <cutlass/gemm/collective/collective_builder.hpp>
 #include <cutlass/gemm/device/gemm_universal.h>
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
-#include <cutlass/detail/blockwise_scale_layout.hpp>
 #include <cutlass/kernel_hardware_info.h>
 #include <cutlass/version.h>
 
@@ -36,8 +36,8 @@ namespace sglang::e3m4_cutlass {
 
 using namespace cute;
 
-using ElementA = cutlass::float_e4m3_t;   // activations (patched: stays e4m3)
-using ElementB = cutlass::float_e4m3_t;   // weights (QMMA B-format patched -> e3m4)
+using ElementA = cutlass::float_e4m3_t;  // activations (patched: stays e4m3)
+using ElementB = cutlass::float_e4m3_t;  // weights (QMMA B-format patched -> e3m4)
 using ElementD = cutlass::bfloat16_t;
 using ElementC = void;
 using LayoutATag = cutlass::layout::RowMajor;
@@ -64,7 +64,7 @@ constexpr int AlignmentC = AlignmentD;
 // with this same choice). majorSFB = Major::K -> [N/128, K/128], w_scale as-is.
 // ScaleGranularity = MmaTile / ScalesPerTile, same as the blockwise path.
 constexpr int ScaleMsPerTile = size<0>(ScalesPerTile{});
-constexpr int ScaleGranularityM = size<0>(MmaTileShape{}) / ScaleMsPerTile;  // 1
+constexpr int ScaleGranularityM = size<0>(MmaTileShape{}) / ScaleMsPerTile;            // 1
 constexpr int ScaleGranularityN = size<1>(MmaTileShape{}) / size<1>(ScalesPerTile{});  // 128
 constexpr int ScaleGranularityK = size<2>(MmaTileShape{}) / size<2>(ScalesPerTile{});  // 128
 
@@ -115,8 +115,7 @@ using GemmKernelVoid =
     cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
 // Persistent cooperative StreamK: splits K across the 188-SM grid for tall
 // shapes; get_workspace_size > 0, cleared in run() before each launch.
-using GemmKernelStreamK =
-    cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue,
-                                          cutlass::gemm::StreamKScheduler>;
+using GemmKernelStreamK = cutlass::gemm::kernel::
+    GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, cutlass::gemm::StreamKScheduler>;
 
 }  // namespace sglang::e3m4_cutlass

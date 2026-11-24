@@ -1536,8 +1536,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # Neutral (1.0, 0.0, inf) SwiGLU for plain-SiLU models, GPT-OSS
         # scalars otherwise -- same encoding as the CUTLASS sm120 path.
         cfg = layer.moe_runner_config
-        alpha, beta, limit = getattr(cfg, "gemm1_alpha", None), None, getattr(
-            cfg, "gemm1_clamp_limit", None
+        alpha, beta, limit = (
+            getattr(cfg, "gemm1_alpha", None),
+            None,
+            getattr(cfg, "gemm1_clamp_limit", None),
         )
         beta = getattr(cfg, "gemm1_beta", None)
         if alpha is None and limit is None:

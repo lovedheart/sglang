@@ -61,7 +61,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.utils.log_utils import print_info_once, print_warning_once
+from sglang.srt.utils.log_utils import print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
@@ -1665,10 +1665,10 @@ def _e3m4_block_linear(
 ) -> Optional[torch.Tensor]:
     """SM120 e3m4-weight block-fp8 linear, or None if it does not qualify."""
     from sglang.kernels.ops.gemm.sm120_fp8_e3m4 import (
-        sm120_fp8_e3m4_gemv,
         sm120_fp8_e3m4_gemm,
-        use_sm120_fp8_e3m4_gemv,
+        sm120_fp8_e3m4_gemv,
         use_sm120_fp8_e3m4_gemm,
+        use_sm120_fp8_e3m4_gemv,
     )
 
     n, k = weight.shape
