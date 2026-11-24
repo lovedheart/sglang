@@ -380,6 +380,19 @@ def host_only_mamba_checkpoint() -> bool:
     return True
 
 
+def int8_ckpt_offload() -> bool:
+    """Whether the int8 checkpoint pool spans GPU + pinned-RAM tiers.
+
+    Like a host-only checkpoint, a RAM checkpoint is a tree value in the
+    host slot, so the tree cores must count it as a match.
+    """
+    mamba = get_exec().mamba
+    return bool(
+        mamba.enable_int8_mamba_checkpoint
+        and mamba.enable_int8_mamba_checkpoint_offload
+    )
+
+
 def _draft_quant_config(draft_model_config: ModelConfig):
     """The quant config the draft model keeps once built, which its `auto` KV
     cache dtype resolves from; read before the draft loads."""

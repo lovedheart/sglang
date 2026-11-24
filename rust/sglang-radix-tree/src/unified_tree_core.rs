@@ -5464,6 +5464,47 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(self.arena.try_device_value(node_id, component_type))
     }
 
+    /// A component's host value on a node, if set.
+    pub fn get_component_host_value(
+        &self,
+        node_id: NodeId,
+        component_type: ComponentType,
+    ) -> Result<Option<&Tensor>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        self.assert_component_enabled_(component_type);
+        Ok(self.arena.node(node_id).try_host_value(component_type))
+    }
+
+    /// Take a component's host value off the node, detaching it from the host
+    /// LRU, and return it; None when unset. Lets python free a RAM checkpoint
+    /// slot that a device commit superseded.
+    pub fn clear_component_host_value(
+        &mut self,
+        node_id: NodeId,
+        component_type: ComponentType,
+    ) -> Result<Option<Tensor>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        self.assert_component_enabled_(component_type);
+        if !self.arena.node(node_id).has_host_value(component_type) {
+            return Ok(None);
+        }
+        let mut device_frees = HashMap::new();
+        let mut host_frees = HashMap::new();
+        let mut cache_actions = CacheActions::default();
+        self.evict_component_and_detach_lru_(
+            node_id,
+            component_type,
+            &mut device_frees,
+            &mut host_frees,
+            &mut cache_actions,
+            EvictLayer::Host,
+            None,
+        );
+        Ok(host_frees
+            .remove(&component_type)
+            .and_then(|values| values.into_iter().next()))
+    }
+
     /// Whether the component's data is device-evicted but host-backed.
     pub fn component_has_host_value_only(
         &self,

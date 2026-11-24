@@ -3,8 +3,8 @@
 use super::*;
 use crate::cache_action::{
     BackupKV, FreeComponentDeviceSlot, FreeComponentHostSlot, FreeDeviceKV, FreeDeviceKVFullOnly,
-    MambaEvictExcessPathStates, RebuildFullToSwaMapping, RecoverSwaWithLockedFull, SwaRebuild,
-    UpdatePendingBackupOnNodeSplit,
+    MambaEvictExcessPathStates, MambaReleaseSupersededHostValue, RebuildFullToSwaMapping,
+    RecoverSwaWithLockedFull, SwaRebuild, UpdatePendingBackupOnNodeSplit,
 };
 
 impl FreeDeviceKV {
@@ -48,6 +48,13 @@ impl MambaEvictExcessPathStates {
     pub(crate) fn into_py_tagged(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let tag = self.tag();
         (tag, self.tail_node_id).into_py_any(py)
+    }
+}
+
+impl MambaReleaseSupersededHostValue {
+    pub(crate) fn into_py_tagged(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let tag = self.tag();
+        (tag, self.node_id).into_py_any(py)
     }
 }
 

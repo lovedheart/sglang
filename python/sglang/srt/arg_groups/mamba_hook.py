@@ -77,6 +77,15 @@ def handle_int8_mamba_checkpoint(server_args: Any):
     # checkpoint slots as bf16 active slots (wrong pool / out-of-range).
     # Reject the combination up front rather than silently corrupting state.
     cfg = resolving_view(server_args)
+    if not cfg.enable_int8_mamba_checkpoint and (
+        cfg.enable_int8_mamba_checkpoint_offload
+        or cfg.int8_mamba_ckpt_host_size is not None
+    ):
+        raise ValueError(
+            "--enable-int8-mamba-checkpoint-offload / "
+            "--int8-mamba-ckpt-host-size require --enable-int8-mamba-checkpoint: "
+            "the RAM tier is an extension of the int8 checkpoint pool."
+        )
     if not cfg.enable_int8_mamba_checkpoint:
         return
     if cfg.enable_hierarchical_cache:
@@ -84,6 +93,15 @@ def handle_int8_mamba_checkpoint(server_args: Any):
             "--enable-int8-mamba-checkpoint is not supported together with "
             "--enable-hierarchical-cache: the host-offload path "
             "is not int8-aware. Disable one of them."
+        )
+    if cfg.disaggregation_decode_retraction_backup == "host_pool":
+        # host_pool brings up the HiCache controller through the retraction
+        # backup, a second door to the same not-int8-aware loader.
+        raise ValueError(
+            "--enable-int8-mamba-checkpoint is not supported together with "
+            "--disaggregation-decode-retraction-backup=host_pool: the "
+            "retraction backup starts the HiCache controller, whose host "
+            "mamba pool is not int8-aware. Use cpu_tensor (or none) instead."
         )
     if cfg.radix_cache_backend is not None:
         raise ValueError(
@@ -101,6 +119,23 @@ def handle_int8_mamba_checkpoint(server_args: Any):
             "--enable-int8-mamba-checkpoint is not supported together with "
             "--enable-unified-memory: the unified pool keeps no int8 checkpoint "
             "pool, so the flag would have no effect. Disable one of them."
+        )
+    if cfg.enable_int8_mamba_checkpoint_offload:
+        if cfg.int8_mamba_ckpt_host_size is None or cfg.int8_mamba_ckpt_host_size <= 0:
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint-offload requires a positive "
+                "--int8-mamba-ckpt-host-size (number of pinned-RAM checkpoint "
+                "slots for the checkpoint RAM tier)."
+            )
+        if cfg.mamba_radix_cache_strategy not in ("auto", "no_buffer", "extra_buffer"):
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint-offload does not support "
+                f"--mamba-radix-cache-strategy={cfg.mamba_radix_cache_strategy!r}."
+            )
+    elif cfg.int8_mamba_ckpt_host_size is not None:
+        raise ValueError(
+            "--int8-mamba-ckpt-host-size requires "
+            "--enable-int8-mamba-checkpoint-offload."
         )
 
 

@@ -272,6 +272,11 @@ class TreeComponent(ABC):
     def reset_session_state(self) -> None:
         self._session_leaves = defaultdict(set)
 
+    def on_cache_reset(self) -> None:
+        """Whole-cache flush: the tree (and with it every cached value) is
+        dropped wholesale -- without per-value frees -- so component-side
+        ledgers that count tree-owned slots must zero out here."""
+
     def session_ref(self, node: UnifiedTreeNode) -> int:
         return node.component_data[self.component_type].session_ref
 

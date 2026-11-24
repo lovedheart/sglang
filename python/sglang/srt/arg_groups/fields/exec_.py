@@ -698,6 +698,19 @@ class ExecMamba(msgspec.Struct):
         Optional[int],
         "Number of int8 mamba checkpoint slots (default: 2x the active mamba pool size).",
     ] = None
+    enable_int8_mamba_checkpoint_offload: A[
+        bool,
+        "Extend the int8 mamba checkpoint pool with a pinned-RAM tier: one logical "
+        "pool whose GPU tier spills to RAM (async D2H) instead of rejecting, and "
+        "whose RAM checkpoints are promoted back to GPU on a prefix hit. Requires "
+        "--enable-int8-mamba-checkpoint and --int8-mamba-ckpt-host-size.",
+    ] = False
+    int8_mamba_ckpt_host_size: A[
+        Optional[int],
+        "Number of pinned-RAM checkpoint slots in the RAM tier of the int8 mamba "
+        "checkpoint pool; required positive with "
+        "--enable-int8-mamba-checkpoint-offload.",
+    ] = None
     linear_attn_backend: A[
         str,
         Arg(

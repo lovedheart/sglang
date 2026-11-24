@@ -849,6 +849,21 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def get_component_host_value(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> Optional[torch.Tensor]:
+        """The component's host value on the node, or None if absent."""
+        ...
+
+    def clear_component_host_value(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> Optional[torch.Tensor]:
+        """Take the component's host value off the node (detaching it from the
+        host LRU) and return it, or None if absent. Only needed by cores that
+        defer the free to a cache action; unset default keeps others inert."""
+        return None
+
+    @abstractmethod
     def component_has_host_value_only(
         self, node_id: NodeId, component_type: ComponentType
     ) -> bool:

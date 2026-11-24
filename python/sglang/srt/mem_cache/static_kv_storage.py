@@ -653,6 +653,12 @@ class StaticKVStorage:
         their own rather than in state slots."""
         return self._allocator.state.ckpt_pool is not None
 
+    def checkpoint_pool(self, sub_pool: str):
+        """The quantized checkpoint pool serving ``sub_pool`` (None without
+        one). Its allocator spans the GPU and (with the offload feature) the
+        pinned-RAM tiers; ids are logical across both."""
+        return self._allocator.state.ckpt_pool
+
     def take_checkpoint_slot(self, sub_pool: str) -> Optional[torch.Tensor]:
         return self._allocator.state.ckpt_pool.alloc(1)
 
