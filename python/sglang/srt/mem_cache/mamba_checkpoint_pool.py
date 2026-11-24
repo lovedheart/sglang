@@ -96,6 +96,15 @@ def _fused_ckpt_kernels():
 
 logger = logging.getLogger(__name__)
 
+# Private staging rows a RAM spill cycles through (see MambaCheckpointPool.
+# __init__). 4 rows overlap up to 3 queued D2Hs with decode compute at a cost
+# of ~3 extra int8 rows (~15 MB on Qwen3.8-Flash-Next).
+_STAGING_RING_DEPTH = 4
+
+# Pending side-state spills cycle through this many sets of pinned scratches
+# (see MambaCheckpointPool._spill_sides_to_host).
+_SIDES_RING_DEPTH = 4
+
 
 class Int8CheckpointStore:
     """int8 store for cached multi-layer linear-attn states.
@@ -115,6 +124,14 @@ class Int8CheckpointStore:
 
     ``buffer_factory(shape, dtype)``, when given, allocates the planes (the RAM
     tier passes a pinned-memory allocator; nothing else should need it).
+
+    ``row_major`` (RAM tier): store each slot's full state CONTIGUOUS on the
+    host ([slots, L, H, d_v, d_k] base) so a tier crossing is one contiguous
+    cudaMemcpy per plane. Scattered per-layer slices cost ~4x the link
+    bandwidth (measured) for the same bytes. The public ``qdata``/``scale``
+    stay the logical [L, slots, ...] shape via permuted views, so every
+    stride-walking reader is unchanged; the row-major bases live on
+    ``qdata_base``/``scale_base``.
     """
 
     QMAX = 127
@@ -130,6 +147,7 @@ class Int8CheckpointStore:
         device: str,
         scale_dtype: torch.dtype = torch.bfloat16,
         buffer_factory=None,
+        row_major: bool = False,
     ):
         self.num_layers = num_layers
         self.num_slots = num_slots
@@ -140,12 +158,22 @@ class Int8CheckpointStore:
         alloc = buffer_factory or (
             lambda shape, dtype: torch.empty(shape, dtype=dtype, device=device)
         )
-        self.qdata = alloc(
-            (num_layers, num_slots, num_heads, head_v_dim, head_k_dim), torch.int8
-        )
-        self.scale = alloc(
-            (num_layers, num_slots, num_heads, 1, head_k_dim), scale_dtype
-        )
+        if row_major:
+            self.qdata_base = alloc(
+                (num_slots, num_layers, num_heads, head_v_dim, head_k_dim), torch.int8
+            )
+            self.scale_base = alloc(
+                (num_slots, num_layers, num_heads, 1, head_k_dim), scale_dtype
+            )
+            self.qdata = self.qdata_base.permute(1, 0, 2, 3, 4)
+            self.scale = self.scale_base.permute(1, 0, 2, 3, 4)
+        else:
+            self.qdata_base = self.qdata = alloc(
+                (num_layers, num_slots, num_heads, head_v_dim, head_k_dim), torch.int8
+            )
+            self.scale_base = self.scale = alloc(
+                (num_layers, num_slots, num_heads, 1, head_k_dim), scale_dtype
+            )
 
     # ---- (de)quant math (also usable standalone for probes/tests) ----
 
@@ -247,11 +275,14 @@ class MambaCheckpointPool:
         self.num_slots = num_slots
         self.host_slots = host_slots
         self.device = device
-        # The last GPU row is a private staging reserve for RAM stores (used
-        # only with a host tier): counted in neither tier's free list, so a
-        # logical id never maps to it.
+        # A small ring of private staging rows for RAM stores (used only with
+        # a host tier): counted in neither tier's free list, so a logical id
+        # never maps to them. A single row serialized every spill (the next
+        # store's quantize had to wait the previous D2H on the decode
+        # stream); a ring of K overlaps K-1 D2Hs with compute.
         self.staging_row = num_slots + 1
-        gpu_rows = num_slots + 1 + (1 if host_slots > 0 else 0)
+        self.num_staging = _STAGING_RING_DEPTH if host_slots > 0 else 0
+        gpu_rows = num_slots + 1 + self.num_staging
         self.temporal = Int8CheckpointStore(
             num_layers=num_layers,
             # the store's slot dim IS the row count: slot 0 + one per slot (+ staging)
@@ -301,7 +332,24 @@ class MambaCheckpointPool:
         # Pool-owned copy stream for the tier crossings; H2D events recorded
         # here are waited on by load_to_active before the dequantize.
         self._copy_stream = None
-        self._staging_busy_event = None
+        self._sides_stream = None
+        self._staging_idx = None
+        self._sides_dev_scratch: list = []
+        self._sides_promote_evt: list = []
+        self._sides_spill_scratch: list = []
+        self._sides_spill_evt: list = []
+        self._sides_spill_next = 0
+        self._pack_q = self._pack_s = None
+        self._pack_c: list = []
+        self._host_conv_base: list = []
+        # One busy event per staging ring row: a spill must wait only for the
+        # copy that last read ITS ring row, not for the whole chain.
+        self._staging_busy_events: list = [None] * self.num_staging
+        # Second guard per ring row: the SIDES stream also reads it (async),
+        # so reuse must wait that stream's event too, not just the copy
+        # stream's plane D2H.
+        self._staging_busy_sides: list = [None] * self.num_staging
+        self._staging_next = 0
         # GPU slots owned by RAM->GPU promotions: (slot, H2D event). A slot
         # stays owned until load_to_active consumes it (or a drop site calls
         # release_promotion); an event retiring does NOT free it, because the
@@ -357,20 +405,70 @@ class MambaCheckpointPool:
             device="cpu",
             scale_dtype=scale_dtype,
             buffer_factory=self._alloc_host,
+            row_major=True,
         )
-        # Host rows are per RAM slot (+ dummy row 0), not per GPU slot: rebuild
-        # the shapes from the GPU planes' per-row slices.
-        self.host_conv = [
-            self._alloc_host((c.shape[0], rows) + tuple(c.shape[2:]), c.dtype)
+        # Host rows are per RAM slot (+ dummy row 0), not per GPU slot, and
+        # stored ROW-major (see Int8CheckpointStore.row_major): base [rows, L,
+        # ...] with the logical [L, rows, ...] shape as a permuted view.
+        self._host_conv_base = [
+            self._alloc_host((rows, c.shape[0]) + tuple(c.shape[2:]), c.dtype)
             for c in self.conv
+        ]
+        self.host_conv = [
+            b.permute(1, 0, *range(2, b.dim())) for b in self._host_conv_base
         ]
         self.host_sides = []
         for m, _, dim in self.sides:
             shape = list(m.shape)
             shape[dim] = rows
             self.host_sides.append((self._alloc_host(tuple(shape), m.dtype), dim))
+        self._sides_stream = None
+        self._sides_host_scratch = [None] * len(self.sides)
+        self._sides_dev_scratch = [None] * len(self.sides)
+        self._sides_promote_evt = [None] * len(self.sides)
         if isinstance(self.device, str) and self.device.startswith("cuda"):
             self._copy_stream = torch.cuda.Stream()
+            # Side-state spills run on their own stream: their 150KB D2Hs
+            # must not queue behind the multi-MB plane D2Hs, and publishing
+            # the host rows must never make a spill commit wait on queued
+            # compute (a host sync would drain the decode stream; see
+            # _spill_sides_to_host). Spill scratches live in a ring (one set
+            # per in-flight spill) and the promote pin is a separate buffer,
+            # so no pinned buffer is host-read while another stream writes it.
+            self._sides_stream = torch.cuda.Stream()
+            self._sides_spill_scratch = [[None] * _SIDES_RING_DEPTH for _ in self.sides]
+            self._sides_spill_evt = [None] * _SIDES_RING_DEPTH
+            self._sides_spill_next = 0
+            self._sides_host_scratch = [None] * len(self.sides)
+            # Pre-baked index tensors: torch.tensor([...], device="cuda")
+            # does a pageable H2D that SYNCS the current stream -- in the
+            # spill path that sync waited on the queued D2Hs.
+            self._staging_idx = torch.arange(
+                self.staging_row,
+                self.staging_row + self.num_staging,
+                dtype=torch.int64,
+                device=self.temporal.qdata.device,
+            )
+            # One contiguous device row per plane: tier crossings pack into /
+            # scatter from these so the PCIe leg is a single cudaMemcpy per
+            # plane instead of L strided slices (~4x the bytes on the wire
+            # otherwise, measured). Only ever touched on _copy_stream, which
+            # serializes every crossing, so one set is safe.
+            dev = self.temporal.qdata.device
+            self._pack_q = torch.empty(
+                (num_layers, num_heads, head_v_dim, head_k_dim),
+                dtype=torch.int8,
+                device=dev,
+            )
+            self._pack_s = torch.empty(
+                (num_layers, num_heads, 1, head_k_dim),
+                dtype=self.temporal.scale.dtype,
+                device=dev,
+            )
+            self._pack_c = [
+                torch.empty(c.shape[:1] + tuple(c.shape[2:]), dtype=c.dtype, device=dev)
+                for c in self.conv
+            ]
 
     # ---- tier routing ----
 
@@ -451,8 +549,14 @@ class MambaCheckpointPool:
             # rows; drain the copy stream before those rows re-enter the free
             # lists. Flush runs at request idle, so this wait is cheap.
             self._copy_stream.synchronize()
+        self._publish_sides(blocking=True)
+        if self._sides_spill_evt:
+            self._sides_spill_evt = [None] * _SIDES_RING_DEPTH
+            self._sides_spill_next = 0
         self._pending_promotions = []
-        self._staging_busy_event = None
+        self._staging_busy_events = [None] * self.num_staging
+        self._staging_busy_sides = [None] * self.num_staging
+        self._staging_next = 0
         self.allocator.clear()
 
     def _release_host_registrations(self) -> None:
@@ -525,54 +629,149 @@ class MambaCheckpointPool:
             mirror.index_copy_(dim, ckpt_slots, src.index_select(dim, active_slots))
 
     def _store_to_host(self, active_mamba_pool, active_slots, host_logical) -> None:
-        staging = torch.tensor(
-            [self.staging_row], dtype=torch.int64, device=self.temporal.qdata.device
+        # Round-robin the staging ring: this spill waits only the D2H that
+        # last read THIS ring row (K spills ago), so up to K-1 earlier D2Hs
+        # stay in flight while decode keeps running.
+        ring_i = self._staging_next
+        self._staging_next = (ring_i + 1) % self.num_staging
+        row = self.staging_row + ring_i
+        # View into the pre-baked device index: building torch.tensor([row],
+        # device="cuda") here would pageable-H2D and SYNC the decode stream.
+        staging = (
+            self._staging_idx[ring_i : ring_i + 1]
+            if self._staging_idx is not None
+            else torch.tensor([row], dtype=torch.int64)
         )
-        if self._staging_busy_event is not None:
-            # The previous RAM store's D2H still reads the staging row; do not
-            # overwrite it before that copy retires (stream-ordered, no sync).
-            torch.cuda.current_stream().wait_event(self._staging_busy_event)
-        # Quantize into the private staging row (a GPU row addressed by no
-        # logical id, so this cannot recurse back into _store_to_host).
+        for busy in (
+            self._staging_busy_events[ring_i],
+            self._staging_busy_sides[ring_i],
+        ):
+            if busy is not None:
+                # That D2H still reads this ring row; do not overwrite it
+                # before the copy retires (stream-ordered, no host sync).
+                torch.cuda.current_stream().wait_event(busy)
+        # Quantize into the ring row (a GPU row addressed by no logical id, so
+        # this cannot recurse back into _store_to_host).
         self._quantize_to_rows(active_mamba_pool, active_slots, staging)
         if self._copy_stream is None:
             # CPU/mock pools: plain copies, already complete.
-            self._copy_staging_to_host(self.host_row(host_logical))
+            self._copy_staging_to_host(self.host_row(host_logical), row, staging, None)
             return
         # Capture the producing (compute) stream OUTSIDE the context below:
         # inside it, current_stream() is the copy stream and the wait would
         # self-order (no-op), letting the D2H race the quantize kernels.
         producer = torch.cuda.current_stream()
-        self._staging_busy_event = torch.cuda.Event()
+        event = torch.cuda.Event()
         with torch.cuda.stream(self._copy_stream):
             self._copy_stream.wait_stream(producer)
-            self._copy_staging_to_host(self.host_row(host_logical))
-            self._staging_busy_event.record(self._copy_stream)
+            sides_ev = self._copy_staging_to_host(
+                self.host_row(host_logical), row, staging, producer
+            )
+            # Guards this ring row against the next spill that reuses it
+            # (the D2H above still reads it until the copy retires).
+            event.record(self._copy_stream)
+        self._staging_busy_events[ring_i] = event
+        self._staging_busy_sides[ring_i] = sides_ev
+        # The D2H (and any sides wait) is enqueued; nothing above read host
+        # memory, so the decode stream stayed unblocked throughout.
 
-    def _copy_staging_to_host(self, h_row: int) -> None:
+    def _copy_staging_to_host(self, h_row: int, row: int, staging, producer) -> None:
         st = self.temporal
         ht = self.host_temporal
-        staging = (
-            torch.tensor(
-                [self.staging_row], dtype=torch.int64, device=self.conv[0].device
-            )
-            if self.conv
-            else torch.tensor([self.staging_row], dtype=torch.int64)
-        )
-        ht.qdata[:, h_row].copy_(st.qdata[:, self.staging_row], non_blocking=True)
-        ht.scale[:, h_row].copy_(st.scale[:, self.staging_row], non_blocking=True)
-        host_idx = torch.tensor([h_row], dtype=torch.int64)
-        for hc, c in zip(self.host_conv, self.conv):
-            hc[:, h_row].copy_(c[:, self.staging_row], non_blocking=True)
-        for (hm, dim), (m, _, _) in zip(self.host_sides, self.sides):
-            # index_copy_ wants same-device value; stage through the GPU copy
-            # first, then move the selected rows across the device boundary.
-            # The D2H must be SYNC: the fresh CPU temp is pageable, and a
-            # non-blocking copy_ can leave it unfinished when the host
-            # index_copy_ below reads it (spilled side rows land as stale
-            # data/zeros).
-            rows = m.index_select(dim, staging.to(m.device))
-            hm.index_copy_(dim, host_idx, rows.to(hm.device))
+        if self._pack_q is not None:
+            # Gather the GPU row into a contiguous pack, then ONE pinned D2H
+            # per plane (host row-major bases). Strided slices would pay ~4x
+            # the link time for the same bytes. Runs on the caller's
+            # (_copy_stream) context, where every crossing is serialized.
+            self._pack_q.copy_(st.qdata[:, row])
+            ht.qdata_base[h_row].copy_(self._pack_q, non_blocking=True)
+            self._pack_s.copy_(st.scale[:, row])
+            ht.scale_base[h_row].copy_(self._pack_s, non_blocking=True)
+            for pack_c, hc_base, c in zip(
+                self._pack_c, self._host_conv_base, self.conv
+            ):
+                pack_c.copy_(c[:, row])
+                hc_base[h_row].copy_(pack_c, non_blocking=True)
+            return self._spill_sides_to_host(h_row, staging, producer)
+        else:
+            # CPU/mock pools: logical views, plain complete copies.
+            ht.qdata[:, h_row].copy_(st.qdata[:, row], non_blocking=True)
+            ht.scale[:, h_row].copy_(st.scale[:, row], non_blocking=True)
+            for hc, c in zip(self.host_conv, self.conv):
+                hc[:, h_row].copy_(c[:, row], non_blocking=True)
+            host_idx = torch.tensor([h_row], dtype=torch.int64)
+            for (hm, dim), (m, _, _) in zip(self.host_sides, self.sides):
+                rows = m.index_select(dim, staging.to(m.device))
+                hm.index_copy_(dim, host_idx, rows.to(hm.device))
+
+    def _spill_sides_to_host(self, h_row: int, staging, producer) -> None:
+        # Side rows are tiny (~150KB); their D2Hs run on the SIDES stream into
+        # a ring of pinned scratches, and the host-row publish is DEFERRED to
+        # _publish_sides. A host sync here would wait on the sides stream's
+        # wait_event(producer) -- i.e. drain every decode kernel already
+        # queued on the compute stream -- which is the stall this whole path
+        # exists to avoid. So a spill commit only enqueues; completed scratch
+        # contents land in the host mirrors when their events retire.
+        if not self.host_sides:
+            return None
+        self._publish_sides()
+        k = self._sides_spill_next
+        if self._sides_spill_evt[k] is not None:
+            # The ring is full: slot k holds the OLDEST pending spill and its
+            # scratch is about to be overwritten. Flush now, while the
+            # _publish_sides sweep still starts at k (oldest first). Advancing
+            # the cursor first would start the sweep at k + 1 and visit slot k
+            # LAST -- and a RAM row re-spilled since (its newer side spill in
+            # a later slot) would then be republished under the older spill's
+            # state, so a later promote would restore stale side state.
+            self._publish_sides(blocking=True)
+        self._sides_spill_next = (k + 1) % _SIDES_RING_DEPTH
+        ev = torch.cuda.Event()
+        self._sides_stream.wait_stream(producer)
+        with torch.cuda.stream(self._sides_stream):
+            for j, ((hm, dim), (m, _, _)) in enumerate(
+                zip(self.host_sides, self.sides)
+            ):
+                rows = m.index_select(dim, staging.to(m.device))
+                scratch = self._sides_spill_scratch[j][k]
+                if scratch is None or scratch.shape != rows.shape:
+                    scratch = self._sides_spill_scratch[j][k] = torch.empty_like(
+                        rows, device="cpu", pin_memory=True
+                    )
+                scratch.copy_(rows, non_blocking=True)
+            ev.record(self._sides_stream)
+        self._sides_spill_evt[k] = (ev, h_row)
+        # Also returned to _store_to_host: the event covers this spill's READ
+        # of the staging ring row, which guards the row's next quantize.
+        return ev
+
+    def _publish_sides(self, blocking: bool = False, upto_h_row=None) -> None:
+        """Copy finished side-row spills from their pinned scratches into the
+        host mirrors (oldest pending first). Non-blocking skips spills whose
+        D2H event has not retired. A reader of host_sides (promote) passes
+        blocking=True and its h_row: only spills OF THAT ROW are awaited --
+        pending spills of other rows would otherwise add an unrelated spill's
+        whole backlog to the promote's host latency. Rows are independent,
+        so their publish order does not matter."""
+        if not self._sides_spill_evt:
+            return
+        for off in range(_SIDES_RING_DEPTH):
+            # Ring order starting at _sides_spill_next is chronological
+            # (oldest pending first), so a host row is never published stale
+            # over a newer spill of the same row.
+            k = (self._sides_spill_next + off) % _SIDES_RING_DEPTH
+            entry = self._sides_spill_evt[k]
+            if entry is None:
+                continue
+            ev, h_row = entry
+            mine = upto_h_row is None or h_row == upto_h_row
+            if not ev.query() and not (blocking and mine):
+                continue
+            ev.synchronize()
+            host_idx = torch.tensor([h_row], dtype=torch.int64)
+            for j, ((hm, dim), _) in enumerate(zip(self.host_sides, self.sides)):
+                hm.index_copy_(dim, host_idx, self._sides_spill_scratch[j][k])
+            self._sides_spill_evt[k] = None
 
     def alloc_device_slot(self) -> Optional[torch.Tensor]:
         """One GPU-tier checkpoint id, or None: promotions must land on the
@@ -598,6 +797,9 @@ class MambaCheckpointPool:
             f"promote() destination must be a GPU checkpoint id, got {device_logical}"
         )
         h_row = self.host_row(host_logical)
+        # The host mirror row must reflect every spill of THIS row before it
+        # is read out (other rows' pending spills are left alone).
+        self._publish_sides(blocking=True, upto_h_row=h_row)
         if self._copy_stream is None:
             self._copy_host_to_device(h_row, device_logical)
             self._pending_promotions.append((device_logical, None))
@@ -616,24 +818,55 @@ class MambaCheckpointPool:
     def _copy_host_to_device(self, h_row: int, gpu_id: int) -> None:
         st = self.temporal
         ht = self.host_temporal
-        st.qdata[:, gpu_id].copy_(ht.qdata[:, h_row], non_blocking=True)
-        st.scale[:, gpu_id].copy_(ht.scale[:, h_row], non_blocking=True)
-        for c, hc in zip(self.conv, self.host_conv):
-            c[:, gpu_id].copy_(hc[:, h_row], non_blocking=True)
-        for (hm, dim), (m, _, _) in zip(self.host_sides, self.sides):
-            # index_copy_/index_select want indices on the tensor's own device;
-            # the VALUE must also be same-device, so move the selected row.
-            # The H2D must be SYNC: the CPU temp is pageable, and a
-            # non-blocking copy could let its memory be recycled (CPU caching
-            # allocator) before the DMA has read it.
-            rows = hm.index_select(
-                dim, torch.tensor([h_row], dtype=torch.int64, device=hm.device)
-            )
-            m.index_copy_(
-                dim,
-                torch.tensor([gpu_id], dtype=torch.int64, device=m.device),
-                rows.to(m.device),
-            )
+        if self._pack_q is not None:
+            # Mirror of _copy_staging_to_host: ONE pinned H2D->pack per plane,
+            # then a cheap device-side scatter into the logical slot row.
+            self._pack_q.copy_(ht.qdata_base[h_row], non_blocking=True)
+            st.qdata[:, gpu_id].copy_(self._pack_q)
+            self._pack_s.copy_(ht.scale_base[h_row], non_blocking=True)
+            st.scale[:, gpu_id].copy_(self._pack_s)
+            for pack_c, hc_base, c in zip(
+                self._pack_c, self._host_conv_base, self.conv
+            ):
+                pack_c.copy_(hc_base[h_row], non_blocking=True)
+                c[:, gpu_id].copy_(pack_c)
+        else:
+            # CPU/mock pools: logical views, plain copies.
+            st.qdata[:, gpu_id].copy_(ht.qdata[:, h_row], non_blocking=True)
+            st.scale[:, gpu_id].copy_(ht.scale[:, h_row], non_blocking=True)
+            for c, hc in zip(self.conv, self.host_conv):
+                c[:, gpu_id].copy_(hc[:, h_row], non_blocking=True)
+        for j, ((hm, dim), (m, _, _)) in enumerate(zip(self.host_sides, self.sides)):
+            # Pinned + device scratches and a narrow() destination: a fresh
+            # torch.tensor([gpu_id], device=...) or pageable rows.to(cuda)
+            # would SYNC the copy stream (waiting the plane H2Ds and every
+            # queued compute kernel). Dev-scratch reuse is stream-ordered on
+            # the copy stream; the PINNED scratch is host-written, so its
+            # overwrite waits the previous promote's event instead.
+            rows = hm.index_select(dim, torch.tensor([h_row], dtype=torch.int64))
+            if m.device.type != "cuda":
+                # CPU/mock pools: plain same-device copy, no events.
+                m.index_copy_(dim, torch.tensor([gpu_id], dtype=torch.int64), rows)
+                continue
+            prev = self._sides_promote_evt[j]
+            if prev is not None:
+                prev.synchronize()
+            pin = self._sides_host_scratch[j]
+            if pin is None or pin.shape != rows.shape:
+                pin = self._sides_host_scratch[j] = torch.empty_like(
+                    rows, device="cpu", pin_memory=True
+                )
+            pin.copy_(rows)
+            dev = self._sides_dev_scratch[j]
+            if dev is None or dev.shape != rows.shape:
+                dev = self._sides_dev_scratch[j] = torch.empty_like(
+                    rows, device=m.device
+                )
+            dev.copy_(pin, non_blocking=True)
+            m.narrow(dim, gpu_id, 1).copy_(dev)
+            evt = torch.cuda.Event()
+            evt.record(torch.cuda.current_stream())
+            self._sides_promote_evt[j] = evt
 
     def load_to_active(self, active_mamba_pool, ckpt_slots, active_slots) -> None:
         """Dequantize temporal + copy conv from GPU checkpoint slots into the
@@ -692,10 +925,10 @@ class MambaCheckpointPool:
         caller can check it against free memory before construction. Mirrors the
         real layout: int8 qdata + per-(head,k) scale + bf16 conv windows +
         mirrored side-state rows, including the reserved slot 0 (plus the RAM
-        tier's private staging row when ``staging_row``)."""
-        # Slot 0 is reserved (matches MambaSlotAllocator); the staging row is
-        # the RAM tier's private quantize buffer.
-        slots = num_slots + 1 + (1 if staging_row else 0)
+        tier's private staging ring when ``staging_row``)."""
+        # Slot 0 is reserved (matches MambaSlotAllocator); the staging rows are
+        # the RAM tier's private quantize ring.
+        slots = num_slots + 1 + (_STAGING_RING_DEPTH if staging_row else 0)
         scale_isz = torch.empty((), dtype=temporal_dtype).element_size()
         conv_isz = torch.empty((), dtype=conv_dtype).element_size()
         qdata = num_layers * slots * num_heads * head_v_dim * head_k_dim  # int8 = 1B
@@ -717,12 +950,17 @@ class MambaCheckpointPool:
             for s in shape:
                 n *= int(s)
             sides += n * src.element_size()
+        # The RAM tier's contiguous-pack buffers (one logical row of each
+        # plane) are allocated alongside it on CUDA; the pre-flight guard
+        # must charge for them too.
+        pack = (qdata + scale + conv) // slots if staging_row else 0
         return {
             "qdata": qdata,
             "scale": scale,
             "conv": conv,
             "sides": sides,
-            "total": qdata + scale + conv + sides,
+            "pack": pack,
+            "total": qdata + scale + conv + sides + pack,
             "per_row": qdata // slots + scale // slots + conv // slots + sides // slots,
         }
 
