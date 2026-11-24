@@ -81,6 +81,13 @@ class MambaSlotAllocator:
             if result is not None:
                 self._alloc_iter = iter(result.split(1))
 
+    @property
+    def alloc_group_open(self) -> bool:
+        """True between ``alloc_group_begin``/``end``: ``alloc(1)`` then drains
+        a pre-allocated batch whose tier composition is no longer decided by
+        the current free counts."""
+        return self._alloc_iter is not None
+
     def alloc_group_end(self):
         """Return any unused pre-allocated slots from the current group."""
         if self._alloc_iter is not None:

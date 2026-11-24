@@ -26,6 +26,19 @@ register_kernel(
     )
 )
 
+# Bit-exact fused replacement for the mamba checkpoint pool's eager
+# quantize/dequantize (amax over the V dim of slot-indexed state rows).
+for _name in ("int8_mamba_ckpt_quant", "int8_mamba_ckpt_dequant"):
+    register_kernel(
+        KernelSpec(
+            op=f"quantization.{_name}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.quantization.int8_mamba_ckpt_quant_triton:{_name}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _name
+
 
 register_kernel(
     KernelSpec(
