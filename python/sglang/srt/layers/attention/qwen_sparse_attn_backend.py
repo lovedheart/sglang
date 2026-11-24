@@ -738,11 +738,26 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "QSA speculative query rows cannot be mapped to requests: "
                 f"rows={num_rows}, batch={batch_size}"
             )
-        return torch.arange(
+        # Uniform (rows-per-request) mappings are constant per (device, bs, k);
+        # steady decode/verify loops hit the same key every forward, so cache
+        # the device tensor instead of relaunching arange + repeat_interleave.
+        # Consumers treat the mapping as read-only.
+        key = (
+            forward_batch.req_pool_indices.device,
             batch_size,
-            dtype=torch.long,
-            device=forward_batch.req_pool_indices.device,
-        ).repeat_interleave(num_rows // batch_size)
+            num_rows // batch_size,
+        )
+        cached = _ROW_TO_REQUEST_CACHE.get(key)
+        if cached is None:
+            cached = torch.arange(
+                batch_size,
+                dtype=torch.long,
+                device=forward_batch.req_pool_indices.device,
+            ).repeat_interleave(num_rows // batch_size)
+            if len(_ROW_TO_REQUEST_CACHE) > 256:
+                _ROW_TO_REQUEST_CACHE.clear()
+            _ROW_TO_REQUEST_CACHE[key] = cached
+        return cached
 
     @staticmethod
     def _as_cpu_int_tensor(values, size: int) -> torch.Tensor:
