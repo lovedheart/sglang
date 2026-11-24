@@ -112,14 +112,17 @@ class TestTieredCheckpointPool(unittest.TestCase):
         self.assertEqual(pool.available_size(), 12)
         self.assertEqual(pool.device_available_size(), 8)
         self.assertEqual(pool.host_available_size(), 4)
-        # The staging row is the extra GPU row past the device tier, addressed
-        # by neither tier's free list.
+        # The staging ring starts at this row and runs _STAGING_RING_DEPTH
+        # rows past the device tier, addressed by neither tier's free list.
         self.assertEqual(pool.staging_row, 9)
-        self.assertEqual(pool.temporal.qdata.shape[1], 10)
+        self.assertEqual(pool.temporal.qdata.shape[1], 9 + 4)  # + ring rows
         est = MambaCheckpointPool.estimate_mem_usage_bytes(
             **_pool_kwargs(), staging_row=True
         )
-        self.assertEqual(est["total"], pool.mem_usage_bytes())
+        # est carries the pack-buffer row the CUDA tier adds; a CPU pool
+        # (no copy stream) never allocates it.
+        self.assertGreater(est["pack"], 0)
+        self.assertEqual(est["total"] - est["pack"], pool.mem_usage_bytes())
         # RAM-tier sizing in maybe_init divides this into a byte budget.
         self.assertEqual(est["per_row"], pool.ckpt_slot_bytes())
 
@@ -203,6 +206,35 @@ class TestTieredCheckpointPool(unittest.TestCase):
         self.assertIn(int(gpu_slot.item()), pool.allocator.free_slots.tolist())
         # No-op for ids the pool never promoted.
         pool.release_promotion(12345)
+
+    def test_staging_ring_round_robins(self):
+        # Consecutive RAM spills must QUANTIZE INTO DIFFERENT ring rows (that
+        # is what lets a queued D2H overlap the next spill), and the cursor
+        # must wrap past the ring depth. Pin the row the quantize ACTUALLY
+        # targets, not a re-derivation of the cursor.
+        pool = self._pool(host_slots=8)
+        active = _active_pool()
+        active.mamba_cache.temporal[:, 1] = torch.randn(
+            L, H, V, K, dtype=torch.bfloat16
+        )
+        rows_seen = []
+        real_quant = pool._quantize_to_rows
+
+        def spy(mamba, src, dst):
+            rows_seen.extend(dst.tolist())
+            return real_quant(mamba, src, dst)
+
+        pool._quantize_to_rows = spy
+        for ckpt in range(9, 14):  # 5 spills into a depth-4 ring
+            pool.store_from_active(active, torch.tensor([1]), torch.tensor([ckpt]))
+        self.assertEqual(rows_seen, [9, 10, 11, 12, 9])  # row 9 reused last
+        self.assertEqual(pool._staging_next, 1)
+        # clear() must reset the cursor AND the events (sentinels stand in
+        # for CUDA events; a CPU pool never records real ones).
+        pool._staging_busy_events = ["ev"] * pool.num_staging
+        pool.clear()
+        self.assertEqual(pool._staging_next, 0)
+        self.assertEqual(pool._staging_busy_events, [None] * pool.num_staging)
 
     def test_two_ram_stores_do_not_clobber_the_staging_row(self):
         pool = self._pool(host_slots=4)
