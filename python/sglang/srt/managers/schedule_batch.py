@@ -315,6 +315,9 @@ class ReqKvInfo:
     mamba_prev_track_seqlen: Optional[int] = None
     # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
     mamba_cow_src_index: Optional[torch.Tensor] = None
+    # The staged CoW source is a pool-owned promoted checkpoint slot (vs a
+    # tree-owned row), so dropping it must release_promotion for THIS req only.
+    mamba_cow_src_promoted: bool = False
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
     mamba_needs_clear: bool = False
     # Deferred clear: freshly allocated ping-pong track slots need zeroing on the
@@ -444,6 +447,7 @@ class ReqKvInfo:
         self.mamba_last_track_seqlen = None
         self.mamba_prev_track_seqlen = None
         self.mamba_cow_src_index = None
+        self.mamba_cow_src_promoted = False
         self.mamba_needs_clear = False
         self.kv_committed_len = 0
 
@@ -1574,6 +1578,7 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_idx = None
         self.mamba_branching_seqlen = None
         self.kv.mamba_cow_src_index = None
+        self.kv.mamba_cow_src_promoted = False
         self.kv.mamba_needs_clear = False
         self.kv.mamba_ping_pong_needs_clear = False
         self.already_computed = 0
@@ -2845,6 +2850,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 cow_src_tensors.append(req.kv.mamba_cow_src_index)
                 cow_dst_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
                 req.kv.mamba_cow_src_index = None
+                req.kv.mamba_cow_src_promoted = False
                 req.kv.mamba_needs_clear = False
             elif req.kv.mamba_needs_clear:
                 clear_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))

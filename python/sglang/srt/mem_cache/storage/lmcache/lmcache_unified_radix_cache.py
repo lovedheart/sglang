@@ -340,6 +340,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 and flow.load_req.kv.mamba_cow_src_index is flow.mamba_value
             ):
                 flow.load_req.kv.mamba_cow_src_index = None
+                flow.load_req.kv.mamba_cow_src_promoted = False
         if flow.load is None:
             if flow.total_hit is not None:
                 # No retrieve will release locks from this completed lookup.
@@ -484,6 +485,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             flow.allocated_request_mamba_for_load = False
         flow.load_req = req
         req.kv.mamba_cow_src_index = checkpoint
+        # This source is an L3-owned value, never a promoted checkpoint slot.
+        req.kv.mamba_cow_src_promoted = False
         req.kv.mamba_needs_clear = False
 
     def _allocate_external_slots(self, num_tokens: int) -> Optional[torch.Tensor]:
@@ -653,6 +656,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 req.kv.mamba_pool_idx = None
             if req.kv.mamba_cow_src_index is mamba_value:
                 req.kv.mamba_cow_src_index = None
+                req.kv.mamba_cow_src_promoted = False
             flow.mamba_value = None
             flow.request_mamba_value = None
             flow.allocated_request_mamba_for_load = False
@@ -703,6 +707,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 and flow.load_req.kv.mamba_cow_src_index is flow.mamba_value
             ):
                 flow.load_req.kv.mamba_cow_src_index = None
+                flow.load_req.kv.mamba_cow_src_promoted = False
             flow.mamba_value = None
         if (
             not flow.cancelled
@@ -746,6 +751,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 and flow.load_req.kv.mamba_cow_src_index is flow.mamba_value
             ):
                 flow.load_req.kv.mamba_cow_src_index = None
+                flow.load_req.kv.mamba_cow_src_promoted = False
             self.token_to_kv_pool_allocator.state_slots.free(flow.mamba_value)
             flow.mamba_value = None
             flow.free_mamba_after_load = False

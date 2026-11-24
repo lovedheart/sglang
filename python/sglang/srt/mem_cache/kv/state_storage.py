@@ -295,6 +295,7 @@ class StateStorage:
             req.kv.mamba_last_track_seqlen = None
             req.kv.mamba_prev_track_seqlen = None
             req.kv.mamba_cow_src_index = None
+            req.kv.mamba_cow_src_promoted = False
             req.kv.mamba_needs_clear = False
 
     def clear(self) -> None:

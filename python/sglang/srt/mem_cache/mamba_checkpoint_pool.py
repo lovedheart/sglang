@@ -409,17 +409,22 @@ class MambaCheckpointPool:
 
     # ---- state transfer between the active MambaPool and this store ----
 
-    def store_from_active(self, active_mamba_pool, active_slots, ckpt_slots) -> None:
+    def store_from_active(
+        self, active_mamba_pool, active_slots, ckpt_slots, ckpt_id=None
+    ) -> None:
         """Quantize temporal + copy conv from the active pool into checkpoint slots
         (the radix donate / cache-store). A RAM-tier destination quantizes into the
         GPU staging row and D2H-copies the int8 planes unchanged; the RAM slot is
         safe to publish because every later reader chains on the pool copy
-        stream."""
+        stream. ``ckpt_id`` lets a caller that already read the slot id skip the
+        D2H sync; the GPU-only config (no host tier) never needs the value."""
         assert ckpt_slots.numel() == 1, "one checkpoint per store"
-        ckpt_id = int(ckpt_slots.reshape(-1)[0].item())
-        if self.host_slots > 0 and ckpt_id > self.num_slots:
-            self._store_to_host(active_mamba_pool, active_slots, ckpt_id)
-            return
+        if self.host_slots > 0:
+            if ckpt_id is None:
+                ckpt_id = int(ckpt_slots.reshape(-1)[0].item())
+            if ckpt_id > self.num_slots:
+                self._store_to_host(active_mamba_pool, active_slots, ckpt_id)
+                return
         self._quantize_to_rows(active_mamba_pool, active_slots, ckpt_slots)
 
     def _quantize_to_rows(self, active_mamba_pool, active_slots, ckpt_slots) -> None:

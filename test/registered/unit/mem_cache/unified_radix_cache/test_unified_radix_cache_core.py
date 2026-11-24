@@ -2160,7 +2160,14 @@ class TestUnifiedRadixCacheInt8MambaCkptOffload(
                     )
                     self.assertIsNotNone(req.kv.mamba_cow_src_index)
                     self.assertEqual(ckpt.num_pending_promotions(), 1)
-                    self.assertEqual(ckpt.device_available_size(), 0)
+                    # Promote-then-release: a re-match may evict one cached
+                    # checkpoint; the GPU tier's ledger must stay closed.
+                    self.assertEqual(
+                        ckpt.device_available_size()
+                        + cache.mamba_evictable_size()
+                        + ckpt.num_pending_promotions(),
+                        ckpt.num_slots,
+                    )
                 last = int(req.kv.mamba_cow_src_index.reshape(-1)[0])
                 ckpt.release_promotion(last)
                 self.assertEqual(ckpt.num_pending_promotions(), 0)
