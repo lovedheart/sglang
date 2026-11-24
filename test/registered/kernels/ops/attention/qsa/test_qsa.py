@@ -564,6 +564,8 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
         )
         indexer = SimpleNamespace(
             layer_id=0,
+            # The padding size is now hoisted ahead of the project_qk call and
+            # read on every mode, so the mock must carry it.
             index_n_heads=1,
             project_qk=lambda hidden, rope_positions, **kwargs: (
                 hidden.reshape(-1, 1, 2),
