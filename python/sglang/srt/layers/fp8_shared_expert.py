@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 
 import torch
+
 from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
 from sglang.srt.utils.device import is_sm120_supported
 

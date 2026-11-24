@@ -18,12 +18,13 @@ from __future__ import annotations
 import logging
 
 import torch
+from torch import nn
+
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
     prepare_nvfp4_layer_for_marlin,
 )
 from sglang.srt.utils.device import is_sm120_supported
-from torch import nn
 
 logger = logging.getLogger(__name__)
 

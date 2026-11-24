@@ -593,9 +593,7 @@ class TestPrefillSlab(CustomTestCase):
                 sim.extend(1, 64)
                 seq = 64
                 slots = sim.req_to_token[1, :seq].long()
-                self._gather_both(
-                    sim, _fb([1], [seq], [seq], sim.device), slots
-                )
+                self._gather_both(sim, _fb([1], [seq], [seq], sim.device), slots)
                 # Chunk 2 with the host store zeroed: the cache in slabsd prefix
                 # must still come out right, proving it was served on the
                 # device. The chunk's own rows come from the scratch.
@@ -619,12 +617,8 @@ class TestPrefillSlab(CustomTestCase):
                 self.assertTrue(torch.equal(k, sim.ref_k[0][slots]))
                 self.assertTrue(torch.equal(v, sim.ref_v[0][slots]))
                 if quantized:
-                    self.assertTrue(
-                        torch.equal(ksf, sim.ref_ksf[0][slots])
-                    )
-                    self.assertTrue(
-                        torch.equal(vsf, sim.ref_vsf[0][slots])
-                    )
+                    self.assertTrue(torch.equal(ksf, sim.ref_ksf[0][slots]))
+                    self.assertTrue(torch.equal(vsf, sim.ref_vsf[0][slots]))
                 slab = sim.offload._slabs[1]
                 # Only layer 0 was gathered; layers advance independently.
                 self.assertEqual(slab.cursors[0], 112)
@@ -643,12 +637,8 @@ class TestPrefillSlab(CustomTestCase):
                 self.assertTrue(torch.equal(k, sim.ref_k[0][slots]))
                 self.assertTrue(torch.equal(v, sim.ref_v[0][slots]))
                 if quantized:
-                    self.assertTrue(
-                        torch.equal(ksf, sim.ref_ksf[0][slots])
-                    )
-                    self.assertTrue(
-                        torch.equal(vsf, sim.ref_vsf[0][slots])
-                    )
+                    self.assertTrue(torch.equal(ksf, sim.ref_ksf[0][slots]))
+                    self.assertTrue(torch.equal(vsf, sim.ref_vsf[0][slots]))
 
     def test_layers_share_the_slab_and_chunks_ride(self):
         # Layers advance independently: a layer whose own cursor still
@@ -667,9 +657,7 @@ class TestPrefillSlab(CustomTestCase):
             slots = sim.req_to_token[1, :seq].long()
             # Layer 1 first: its cursor hits 96. Layer 0 (cursor 64 <= the
             # new prior 64) must still ride the SAME slab, not re-stage.
-            self._gather_both(
-                sim, _fb([1], [seq], [32], sim.device), slots, layer=1
-            )
+            self._gather_both(sim, _fb([1], [seq], [32], sim.device), slots, layer=1)
             self._gather_both(sim, _fb([1], [seq], [32], sim.device), slots)
             self.assertIs(sim.offload._slabs[1], slab)
             self.assertEqual(slab.cursors[:2], [96, 96])
@@ -685,9 +673,7 @@ class TestPrefillSlab(CustomTestCase):
                 sim.req_to_token,
                 reset_req_pool_indices=torch.tensor([1, 2], device=sim.device),
             )
-            sim._write(
-                torch.cat([slots_a, slots_b]), sim.offload.extend_rows(64)
-            )
+            sim._write(torch.cat([slots_a, slots_b]), sim.offload.extend_rows(64))
             slots = torch.cat([slots_a, slots_b])
             self._gather_both(
                 sim, _fb([1, 2], [40, 24], [40, 24], sim.device), slots, layer=1

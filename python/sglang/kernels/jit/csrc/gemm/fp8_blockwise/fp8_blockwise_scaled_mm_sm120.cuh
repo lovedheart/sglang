@@ -26,10 +26,10 @@ limitations under the License.
 #include <cute/arch/copy_sm80.hpp>
 #include <cute/arch/mma_sm120.hpp>
 #include <cutlass/numeric_types.h>
-#include <cuda_fp8.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 // clang-format off
@@ -1052,16 +1052,12 @@ void launch_sm120_fp8_decode_warp_fused(
 /// gate (m <= 16 + warp-kernel shapes + env kill-switch) lives in the Python
 /// dispatcher; these checks only catch wiring mistakes.
 inline void fp8_blockwise_warp_fused_act_sm120(
-    tvm::ffi::TensorView out,
-    tvm::ffi::TensorView x,
-    tvm::ffi::TensorView weight,
-    tvm::ffi::TensorView weight_scale) {
+    tvm::ffi::TensorView out, tvm::ffi::TensorView x, tvm::ffi::TensorView weight, tvm::ffi::TensorView weight_scale) {
   RuntimeCheck(x.device().device_type == kDLCUDA, "x must be a CUDA tensor");
   RuntimeCheck(x.dim() == 2 && weight.dim() == 2, "x and weight must be 2D tensors");
   RuntimeCheck(x.stride(1) == 1, "x must be a row major tensor");
   RuntimeCheck(weight.stride(1) == 1, "weight must be a row major [n, k] tensor");
-  RuntimeCheck(
-      weight_scale.is_contiguous(), "weight_scale must be a contiguous [n / 128, k / 128] tensor");
+  RuntimeCheck(weight_scale.is_contiguous(), "weight_scale must be a contiguous [n / 128, k / 128] tensor");
   RuntimeCheck(host::is_type<fp8_e4m3_t>(weight.dtype()), "weight must be Float8_e4m3fn");
   RuntimeCheck(host::is_type<float>(weight_scale.dtype()), "weight_scale must be Float32");
   const int32_t m = static_cast<int32_t>(x.size(0));
@@ -1110,9 +1106,8 @@ void sm120_fp8_blockwise_dispatch_shape(
     // incl. 1-2) and kv_proj (N=512, K=2560: 1.10-1.17x), while every wide-N
     // family (N >= 6144 with K=2560) loses 1.2-1.3x and stays on swapAB. The
     // extra (k >= 6144 || n <= 1024) arm adds exactly those two families.
-    const bool warp_pr =
-        m <= 16 && n <= 32 * num_sms && n % 128 == 0 && k % 128 == 0 && k <= 8192 && (m <= 8 || k >= 6144) &&
-        n >= 4096 && k >= 4096;
+    const bool warp_pr = m <= 16 && n <= 32 * num_sms && n % 128 == 0 && k % 128 == 0 && k <= 8192 &&
+                         (m <= 8 || k >= 6144) && n >= 4096 && k >= 4096;
     const bool warp_flashnext =
         m <= 16 && n <= 32 * num_sms && n % 128 == 0 && k % 128 == 0 && k <= 8192 && (k >= 6144 || n <= 1024);
     // Split-K warp kernel for small-M decode shapes. Its fp32 partials are
@@ -1126,8 +1121,7 @@ void sm120_fp8_blockwise_dispatch_shape(
     // narrow N (n <= 4096) still wins; wide N stays on swapAB. Beyond
     // n = 32768 (lm_head-sized) the fp32 partial traffic outweighs the
     // latency win and swapAB is back ahead, so cap the width.
-    const bool warp_small =
-        m <= 16 && n <= 32768 && n % 128 == 0 && k % 128 == 0 && k <= 8192 && (m <= 8 || n <= 4096);
+    const bool warp_small = m <= 16 && n <= 32768 && n % 128 == 0 && k % 128 == 0 && k <= 8192 && (m <= 8 || n <= 4096);
     if (warp_pr || warp_flashnext || warp_small) {
       launch_sm120_fp8_decode_warp<OutType>(out, a, b, scales_a, scales_b, stream);
       return;

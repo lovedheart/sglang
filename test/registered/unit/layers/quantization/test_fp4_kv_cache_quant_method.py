@@ -78,7 +78,6 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         self.assertEqual(dtype, torch.float8_e4m3fn)
         self.assertEqual(resolved, "fp8_e4m3")
 
-
     def test_factory_unknown_raises(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             get_kv_cache_quant_method,

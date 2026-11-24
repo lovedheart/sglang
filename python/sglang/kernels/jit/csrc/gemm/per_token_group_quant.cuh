@@ -237,17 +237,15 @@ SGL_DEVICE const QuantKernelParams& base_params(const PaddedQuantKernelParams& p
 // (shorter) input. Subwarp-uniform and duplicate-safe, like every store site.
 template <typename Trait>
 SGL_DEVICE void write_zero_group(
-    const QuantKernelParams& params,
-    const uint32_t token_idx,
-    const uint32_t group_idx,
-    const uint32_t lane_id) {
+    const QuantKernelParams& params, const uint32_t token_idx, const uint32_t group_idx, const uint32_t lane_id) {
   using namespace device;
   using Q = typename Trait::QuantType;
   using Q2 = typename detail::WeightTrait<Q>::packed2_t;
   AlignedVector<Q2, Trait::kVecSize / 2> out;
   out.fill(Q2{});
   out.store(params.output.get<Q>(0, token_idx) + group_idx * Trait::kGroupSize, lane_id);
-  params.scale.store<Trait::kUe8m0, Trait::kRowMajor, Trait::kAligned>(0, token_idx, group_idx, detail::scale_t<Trait::kUe8m0>{});
+  params.scale.store<Trait::kUe8m0, Trait::kRowMajor, Trait::kAligned>(
+      0, token_idx, group_idx, detail::scale_t<Trait::kUe8m0>{});
 }
 
 }  // namespace detail

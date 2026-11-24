@@ -8,6 +8,7 @@ topk(indexer_budget)=2048, HC hc_count=4 / hidden=2560 / lowrank=320.
 Run under ncu with --kernel-name regex to isolate one family:
   ncu -k "regex:_sparse_gqa_chunk_prefill_nvfp4|_hc_mix_a8w8" ...
 """
+
 import sys
 
 import torch
@@ -29,10 +30,18 @@ def bench_qsa_prefill():
     nq, nkv, hd, topk = 24, 2, 256, 2048
     q = torch.randn(total_q, nq, hd, device=DEV, dtype=DT) * 0.1
     # packed nvfp4 pool: half bytes + fp8-e4m3 block scales per 16 elems
-    kp = torch.randint(0, 255, (nseq * ctx, nkv, hd // 2), device=DEV, dtype=torch.uint8)
-    ksf = torch.randint(100, 130, (nseq * ctx, nkv, hd // 16), device=DEV, dtype=torch.uint8).view(torch.float8_e4m3fn)
-    vp = torch.randint(0, 255, (nseq * ctx, nkv, hd // 2), device=DEV, dtype=torch.uint8)
-    vsf = torch.randint(100, 130, (nseq * ctx, nkv, hd // 16), device=DEV, dtype=torch.uint8).view(torch.float8_e4m3fn)
+    kp = torch.randint(
+        0, 255, (nseq * ctx, nkv, hd // 2), device=DEV, dtype=torch.uint8
+    )
+    ksf = torch.randint(
+        100, 130, (nseq * ctx, nkv, hd // 16), device=DEV, dtype=torch.uint8
+    ).view(torch.float8_e4m3fn)
+    vp = torch.randint(
+        0, 255, (nseq * ctx, nkv, hd // 2), device=DEV, dtype=torch.uint8
+    )
+    vsf = torch.randint(
+        100, 130, (nseq * ctx, nkv, hd // 16), device=DEV, dtype=torch.uint8
+    ).view(torch.float8_e4m3fn)
     k_gs = 1.0  # get_bmm_scales returns python floats, not tensors
     v_gs = 1.0
     indices = torch.randint(0, ctx, (total_q, nkv, topk), device=DEV, dtype=torch.int32)
@@ -41,12 +50,36 @@ def bench_qsa_prefill():
     kv_lens = torch.full((nseq,), ctx, device=DEV, dtype=torch.int32)
     for _ in range(3):  # warmup
         sparse_gqa_fwd_interface_triton_ck_nvfp4(
-            q, kp, ksf, vp, vsf, k_gs, v_gs, indices, cu_q, cu_k, kv_lens, 1.0 / 16.0, max_q=chunk
+            q,
+            kp,
+            ksf,
+            vp,
+            vsf,
+            k_gs,
+            v_gs,
+            indices,
+            cu_q,
+            cu_k,
+            kv_lens,
+            1.0 / 16.0,
+            max_q=chunk,
         )
     torch.cuda.synchronize()
     for _ in range(5):  # profiled
         sparse_gqa_fwd_interface_triton_ck_nvfp4(
-            q, kp, ksf, vp, vsf, k_gs, v_gs, indices, cu_q, cu_k, kv_lens, 1.0 / 16.0, max_q=chunk
+            q,
+            kp,
+            ksf,
+            vp,
+            vsf,
+            k_gs,
+            v_gs,
+            indices,
+            cu_q,
+            cu_k,
+            kv_lens,
+            1.0 / 16.0,
+            max_q=chunk,
         )
     torch.cuda.synchronize()
     print("qsa prefill done")
@@ -58,10 +91,16 @@ def bench_hc_mix():
     rows, hc, hs, lr = 4032, 4, 2560, 320
     k = hc * hs
     x = torch.randn(rows, k, device=DEV, dtype=DT) * 0.05
-    w_down = torch.randint(0, 255, (lr, k), device=DEV, dtype=torch.uint8).view(torch.float8_e4m3fn)
+    w_down = torch.randint(0, 255, (lr, k), device=DEV, dtype=torch.uint8).view(
+        torch.float8_e4m3fn
+    )
     w_down_scale = torch.randint(100, 126, (lr, k // 32), device=DEV, dtype=torch.uint8)
-    w_up = torch.randint(0, 255, (hc * hs, lr), device=DEV, dtype=torch.uint8).view(torch.float8_e4m3fn)
-    w_up_scale = torch.randint(100, 126, (hc * hs, lr // 32), device=DEV, dtype=torch.uint8)
+    w_up = torch.randint(0, 255, (hc * hs, lr), device=DEV, dtype=torch.uint8).view(
+        torch.float8_e4m3fn
+    )
+    w_up_scale = torch.randint(
+        100, 126, (hc * hs, lr // 32), device=DEV, dtype=torch.uint8
+    )
     for _ in range(3):
         fused_hc_mix_fp8_w8a8(x, w_down, w_down_scale, w_up, w_up_scale, hc, hs)
     torch.cuda.synchronize()

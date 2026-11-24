@@ -1,7 +1,9 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
+
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
+
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
@@ -32,10 +34,10 @@ __device__ __forceinline__ float dec43(uint32_t b) {  // fp8 e4m3: s eeee mmm, b
 template <int K>
 __global__ void __launch_bounds__(256) sm120_fp8_e3m4_gemv_kernel(
     bf16_t* __restrict__ out,
-    const uint8_t* __restrict__ x,   // [K] e4m3 codes
-    const uint8_t* __restrict__ w,   // [N,K] e3m4 codes
-    const float* __restrict__ a_s,   // [K/128]
-    const float* __restrict__ w_s,   // [N/128, K/128]
+    const uint8_t* __restrict__ x,  // [K] e4m3 codes
+    const uint8_t* __restrict__ w,  // [N,K] e3m4 codes
+    const float* __restrict__ a_s,  // [K/128]
+    const float* __restrict__ w_s,  // [N/128, K/128]
     int N) {
   constexpr int kBlk = K / 128;
   static_assert(K % 512 == 0, "K must be a multiple of 512 (4 scale blocks per pass)");
@@ -68,11 +70,11 @@ __global__ void __launch_bounds__(256) sm120_fp8_e3m4_gemv_kernel(
     const float s = __ldg(a_s + kbs) * __ldg(w_s + static_cast<size_t>(n >> 7) * kBlk + kbs);
     acc = fmaf(d0 + d1, s, acc);
     cur = nxt;
-    if (kb + 4 < kBlk)
-      xv = *reinterpret_cast<const uint4*>(x + ((kb + 4) << 7) + (lane << 4));
+    if (kb + 4 < kBlk) xv = *reinterpret_cast<const uint4*>(x + ((kb + 4) << 7) + (lane << 4));
   }
 #pragma unroll
-  for (int o = 16; o; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+  for (int o = 16; o; o >>= 1)
+    acc += __shfl_xor_sync(0xffffffffu, acc, o);
   if (lane == 0) out[n] = static_cast<bf16_t>(acc);
 }
 

@@ -27,10 +27,7 @@ void fp8_blockwise_scaled_mm(
 }
 
 void sm120_fp8_blockwise_warp_fused_act(
-    tvm::ffi::TensorView out,
-    tvm::ffi::TensorView x,
-    tvm::ffi::TensorView weight,
-    tvm::ffi::TensorView weight_scale) {
+    tvm::ffi::TensorView out, tvm::ffi::TensorView x, tvm::ffi::TensorView weight, tvm::ffi::TensorView weight_scale) {
   fp8_blockwise_warp_fused_act_sm120(out, x, weight, weight_scale);
 }
 

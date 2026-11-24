@@ -4,6 +4,7 @@
 Sends real concurrent batches (4 in-flight requests) against the running
 sglang server on :8070 and captures separate torch-profiler traces per stage.
 """
+
 import json
 import os
 import sys
@@ -123,7 +124,10 @@ def capture_prefill():
             (synthetic_prompt(4096, f"c{r}p{i}"), 1, 2000 + r * 4 + i) for i in range(4)
         ]
         parallel_gen(jobs)
-        print(f"[prefill] capture round {r + 1} done at {time.time() - t0:.1f}s", flush=True)
+        print(
+            f"[prefill] capture round {r + 1} done at {time.time() - t0:.1f}s",
+            flush=True,
+        )
     hits = wait_for_trace(out_dir, "bs4-prefill")
     print("[prefill] traces:", hits, flush=True)
     return bool(hits)

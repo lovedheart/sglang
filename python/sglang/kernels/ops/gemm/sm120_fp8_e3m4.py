@@ -44,7 +44,7 @@ def _jit_gemm_module() -> Module:
 
 
 @cache_once
-def _jit_gemm_cutlass_module() -> "Module | None":
+def _jit_gemm_cutlass_module() -> Module | None:
     """CUTLASS-ported wide-band kernel; None (cached) keeps the old path."""
     if not is_sm120_supported():
         return None
@@ -71,7 +71,7 @@ def _jit_gemm_cutlass_module() -> "Module | None":
 
 
 @cache_once
-def _jit_gemm_cute_ws_module() -> "Module | None":
+def _jit_gemm_cute_ws_module() -> Module | None:
     """Self-owned CuTe warp-specialized kernel; None (cached) keeps old paths."""
     if not is_sm120_supported():
         return None
@@ -129,9 +129,7 @@ def sm120_fp8_e3m4_gemv(
     """
     n = w_e3m4.shape[0]
     out = torch.empty((n,), dtype=torch.bfloat16, device=x_fp8.device)
-    _jit_gemv_module(w_e3m4.shape[1]).run(
-        x_fp8, w_e3m4, x_scale, w_scale, out
-    )
+    _jit_gemv_module(w_e3m4.shape[1]).run(x_fp8, w_e3m4, x_scale, w_scale, out)
     return out
 
 

@@ -451,7 +451,6 @@ class QSAIndexer(MultiPlatformOp):
             return positions[0]
         return positions
 
-
     def apply_rope(self, positions: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.numel() == 0:
             return tensor

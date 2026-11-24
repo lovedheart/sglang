@@ -47,6 +47,7 @@ def build_indexer_host(device, anchor, drafts=()):
         config=sidecar, root=config.root, root_host_pool=anchor
     )
 
+
 @pytest.fixture(autouse=True)
 def _private_storage_dir(monkeypatch):
     # A machine-wide storage dir overrides HiCacheFile's file_path argument,

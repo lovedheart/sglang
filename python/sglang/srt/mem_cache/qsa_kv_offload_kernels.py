@@ -393,12 +393,8 @@ class QSAKVFusedResolve:
                     "number of 8 B words"
                 )
             self.sf_row_words = words
-            self.dev_ksf = [
-                b.view(b.shape[0], -1).view(torch.int64) for b in dev_ksf
-            ]
-            self.dev_vsf = [
-                b.view(b.shape[0], -1).view(torch.int64) for b in dev_vsf
-            ]
+            self.dev_ksf = [b.view(b.shape[0], -1).view(torch.int64) for b in dev_ksf]
+            self.dev_vsf = [b.view(b.shape[0], -1).view(torch.int64) for b in dev_vsf]
             self.host_ksf_addr = [host_ksf[i].data_ptr() for i in range(layers)]
             self.host_vsf_addr = [host_vsf[i].data_ptr() for i in range(layers)]
         nr, hot, cr = num_request_slots, hot_blocks, compress_ratio

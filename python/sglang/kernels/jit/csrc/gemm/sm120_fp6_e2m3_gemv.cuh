@@ -1,7 +1,9 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
+
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
+
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
@@ -35,7 +37,7 @@ __device__ __forceinline__ float dec6(uint32_t b) {  // fp6 e2m3: s ee mmm, bias
 
 template <int K, int M>
 __global__ void __launch_bounds__(256) sm120_fp6_e2m3_gemv_kernel(
-    bf16_t* __restrict__ out,       // [M, N]
+    bf16_t* __restrict__ out,             // [M, N]
     const __nv_bfloat16* __restrict__ x,  // [M, K]
     const uint8_t* __restrict__ w,        // [N*K*6/8] packed codes
     const float* __restrict__ w_s,        // [N/32, K/32]
@@ -51,7 +53,8 @@ __global__ void __launch_bounds__(256) sm120_fp6_e2m3_gemv_kernel(
   const __nv_bfloat16* x_row = x;  // [M, K]
   float acc[M];
 #pragma unroll
-  for (int m = 0; m < M; ++m) acc[m] = 0.f;
+  for (int m = 0; m < M; ++m)
+    acc[m] = 0.f;
 
   // Each pass consumes 128 codes: lane covers 4 codes at code index
   // p * 128 + lane * 4, i.e. byte p * 96 + lane * 3.
@@ -91,11 +94,13 @@ __global__ void __launch_bounds__(256) sm120_fp6_e2m3_gemv_kernel(
 #pragma unroll
   for (int o = 16; o; o >>= 1) {
 #pragma unroll
-    for (int m = 0; m < M; ++m) acc[m] += __shfl_xor_sync(0xffffffffu, acc[m], o);
+    for (int m = 0; m < M; ++m)
+      acc[m] += __shfl_xor_sync(0xffffffffu, acc[m], o);
   }
   if (lane == 0) {
 #pragma unroll
-    for (int m = 0; m < M; ++m) out[static_cast<size_t>(m) * N + n] = static_cast<bf16_t>(acc[m]);
+    for (int m = 0; m < M; ++m)
+      out[static_cast<size_t>(m) * N + n] = static_cast<bf16_t>(acc[m]);
   }
 }
 
@@ -126,14 +131,30 @@ struct Sm120Fp6E2m3GemvKernel {
           N);
     };
     switch (M) {
-      case 1: launch(sm120_fp6_e2m3_gemv_kernel<K, 1>); break;
-      case 2: launch(sm120_fp6_e2m3_gemv_kernel<K, 2>); break;
-      case 3: launch(sm120_fp6_e2m3_gemv_kernel<K, 3>); break;
-      case 4: launch(sm120_fp6_e2m3_gemv_kernel<K, 4>); break;
-      case 5: launch(sm120_fp6_e2m3_gemv_kernel<K, 5>); break;
-      case 6: launch(sm120_fp6_e2m3_gemv_kernel<K, 6>); break;
-      case 7: launch(sm120_fp6_e2m3_gemv_kernel<K, 7>); break;
-      case 8: launch(sm120_fp6_e2m3_gemv_kernel<K, 8>); break;
+      case 1:
+        launch(sm120_fp6_e2m3_gemv_kernel<K, 1>);
+        break;
+      case 2:
+        launch(sm120_fp6_e2m3_gemv_kernel<K, 2>);
+        break;
+      case 3:
+        launch(sm120_fp6_e2m3_gemv_kernel<K, 3>);
+        break;
+      case 4:
+        launch(sm120_fp6_e2m3_gemv_kernel<K, 4>);
+        break;
+      case 5:
+        launch(sm120_fp6_e2m3_gemv_kernel<K, 5>);
+        break;
+      case 6:
+        launch(sm120_fp6_e2m3_gemv_kernel<K, 6>);
+        break;
+      case 7:
+        launch(sm120_fp6_e2m3_gemv_kernel<K, 7>);
+        break;
+      case 8:
+        launch(sm120_fp6_e2m3_gemv_kernel<K, 8>);
+        break;
       default:
         host::RuntimeCheck(false, "fp6 e2m3 gemv supports M <= 8, got ", M);
     }

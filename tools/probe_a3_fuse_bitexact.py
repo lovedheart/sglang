@@ -105,13 +105,39 @@ def old_path(x, d8, ds, u8, us, hc, hs):
     )
     BM, BN, BK = 128, 64, 256
     _old_down_kernel[(triton.cdiv(rows, BM), triton.cdiv(lowrank, BN))](
-        a8, asf, d8, ds, t8, tsf, rows, k, lowrank, 1.0 / hc,
-        BM=BM, BN=BN, BK=BK, NKB=k // 32, num_warps=8, num_stages=2,
+        a8,
+        asf,
+        d8,
+        ds,
+        t8,
+        tsf,
+        rows,
+        k,
+        lowrank,
+        1.0 / hc,
+        BM=BM,
+        BN=BN,
+        BK=BK,
+        NKB=k // 32,
+        num_warps=8,
+        num_stages=2,
     )
     _hc_mix_a8w8_up_kernel[(triton.cdiv(rows, 64), hs // 64)](
-        t8, tsf, u8, us, x, out, rows,
-        LOWRANK=lowrank, HS=hs, HC=hc, BM=64, BN=64, BK=64,
-        num_warps=4, num_stages=3,
+        t8,
+        tsf,
+        u8,
+        us,
+        x,
+        out,
+        rows,
+        LOWRANK=lowrank,
+        HS=hs,
+        HC=hc,
+        BM=64,
+        BN=64,
+        BK=64,
+        num_warps=4,
+        num_stages=3,
     )
     return out
 
@@ -144,11 +170,13 @@ def main():
             eq = torch.equal(o_old, o_new)
             print(f"rows={rows:5d} seed={seed} torch.equal={eq}")
             if not eq:
-                bad = (o_old != o_new)
+                bad = o_old != o_new
                 nm = int(bad.sum())
                 pos = bad.nonzero()[:5].tolist()
                 for r, c in pos:
-                    print(f"  mismatch [{r},{c}]: old={o_old[r,c].item()} new={o_new[r,c].item()}")
+                    print(
+                        f"  mismatch [{r},{c}]: old={o_old[r, c].item()} new={o_new[r, c].item()}"
+                    )
                 failures.append((rows, seed, nm))
             del x, o_old, o_new
             torch.cuda.empty_cache()

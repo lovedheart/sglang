@@ -20,8 +20,9 @@ import subprocess
 import tempfile
 
 import pytest
-import sglang.srt.layers.attention.qsa.sparse_decode as _sd
 import torch
+
+import sglang.srt.layers.attention.qsa.sparse_decode as _sd
 
 # Production QSA shape (config.json text_config): head_dim 256, 2 kv heads,
 # 24 q heads, indexer budget 2048 -> final_topk row width 2051.
