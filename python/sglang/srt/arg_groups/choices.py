@@ -209,6 +209,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
     "sm12x_nvfp4_bf16",  # SM120/SM121 NVFP4 W4A16 (BF16 activations) CuTe DSL MoE
+    "sm12x_mxfp4",  # SM120/SM121 MXFP4 W4A16 (BF16 activations) CuTe DSL MoE
     "flashinfer_megamoe",
     "cutlass",
     "aiter",

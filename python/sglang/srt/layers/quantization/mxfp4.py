@@ -398,6 +398,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # MoE runner, so it needs the same unpadded checkpoint layout and
         # DeepGEMM scale preparation even when the runner is flashinfer_mxfp4.
         self.use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        # SM12x (RTX PRO / 50-series) MXFP4 W4A16 CuTe DSL fused MoE kernel:
+        # BF16 activations, E8M0 g32 scales re-packed at 16-group swizzle
+        # granularity post-load (see _process_weights_for_sm12x_mxfp4).
+        self.use_sm12x_mxfp4 = get_moe_runner_backend().is_sm12x_mxfp4()
+        if self.use_sm12x_mxfp4 and not get_platform().is_sm120:
+            raise NotImplementedError(
+                "moe_runner_backend=sm12x_mxfp4 requires an SM120/SM121 GPU."
+            )
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
@@ -470,9 +478,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad
                 - layer.intermediate_size_per_partition
             )
-        elif self.use_deep_gemm or self.use_mega_moe:
+        elif self.use_deep_gemm or self.use_mega_moe or self.use_sm12x_mxfp4:
             # DeepGEMM fp8_fp4 grouped GEMM consumes the checkpoint layout
             # directly (packed e2m1 K-major + ue8m0 g32 scales); no padding.
+            # The sm12x W4A16 path likewise keeps the checkpoint sizes here
+            # (its post-load processor pads to kernel buckets itself, after
+            # de-interleaving gate/up rows -- padding here would move the
+            # loader's naive-copy split boundary).
             pass
         elif get_platform().is_sm100:
             if self.use_flashinfer:
@@ -733,6 +745,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
         if self._fi_kernel == "b12x_sm120":
             self._process_weights_for_sm120_b12x(layer)
+            return
+        if self.use_sm12x_mxfp4:
+            self._process_weights_for_sm12x_mxfp4(layer)
             return
         if self.use_flashinfer:
             # Per-expert buffers are local (create_weights uses num_local_experts);
@@ -1464,6 +1479,93 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer._mxfp4_backend = "flashinfer_cutlass_sm120"
         torch.cuda.empty_cache()
 
+    def _process_weights_for_sm12x_mxfp4(self, layer):
+        """Prepare MXFP4 experts for the SM12x CuTe-DSL W4A16 fused MoE kernel.
+
+        The kernel wants (a) w13 rows in halved ``[gate; up]`` order (gate
+        first), (b) E8M0 block scales in the 128x4-swizzled NVFP4-style
+        layout at *16-group* granularity. MXFP4 stores one scale per 32
+        groups, so each E8M0 byte is duplicated to cover both 16-halves of
+        its 32-block; inside the kernel the two duplicated reads decode to
+        the same 2^(b-127) factor, which is exactly the MXFP4 semantics
+        (see sm12x_mxfp4_w4a16_moe.py ``_sfsplit``). No global scales
+        exist in an MXFP4 checkpoint, so ``*_gs`` are ones (kept as real
+        tensors because the kernel multiplies them per expert).
+
+        The kernel expresses SwiGLU(silu) only; checkpoints calibrated with
+        a different expert activation (GPT-OSS gelu-tanh, gemm1_alpha) are
+        rejected at runner time, not silently misrepresented here.
+        """
+        from sglang.srt.layers.quantization.utils import swizzle_blockscale
+
+        if layer.moe_ep_size != 1 or layer.moe_tp_size != 1:
+            raise NotImplementedError(
+                "sm12x_mxfp4 does not support expert or tensor parallelism "
+                f"(got ep={layer.moe_ep_size}, tp={layer.moe_tp_size})."
+            )
+        for name in ("w13_weight_bias", "w2_weight_bias"):
+            bias = getattr(layer, name, None)
+            if bias is not None and bias.abs().amax().item() != 0.0:
+                raise NotImplementedError(f"sm12x_mxfp4 supports no expert bias ({name} is nonzero).")
+
+        w13 = layer.w13_weight.data.view(torch.uint8)  # [E, 2I, H/2]
+        s13 = layer.w13_weight_scale.data.view(torch.uint8)  # [E, 2I, H/32]
+        w2 = layer.w2_weight.data.view(torch.uint8)  # [E, H, I/2]
+        s2 = layer.w2_weight_scale.data.view(torch.uint8)  # [E, H, I/32]
+        e, n_un, half = w13.shape
+        i_un = n_un // 2
+        dev = w13.device
+
+        # Gate/up order in the loaded buffer: HF interleaves [g0,u0,g1,u1,...]
+        # unless the architecture loaded halved rows already.
+        interleaved = getattr(layer.moe_runner_config, "gate_up_interleaved", True)
+        if interleaved:
+            gate_w, up_w = w13[:, 0::2], w13[:, 1::2]
+            gate_s, up_s = s13[:, 0::2], s13[:, 1::2]
+        else:
+            gate_w, up_w = w13[:, :i_un], w13[:, i_un:]
+            gate_s, up_s = s13[:, :i_un], s13[:, i_un:]
+
+        def _swizzle_dup(scale_ng: torch.Tensor) -> torch.Tensor:
+            # [E, rows, K/32] -> duplicated [E, rows, K/16] -> 128x4 swizzled
+            dup = scale_ng.repeat_interleave(2, dim=-1)
+            return swizzle_blockscale(dup.view(torch.float8_e4m3fn)).view(torch.uint8)
+
+        w13_gu = torch.cat([gate_w, up_w], dim=1).contiguous()
+        s13_sw = _swizzle_dup(torch.cat([gate_s, up_s], dim=1).contiguous())
+        s2_sw = _swizzle_dup(s2.contiguous())
+
+        layer.w13_weight.data = w13_gu
+        layer.w2_weight.data = w2
+        layer.w13_weight_scale = Parameter(s13_sw, requires_grad=False)
+        layer.w2_weight_scale = Parameter(s2_sw, requires_grad=False)
+        ones = torch.ones(e, dtype=torch.float32, device=dev)
+        layer.w13_gs = Parameter(ones, requires_grad=False)
+        layer.w2_gs = Parameter(ones.clone(), requires_grad=False)
+        layer._mxfp4_backend = "sm12x_mxfp4"
+
+    def _apply_sm12x_mxfp4(self, layer, dispatch_output):
+        from sglang.srt.layers.moe.moe_runner.sm12x_mxfp4 import (
+            Sm12xMxfp4W4A16MoeQuantInfo,
+        )
+
+        cfg = self.moe_runner_config
+        if cfg.gemm1_alpha is not None or getattr(cfg, "swiglu_limit", None):
+            raise NotImplementedError(
+                "sm12x_mxfp4's fused kernel implements plain silu-gated SwiGLU; "
+                "situ/gelu-tanh checkpoints (gemm1_alpha/swiglu_limit) need an "
+                "activation-specialized kernel build."
+            )
+        quant_info = Sm12xMxfp4W4A16MoeQuantInfo(
+            w13=layer.w13_weight.data,
+            w13_sf=layer.w13_weight_scale.data,
+            w13_gs=layer.w13_gs.data,
+            w2=layer.w2_weight.data,
+            w2_sf=layer.w2_weight_scale.data,
+            w2_gs=layer.w2_gs.data,
+        )
+        return self.runner.run(dispatch_output, quant_info)
+
     def _process_weights_for_sm120_b12x(self, layer):
         """Prepare MXFP4 experts for FlashInfer's SM12x CuTe-DSL b12x backend.
 
@@ -1582,6 +1684,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_marlin()
             or moe_runner_backend.is_deep_gemm()
         ):
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        elif moe_runner_backend.is_sm12x_mxfp4():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         elif moe_runner_backend.is_flashinfer_mxfp4() and self._fi_kernel in (
             "cutlass_sm90",
@@ -1879,6 +1983,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.use_marlin:
             assert TopKOutputChecker.format_is_standard(topk_output)
             return self._apply_marlin(layer, dispatch_output)
+
+        if self.use_sm12x_mxfp4:
+            return self._apply_sm12x_mxfp4(layer, dispatch_output)
 
         if self._fi_kernel == "cutlass_sm90":
             return self._apply_sm90_cutlass(layer, dispatch_output)
