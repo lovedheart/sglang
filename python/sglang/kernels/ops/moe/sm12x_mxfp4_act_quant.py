@@ -1,6 +1,7 @@
-# Fork note: this file mirrors gemm_dev/sm12x_mxfp4/mxfp4_w4a4_moe.py byte-
-# identical except this header block (source of truth stays in gemm_dev).
-# MXFP4 W4A4 grouped MoE on the native b12x MmaMXF4 dense_gemm (3D grouped
+# Fork note: this file mirrors gemm_dev/sm12x_mxfp4/mxfp4_act_quant.py (source
+# of truth stays in gemm_dev); only this header and style/format edits differ.
+# ----
+# MXFP4 activation quantizer used by the W4A4 drivers (b12x swizzled E8M0
 # contract: expert-block-major A/B, swizzled E8M0 scales, alpha=None).
 import torch
 import triton

@@ -19,7 +19,6 @@ Token counts are rounded up to the same bounded bucket ladder as
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -41,8 +40,6 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -78,8 +75,12 @@ _WORKSPACE_CACHE: dict[tuple, list[torch.Tensor]] = {}
 
 def _hybrid_buckets(max_num_tokens: int) -> tuple[int, ...]:
     """Same bucket ladder as sm12x_nvfp4_bf16 (kept duplicated on purpose so
-    the two backends never share a helper that one of them later tweaks)."""
+    the two backends never share a helper that one of them later tweaks):
+    multiples of 4 up to 128, of 8 to 256, steps of 256 to 2048, steps of
+    512 to 4096, powers of 2 beyond, plus the 1/2/... octave starts."""
     buckets = []
+    buckets += range(4, min(max_num_tokens, 128) + 1, 4)
+    buckets += range(136, min(max_num_tokens, 256) + 1, 8)
     m = 1
     while m <= min(max_num_tokens, 256):
         buckets.append(m)
@@ -203,6 +204,13 @@ def fused_experts_none_to_sm12x_mxfp4(
     topk_output = dispatch_output.topk_output
     topk_weights = topk_output.topk_weights
     topk_ids = topk_output.topk_ids
+
+    # Mxfp4MoEMethod never folds routed_scaling_factor into the top-k weights
+    # (it is not in _fuses_routed_scaling_factor_in_topk), so the runner owns
+    # applying it -- same contract as deep_gemm_sm120. Folding it into the
+    # per-slot weights is exact: the fused kernels emit sum_k w_k * expert_k.
+    if cfg.routed_scaling_factor is not None:
+        topk_weights = topk_weights * cfg.routed_scaling_factor
 
     t, h = hidden.shape
     e, n13, _ = quant_info.w13.shape

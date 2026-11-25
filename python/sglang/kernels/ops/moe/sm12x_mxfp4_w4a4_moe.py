@@ -1,5 +1,8 @@
-# Fork note: this file mirrors gemm_dev/sm12x_mxfp4/mxfp4_w4a4_moe.py byte-
-# identical except this header block (source of truth stays in gemm_dev).
+# Fork note: this file mirrors gemm_dev/sm12x_mxfp4/mxfp4_w4a4_moe.py (source of
+# truth stays in gemm_dev); only this header, style/format edits, and plan-time
+# review fixes differ (ladder-overflow raise, host-side count batching, dead
+# execute() params removed) -- kernels are unchanged.
+# ----
 # MXFP4 W4A4 grouped MoE on the native b12x MmaMXF4 dense_gemm (3D grouped
 # contract: expert-block-major A/B, swizzled E8M0 scales, alpha=None).
 from __future__ import annotations
@@ -137,23 +140,26 @@ class Mxfp4W4A4Runner:
         cnt = torch.bincount(sids, minlength=self.E)
         off = torch.zeros(self.E + 1, dtype=torch.int64, device=self.dev)
         off[1:] = torch.cumsum(cnt, 0)
-        m = next(v for v in LADDER if v >= int(cnt.max()))
+        cmax = int(cnt.max())
+        if cmax > LADDER[-1]:
+            raise ValueError(
+                f"Mxfp4W4A4Runner supports at most {LADDER[-1]} slots per "
+                f"expert, got {cmax}; split the expert across m-tiles or "
+                "extend LADDER."
+            )
+        m = next(v for v in LADDER if v >= cmax)
         tok = (order // tk).to(torch.int32)  # token per slot
         w = topk_weights.reshape(-1)[order].to(torch.float32)
 
+        cnt_host = cnt.tolist()  # one device->host sync, not one per expert
         buckets = []
         e0 = 0
         while e0 < self.E:
-            if cnt[e0].item() == 0:
+            if cnt_host[e0] == 0:
                 e0 += 1
                 continue
             e1 = e0 + 1
-            while (
-                e1 < self.E
-                and cnt[e1].item()
-                and cnt[e1].item() <= m
-                and (e1 - e0) < 64
-            ):
+            while e1 < self.E and cnt_host[e1] and cnt_host[e1] <= m and (e1 - e0) < 64:
                 e1 += 1
             L = e1 - e0
             cs = cnt[e0:e1]
@@ -167,8 +173,9 @@ class Mxfp4W4A4Runner:
             e0 = e1
         return tok, w, buckets
 
-    def execute(self, hidden, topk_ids, topk_weights, tok, w, buckets, out=None):
-        """Capture-safe given a fixed plan: constant shapes, no host syncs."""
+    def execute(self, hidden, tok, w, buckets, out=None):
+        """Capture-safe given a fixed plan (``plan`` consumed the topk pair):
+        constant shapes, no host syncs."""
         T, H = hidden.shape
         I, Ipad = self.I, self.Ipad
         xsorted = hidden[tok.long()]
@@ -226,4 +233,4 @@ class Mxfp4W4A4Runner:
 
     def run(self, hidden, topk_ids, topk_weights, out=None):
         tok, w, buckets = self.plan(topk_ids, topk_weights)
-        return self.execute(hidden, topk_ids, topk_weights, tok, w, buckets, out)
+        return self.execute(hidden, tok, w, buckets, out)

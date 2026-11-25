@@ -1,5 +1,7 @@
-# Fork note: this file mirrors gemm_dev/sm12x_mxfp4/mxfp4_w4a4_flat.py byte-
-# identical except this header block (source of truth stays in gemm_dev).
+# Fork note: this file mirrors gemm_dev/sm12x_mxfp4/mxfp4_w4a4_flat.py (source
+# of truth stays in gemm_dev); only this header and review fixes differ (shape
+# guards, unconditional moe_align import, env hoist, dead code removal).
+# ----
 # Flat-token grouped W4A4 (Triton tl.dot_scaled) — replaces the 3D dense_gemm
 # bucketed driver once registered in the sglang runner.
 # Flat-token grouped W4A4 MoE for MXFP4 (M2e): kills the 6.4x per-expert m-padding
@@ -13,16 +15,15 @@
 # Numerics gate: fp64 requant-oracle relL2 <= 9.5e-2.
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
-try:
-    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
-        moe_align_block_size,
-    )
-except ImportError:  # gemm_dev standalone
-    moe_align_block_size = None
+from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+    moe_align_block_size,
+)
 
 _BM_MAX = 128  # align-tile ceiling for workspace sizing (runtime picks 16-128)
 
@@ -30,8 +31,6 @@ _BM_MAX = 128  # align-tile ceiling for workspace sizing (runtime picks 16-128)
 def _align_bm(npair: int, num_experts: int) -> int:
     """Low slots/expert -> small tile (padding dominates); high -> BM=32
     (tile efficiency dominates). Measured crossover ~16 slots/expert."""
-    import os
-
     fb = os.environ.get("FLAT_BM")
     if fb:
         return int(fb)
@@ -222,14 +221,9 @@ def _w4a4_gemm_flat(
         a = tl.load(a_ptr + r[:, None] * (K // 2) + ak[None, :])
         ask = kb * (BK // 32) + tl.arange(0, BK // 32)
         asc = tl.load(as_ptr + r[:, None] * (K // 32) + ask[None, :])
-        if OUT_MODE == 0:
-            b = tl.load(w_ptr + (e * N + ns[None, :]) * (K // 2) + ak[:, None])
-            bsc = tl.load(ws_ptr + (e * N + ns[:, None]) * (K // 32) + ask[None, :])
-            acc = tl.dot_scaled(a, asc, "e2m1", b, bsc, "e2m1", acc)
-        else:
-            b = tl.load(w_ptr + (e * N + ns[None, :]) * (K // 2) + ak[:, None])
-            bsc = tl.load(ws_ptr + (e * N + ns[:, None]) * (K // 32) + ask[None, :])
-            acc = tl.dot_scaled(a, asc, "e2m1", b, bsc, "e2m1", acc)
+        b = tl.load(w_ptr + (e * N + ns[None, :]) * (K // 2) + ak[:, None])
+        bsc = tl.load(ws_ptr + (e * N + ns[:, None]) * (K // 32) + ask[None, :])
+        acc = tl.dot_scaled(a, asc, "e2m1", b, bsc, "e2m1", acc)
     if OUT_MODE == 0:
         tl.store(
             out_ptr + r[:, None] * N + ns[None, :], acc.to(out_ptr.dtype.element_ty)
@@ -263,7 +257,7 @@ def _reduce_topk_kernel(
         pos = tl.load(sid_ptr + t * TOPK + k)  # sid_ptr = inv (slot->pos)
         acc += tl.load(
             part_ptr + pos.to(tl.int64) * N + col,
-            mask=col[None if False else 0] < N if False else col < N,
+            mask=col < N,
             other=0.0,
         ).to(tl.float32)
     tl.store(out_ptr + t * N + col, acc.to(out_ptr.dtype.element_ty), mask=col < N)
@@ -303,7 +297,31 @@ def run_moe_w4a4_flat(
     topk = topk_ids.shape[1]
     dev = hidden_states.device
     npair = t * topk
-    assert t <= 65536, "flat path"
+    if t > 65536:
+        raise ValueError(f"flat W4A4 path supports at most 65536 tokens, got {t}.")
+    # The launch grids below are floor divisions by the tile sizes; a
+    # non-multiple geometry would silently skip the tail tile and return
+    # wrong output, so reject it up front.
+    _g1bn = int(os.environ.get("FLAT_G1BN", "256"))
+    _g1bk = int(os.environ.get("FLAT_G1BK", "256"))
+    _g2bn = int(os.environ.get("FLAT_G2BN", "256"))
+    _g2bk = int(os.environ.get("FLAT_G2BK", "128"))
+    checks = [
+        ((2 * i) % _g1bn == 0, f"2*intermediate ({2 * i}) / G1 BN {_g1bn}"),
+        (h % _g1bk == 0, f"hidden ({h}) / G1 BK {_g1bk}"),
+        (h % _g2bn == 0, f"hidden ({h}) / G2 BN {_g2bn}"),
+        (i % _g2bk == 0, f"intermediate ({i}) / G2 BK {_g2bk}"),
+        (i % 64 == 0, f"intermediate ({i}) / silu tile 64"),
+    ]
+    _fbm = os.environ.get("FLAT_BM")
+    if _fbm:
+        checks.append((int(_fbm) <= _BM_MAX, f"FLAT_BM {_fbm} / cap {_BM_MAX}"))
+    bad = [msg for ok, msg in checks if not ok]
+    if bad:
+        raise ValueError(
+            "flat W4A4 needs tile-aligned geometry, got h="
+            f"{h}, i={i}: not divisible: " + "; ".join(bad)
+        )
     ws = (
         workspace
         if workspace is not None
@@ -343,12 +361,6 @@ def run_moe_w4a4_flat(
         TOPK=topk,
         num_warps=4,
     )
-    import os
-
-    _g1bn = int(os.environ.get("FLAT_G1BN", "256"))
-    _g1bk = int(os.environ.get("FLAT_G1BK", "256"))
-    _g2bn = int(os.environ.get("FLAT_G2BN", "256"))
-    _g2bk = int(os.environ.get("FLAT_G2BK", "128"))
     _w4a4_gemm_flat[(rp // bm * (2 * i // _g1bn),)](
         sa,
         sas,

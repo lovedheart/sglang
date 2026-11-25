@@ -1503,8 +1503,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             + ((rv // 32) % 4)
         )
         addr = (w * 4 + (kbv % 2)).reshape(-1)
-        blk = torch.arange(e_, device=dev)[:, None] * (mp * kp)
-        out.index_put_(((blk + addr).reshape(-1),), scale_ng.reshape(-1))
+        # Chunk over experts so the int64 gather indices (addr + flat slot
+        # list) stay bounded to one chunk instead of E*R*K/32 int64s.
+        chunk = max(1, 4_000_000 // max(1, r_ * kt))
+        for e0 in range(0, e_, chunk):
+            e1 = min(e_, e0 + chunk)
+            slots = torch.arange(e0, e1, device=dev)[:, None] * (mp * kp) + addr
+            out.index_put_((slots.reshape(-1),), scale_ng[e0:e1].reshape(-1))
         return out.view(e_, mp, kp)
 
     def _process_weights_for_sm12x_mxfp4(self, layer):
@@ -1574,12 +1579,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # re-swizzled into the 4-byte-word layout (vec32 block kb32 lives in
         # byte lane kb32 % 2 of word (kb32 // 2)); numerics verified
         # end-to-end in gemm_dev M5 (test_mxfp4_cute.py, relL2 0.0201).
-        layer.w13_weight_scale_w4a4 = Parameter(
-            self._swizzle_w4a4_words(s13_ng), requires_grad=False
-        )
-        layer.w2_weight_scale_w4a4 = Parameter(
-            self._swizzle_w4a4_words(s2.contiguous()), requires_grad=False
-        )
+        # Build only when the arm is enabled -- the env must be set before
+        # weight load; with it at 0 the arm stays None (pure W4A16) instead
+        # of paying a second swizzled scale grid per layer.
+        if envs.SGLANG_SM12X_MXFP4_W4A4_MIN_TOKENS.get() > 0:
+            layer.w13_weight_scale_w4a4 = Parameter(
+                self._swizzle_w4a4_words(s13_ng), requires_grad=False
+            )
+            layer.w2_weight_scale_w4a4 = Parameter(
+                self._swizzle_w4a4_words(s2.contiguous()), requires_grad=False
+            )
+        else:
+            layer.w13_weight_scale_w4a4 = None
+            layer.w2_weight_scale_w4a4 = None
         ones = torch.ones(e, dtype=torch.float32, device=dev)
         layer.w13_gs = Parameter(ones, requires_grad=False)
         layer.w2_gs = Parameter(ones.clone(), requires_grad=False)
@@ -1604,12 +1616,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2=layer.w2_weight.data,
             w2_sf=layer.w2_weight_scale.data,
             w2_gs=layer.w2_gs.data,
-            w13_sf_w4a4=getattr(layer, "w13_weight_scale_w4a4", None).data
-            if getattr(layer, "w13_weight_scale_w4a4", None) is not None
-            else None,
-            w2_sf_w4a4=getattr(layer, "w2_weight_scale_w4a4", None).data
-            if getattr(layer, "w2_weight_scale_w4a4", None) is not None
-            else None,
+            w13_sf_w4a4=None
+            if layer.w13_weight_scale_w4a4 is None
+            else layer.w13_weight_scale_w4a4.data,
+            w2_sf_w4a4=None
+            if layer.w2_weight_scale_w4a4 is None
+            else layer.w2_weight_scale_w4a4.data,
         )
         return self.runner.run(dispatch_output, quant_info)
 

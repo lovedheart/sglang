@@ -1,5 +1,7 @@
-# Fork note: this file mirrors gemm_dev/sm12x_mxfp4/mxfp4_w4a8_kernel.py
-# byte-identical except this header block (source of truth stays in gemm_dev).
+# Fork note: this file mirrors gemm_dev/sm12x_mxfp4/mxfp4_w4a8_kernel.py (source
+# of truth stays in gemm_dev); only this header, style/format edits, and
+# launch-geometry guards in the driver differ -- kernels are unchanged.
+# ----
 # MXFP4 W4A8 decode MoE: fork of sm12x_nvfp4_w4a8_moe.py (search "MXFP4:");
 # e2m1 PRMT->fp8 decode, per-K32 E8M0 pow2 fold in fp32 between group dots,
 # row-major [E,N,K/32] scales, no global scales.
@@ -248,7 +250,7 @@ def allocate_workspace(
     npair = num_tokens * top_k
     cap = npair + (num_experts + 1) * (_BLOCK - 1)
     cap = (cap + 3) // 4 * 4
-    eblocks = triton.cdiv(cap, _BLOCK)
+
     z = torch.zeros
     return {
         "cap": cap,
@@ -276,6 +278,15 @@ def run_moe_w4a4m(
         if workspace is not None
         else allocate_workspace(t, h, i, e, topk, dev)
     )
+    # gemm1's grid truncates 2*i by BN 256, gemm2's truncates h by BN 128, and
+    # both dot loops truncate K by the 32-wide MX scale group; a non-multiple
+    # would silently drop the tail, so reject it here.
+    if (2 * i) % 256 or h % 128 or h % 32 or i % 32:
+        raise ValueError(
+            "sm12x W4A8 needs h, i tile-aligned: "
+            f"2*intermediate({2 * i})%256, hidden({h})%128, "
+            f"hidden({h})%32, intermediate({i})%32 must all be zero."
+        )
 
     x8, x_s = ws["a8"], ws["a_s"]
     _row_quant[(t,)](

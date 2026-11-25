@@ -1,5 +1,7 @@
-# Fork note: this file mirrors gemm_dev/sm12x_mxfp4/mxfp4_w4a4_cute.py byte-
-# identical except this header block (source of truth stays in gemm_dev).
+# Fork note: this file mirrors gemm_dev/sm12x_mxfp4/mxfp4_w4a4_cute.py (source
+# of truth stays in gemm_dev); only this header and formatter re-wrapping
+# differ.
+# ----
 # MXFP4 (E2M1 x E2M1, UE8M0 vec-32 block scales) CuTe DSL grouped MoE for
 # SM120, forked from flashinfer's NVFP4 moe_nvfp4_w4a4 kernel. See
 # gemm_dev/sm12x_mxfp4/M5_SURGERY.md for the surgery map. Not yet wired into
@@ -1010,6 +1012,8 @@ def _build(T, H, I, N13, E, TOPK, swiglu):
                             acc,
                         )
 
+                # MX has no global scales (nvfp4 legacy); kept as 1.0 so the
+                # epilogue formulas stay identical to the nvfp4 source.
                 scale = F32(1.0)
                 if cutlass.const_expr(fuse):
                     MN = BN // 32
