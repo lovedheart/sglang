@@ -208,10 +208,109 @@ def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
     # other projection weights once they are loaded, as it does for FP8.
 
 
+_NVFP4_DRAFT_ALGORITHMS = frozenset({"EAGLE", "EAGLE3", "NEXTN"})
+
+
+def _draft_runner_is_qsa(cfg: Any, server_args: Any) -> bool:
+    """Whether the draft runner will be built on the QSA backend."""
+    from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+    try:
+        from sglang.srt.hf_transformers import get_config
+
+        path = cfg.speculative_draft_model_path or server_args.model_path
+        if cfg.speculative_draft_model_path:
+            revision = cfg.speculative_draft_model_revision or cfg.revision
+        else:
+            revision = cfg.revision
+        hf_config = get_config(
+            path, revision=revision, trust_remote_code=cfg.trust_remote_code
+        )
+    except Exception:
+        return False
+    return hf_config is not None and is_qwen_qsa(hf_config)
+
+
+def _handle_nvfp4_draft_kv_cache(cfg: Any, server_args: Any) -> None:
+    """Validate an explicit ``--speculative-draft-kv-cache-dtype=nvfp4``.
+
+    The draft worker owns its own KV pool, so an explicit draft dtype packs it
+    as FP4 even when the target's cache is unquantized. Only backends with an
+    FP4 read path can serve a draft phase; check both phases against the same
+    registry the attention backends negotiate with.
+    """
+    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        KVCacheAttentionPhase,
+        describe_kv_cache_attention_backends,
+        resolve_kv_cache_attention_access,
+    )
+
+    if not (get_platform().is_sm100 or get_platform().is_sm120):
+        raise ValueError(
+            "--speculative-draft-kv-cache-dtype=nvfp4 requires Blackwell "
+            "SM100 or SM120 (packed FP4 storage and FP4 KV reads)."
+        )
+    algorithm = (
+        cfg.speculative_algorithm.upper()
+        if cfg.speculative_algorithm is not None
+        else None
+    )
+    if algorithm is None or algorithm == "NGRAM":
+        # No draft KV pool exists for these; the flag is inert, but say so:
+        # the operator asked for a pool the run will never build.
+        logger.warning(
+            "--speculative-draft-kv-cache-dtype=nvfp4 has no effect without "
+            "an EAGLE/EAGLE3/NEXTN draft worker (algorithm: %s).",
+            cfg.speculative_algorithm,
+        )
+        return
+    if algorithm not in _NVFP4_DRAFT_ALGORITHMS:
+        raise ValueError(
+            "--speculative-draft-kv-cache-dtype=nvfp4 supports the "
+            "EAGLE/EAGLE3/NEXTN draft workers; got "
+            f"{cfg.speculative_algorithm}."
+        )
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "--speculative-draft-kv-cache-dtype=nvfp4 does not support "
+            "--enable-unified-memory: the unified plan has no FP4 draft "
+            "region views."
+        )
+    if _draft_runner_is_qsa(cfg, server_args):
+        # A QSA draft runner always runs on its own QSA backend in both
+        # phases (DraftBackendFactory ignores the named draft backend); QSA
+        # reads packed FP4 rows by gather-dequant.
+        backends_by_phase = {
+            KVCacheAttentionPhase.PREFILL: "qsa",
+            KVCacheAttentionPhase.DECODE: "qsa",
+        }
+    else:
+        prefill_backend, decode_backend = attention_backends_of(
+            resolved_view(server_args)
+        )
+        draft_backend = cfg.speculative_draft_attention_backend
+        backends_by_phase = {
+            KVCacheAttentionPhase.PREFILL: draft_backend or prefill_backend,
+            KVCacheAttentionPhase.DECODE: draft_backend or decode_backend,
+        }
+    for phase, backend in backends_by_phase.items():
+        if resolve_kv_cache_attention_access("nvfp4", phase, backend) is None:
+            raise ValueError(
+                "--speculative-draft-kv-cache-dtype=nvfp4: the draft "
+                f"{phase.value} backend {backend!r} has no FP4 KV read path. "
+                f"Backends that can read nvfp4 {phase.value} KV: "
+                f"{describe_kv_cache_attention_backends('nvfp4', phase)}; or "
+                "set --speculative-draft-kv-cache-dtype to bf16/fp8_e4m3."
+            )
+
+
 def handle_kv4_compatibility(server_args: Any) -> None:
     """Check FP4 KV cache compatibility with the attention backend"""
 
     cfg = resolving_view(server_args)
+
+    if cfg.speculative_draft_kv_cache_dtype == "nvfp4":
+        _handle_nvfp4_draft_kv_cache(cfg, server_args)
 
     if cfg.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
         return

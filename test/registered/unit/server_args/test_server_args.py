@@ -1701,6 +1701,111 @@ class TestKV4Compatibility(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
             handle_kv4_compatibility(args)
 
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=False)
+    def test_nvfp4_draft_kv_requires_blackwell(self):
+        # The draft dtype is explicit; the target stays unquantized, so only
+        # the draft-side validation can catch an unsupported platform.
+        args = ServerArgs(
+            model_path="dummy",
+            attention_backend="trtllm_mha",
+            speculative_algorithm="NEXTN",
+            speculative_draft_kv_cache_dtype="nvfp4",
+        )
+        with self.assertRaisesRegex(ValueError, "requires Blackwell"):
+            handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_nvfp4_draft_kv_rejects_backend_without_fp4_read(self):
+        args = ServerArgs(
+            model_path="dummy",
+            attention_backend="triton",
+            speculative_algorithm="NEXTN",
+            speculative_draft_kv_cache_dtype="nvfp4",
+        )
+        with self.assertRaisesRegex(ValueError, "no FP4 KV read path"):
+            handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_nvfp4_draft_kv_accepts_the_mixed_read_pair(self):
+        # Draft extend reads flashinfer's FP8 dequant workspace, draft decode
+        # reads packed FP4 through XQA: both phases have a read path.
+        args = ServerArgs(
+            model_path="dummy",
+            prefill_attention_backend="flashinfer",
+            decode_attention_backend="trtllm_mha",
+            speculative_algorithm="NEXTN",
+            speculative_draft_kv_cache_dtype="nvfp4",
+        )
+        handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_nvfp4_draft_kv_rejects_flashinfer_draft_backend(self):
+        # A named draft backend serves BOTH draft phases, and flashinfer has
+        # no nvfp4 decode read path.
+        args = ServerArgs(
+            model_path="dummy",
+            attention_backend="trtllm_mha",
+            speculative_algorithm="EAGLE",
+            speculative_draft_attention_backend="flashinfer",
+            speculative_draft_kv_cache_dtype="nvfp4",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "decode backend 'flashinfer' has no FP4 KV read path"
+        ):
+            handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_nvfp4_draft_kv_rejects_prefix_commit_spec_algorithms(self):
+        for algorithm in ("DFLASH", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                args = ServerArgs(
+                    model_path="dummy",
+                    attention_backend="trtllm_mha",
+                    speculative_algorithm=algorithm,
+                    speculative_draft_kv_cache_dtype="nvfp4",
+                )
+                with self.assertRaisesRegex(ValueError, "EAGLE/EAGLE3/NEXTN"):
+                    handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_nvfp4_draft_kv_accepts_qsa_draft_runner(self):
+        # Qwen3.8-Flash-Next shape: the target resolves triton/trtllm_mha,
+        # but the draft reads its own pool through a QSA backend (gather
+        # dequant), which has an nvfp4 read path in both phases.
+        from sglang.srt.arg_groups import kv_cache_hook
+
+        qsa_hf = SimpleNamespace(
+            indexer_n_heads=16,
+            indexer_kv_heads=1,
+            indexer_head_dim=128,
+            indexer_budget=2048,
+            indexer_compress_ratio=4,
+        )
+        args = ServerArgs(
+            model_path="dummy",
+            attention_backend="triton",
+            decode_attention_backend="trtllm_mha",
+            speculative_algorithm="NEXTN",
+            speculative_draft_kv_cache_dtype="nvfp4",
+        )
+        with patch(
+            "sglang.srt.hf_transformers.get_config",
+            return_value=qsa_hf,
+        ):
+            handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_nvfp4_draft_kv_rejects_unified_memory(self):
+        args = ServerArgs(
+            model_path="dummy",
+            attention_backend="trtllm_mha",
+            speculative_algorithm="NEXTN",
+            speculative_draft_kv_cache_dtype="nvfp4",
+            enable_unified_memory=True,
+        )
+        with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
+            handle_kv4_compatibility(args)
+
 
 _PLATFORM_KV_CACHE_DTYPE = "example_platform_kv"
 

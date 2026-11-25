@@ -584,7 +584,27 @@ class KVCacheConfigurator:
             device=self.device,
             page_size=self.page_size,
         )
-        quant_method.configure_attention_backends_from_server_args(self.server_args)
+        if self.is_draft_worker:
+            from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+
+            if parse_qsa_profile(self.model_config.hf_config) is not None:
+                # A QSA draft runner reads its pool through its own QSA
+                # backend (gather-dequant) in both phases, whatever the
+                # target and the named draft backend say.
+                quant_method.configure_attention_backends("qsa", "qsa")
+            else:
+                # The draft runner attends through the draft backend when the
+                # operator named one, else through the target's per-phase
+                # backends (see DraftBackendFactory). Price the pool's
+                # auxiliary buffers for what those backends will read.
+                draft_backend = get_spec().speculative_draft_attention_backend
+                prefill_backend, decode_backend = attention_backends()
+                quant_method.configure_attention_backends(
+                    draft_backend or prefill_backend,
+                    draft_backend or decode_backend,
+                )
+        else:
+            quant_method.configure_attention_backends_from_server_args(self.server_args)
         quant_method.load_scales_from_model(self.model)
         return quant_method
 

@@ -78,6 +78,47 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         self.assertEqual(dtype, torch.float8_e4m3fn)
         self.assertEqual(resolved, "fp8_e4m3")
 
+    def test_cli_accepts_nvfp4_draft_kv_dtype(self):
+        from sglang.srt.server_args import ServerArgs
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        action = next(
+            a
+            for a in parser._actions
+            if "--speculative-draft-kv-cache-dtype" in a.option_strings
+        )
+        self.assertIn("nvfp4", action.choices)
+
+    def test_nvfp4_attention_access_matrix(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            resolve_kv_cache_attention_access,
+        )
+
+        # The nvfp4 draft-KV boot check keys off this matrix. A rule may only
+        # move here once that backend's FP4 read path is actually wired.
+        readable = {
+            "prefill": {"flashinfer", "trtllm_mha", "qsa"},
+            "decode": {"trtllm_mha", "qsa"},
+        }
+        for phase, backends in readable.items():
+            for backend in backends:
+                self.assertIsNotNone(
+                    resolve_kv_cache_attention_access("nvfp4", phase, backend),
+                    f"{backend} should read nvfp4 {phase} KV",
+                )
+        for phase, backend in (
+            ("prefill", "triton"),
+            ("prefill", "fa3"),
+            ("decode", "flashinfer"),
+            ("decode", "triton"),
+            ("decode", "fa3"),
+        ):
+            self.assertIsNone(
+                resolve_kv_cache_attention_access("nvfp4", phase, backend),
+                f"{backend} must not claim an nvfp4 {phase} read path",
+            )
+
     def test_factory_unknown_raises(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             get_kv_cache_quant_method,
@@ -252,6 +293,25 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
             4096 + 512 + 512 + 2048,
         )
 
+    def test_qsa_only_pool_still_gets_linear_scales(self):
+        # Rung-0 finding: a pool read only by QSA gather-dequant (an nvfp4
+        # draft pool) must still allocate the token-linear scale buffers;
+        # without them the FP4 store path has nowhere to put block scales.
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            NVFP4KVCacheMethod,
+        )
+
+        size, heads, dim, layers = 64, 8, 128, 4
+        method = NVFP4KVCacheMethod(
+            num_layers=layers, device="cpu", page_size=16, native_scale_layout=True
+        )
+        method.configure_attention_backends("qsa", "qsa")
+        bufs = method.create_buffers(size, heads, dim, layers, "cpu")
+        self.assertIsNotNone(bufs["k_scale_buffer"])
+        self.assertIsNotNone(bufs["v_scale_buffer"])
+        self.assertIsNone(bufs["native_k_scale_buffer"])
+        self.assertIsNone(bufs["dq_k_buffer"])
+
     def test_server_args_backend_selection_uses_resolution_projection(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             KVCacheAttentionAccessKind,
@@ -290,6 +350,105 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
             [
                 KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
                 KVCacheAttentionAccessKind.NATIVE_FP4,
+            ],
+        )
+
+    def test_draft_runner_negotiates_the_draft_backends(self):
+        from sglang.srt.mem_cache import kv_cache_configurator as kcc
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            KVCacheAttentionAccessKind,
+            NVFP4KVCacheMethod,
+        )
+
+        # A named draft backend serves both draft phases, so the draft pool
+        # must size its aux buffers for the draft backend (native FP4), not
+        # for the target's pair (which here could not even read FP4 decode).
+        cfg = SimpleNamespace(
+            kv_cache_dtype=torch.float4_e2m1fn_x2,
+            kv_cache_dtype_str="nvfp4",
+            is_draft_worker=True,
+            device="cpu",
+            page_size=16,
+            model=None,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+            server_args=SimpleNamespace(),
+        )
+
+        def _make_method(name, **kwargs):
+            return NVFP4KVCacheMethod(native_scale_layout=True, **kwargs)
+
+        with (
+            patch.object(NVFP4KVCacheMethod, "load_scales_from_model"),
+            patch.object(kcc, "get_kv_cache_quant_method", side_effect=_make_method),
+            patch.object(
+                kcc,
+                "get_spec",
+                return_value=SimpleNamespace(
+                    speculative_draft_attention_backend="trtllm_mha"
+                ),
+            ),
+            patch.object(
+                kcc, "attention_backends", return_value=("flashinfer", "flashinfer")
+            ),
+        ):
+            method = kcc.KVCacheConfigurator._build_fp4_quant_method(cfg, num_layers=1)
+
+        self.assertEqual(
+            [access.kind for access in method.active_attention_accesses()],
+            [
+                KVCacheAttentionAccessKind.NATIVE_FP4,
+                KVCacheAttentionAccessKind.NATIVE_FP4,
+            ],
+        )
+
+    @unittest.skipUnless(
+        hasattr(torch, "float4_e2m1fn_x2"), "FP4 storage dtype required"
+    )
+    def test_qsa_draft_runner_negotiates_gather_dequant(self):
+        from sglang.srt.mem_cache import kv_cache_configurator as kcc
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            KVCacheAttentionAccessKind,
+            NVFP4KVCacheMethod,
+        )
+
+        # A QSA draft (Qwen3.8-Flash-Next NEXTN) always reads its own pool
+        # through the QSA gather-dequant path, whatever backends the target
+        # resolved to; the pool's scale layout must follow that, not them.
+        qsa_hf = SimpleNamespace(
+            indexer_n_heads=16,
+            indexer_kv_heads=1,
+            indexer_head_dim=128,
+            indexer_budget=2048,
+            indexer_compress_ratio=4,
+        )
+        cfg = SimpleNamespace(
+            kv_cache_dtype=torch.float4_e2m1fn_x2,
+            kv_cache_dtype_str="nvfp4",
+            is_draft_worker=True,
+            device="cpu",
+            page_size=16,
+            model=None,
+            model_config=SimpleNamespace(hf_config=qsa_hf),
+            server_args=SimpleNamespace(),
+        )
+
+        def _make_method(name, **kwargs):
+            return NVFP4KVCacheMethod(native_scale_layout=False, **kwargs)
+
+        with (
+            patch.object(NVFP4KVCacheMethod, "load_scales_from_model"),
+            patch.object(kcc, "get_kv_cache_quant_method", side_effect=_make_method),
+            patch.object(
+                kcc, "attention_backends", return_value=("triton", "trtllm_mha")
+            ),
+        ):
+            method = kcc.KVCacheConfigurator._build_fp4_quant_method(cfg, num_layers=1)
+
+        self.assertEqual(
+            [access.kind for access in method.active_attention_accesses()],
+            [
+                KVCacheAttentionAccessKind.GATHER_DEQUANT,
+                KVCacheAttentionAccessKind.GATHER_DEQUANT,
             ],
         )
 
