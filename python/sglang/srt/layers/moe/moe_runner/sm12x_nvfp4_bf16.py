@@ -61,7 +61,7 @@ class Sm12xNvfp4W4A16MoeQuantInfo(MoeQuantInfo):
     w2: torch.Tensor  # uint8 [E, H, I/2]
     w2_sf: torch.Tensor  # e4m3/uint8 [E, pad128(H), pad4(I/16)]
     w2_gs: torch.Tensor  # fp32 [E]
-    # Optional W4A4 prefill arm (flashinfer moe_nvfp4_w4a4, sibling of the
+    # Optional W4A4 prefill arm (vendored sm12x_nvfp4_w4a4_moe, sibling of the
     # vendored W4A16 kernel reading the same canonical weights). When set,
     # batches with at least SGLANG_SM12X_W4A4_PREFILL_MIN_TOKENS tokens
     # quantize activations to NVFP4 using these quantization multipliers
@@ -117,13 +117,13 @@ def _w4a4_workspace(
     device: torch.device,
 ) -> list[torch.Tensor]:
     """Per-bucket W4A4 workspace views carved from the shared arena."""
-    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_nvfp4_w4a4 import (
+    from sglang.kernels.ops.moe.sm12x_nvfp4_w4a4_moe import (
         allocate_workspace,
     )
 
     shapes = None
     try:
-        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_nvfp4_w4a4 import (
+        from sglang.kernels.ops.moe.sm12x_nvfp4_w4a4_moe import (
             _entry,
         )
 
@@ -319,7 +319,7 @@ def fused_experts_none_to_sm12x_nvfp4_bf16(
     # with an out-of-range expert id are skipped by the kernel.
     out = torch.empty((bucket, h), dtype=torch.bfloat16, device=hidden.device)
     if use_w4a4:
-        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_nvfp4_w4a4 import (
+        from sglang.kernels.ops.moe.sm12x_nvfp4_w4a4_moe import (
             run_moe_w4a4,
         )
 
