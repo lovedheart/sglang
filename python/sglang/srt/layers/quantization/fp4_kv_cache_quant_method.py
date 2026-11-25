@@ -202,6 +202,12 @@ class KVCacheQuantMethodBase(ABC):
             for access in self.active_attention_accesses()
         )
 
+    def has_gather_dequant_access(self) -> bool:
+        return any(
+            access.kind == KVCacheAttentionAccessKind.GATHER_DEQUANT
+            for access in self.active_attention_accesses()
+        )
+
     def needs_native_fp4_scales(self) -> bool:
         """Whether the pool needs a separate native FP4 scale layout."""
         return self.has_native_fp4_access()
@@ -505,8 +511,15 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
     def needs_linear_scale_buffer(self) -> bool:
         # FlashInfer DQ prefill always needs token-linear scales. SM120 XQA also
         # consumes the legacy linear layout instead of SM100's GenMHA layout.
-        return self.needs_dequant_workspace() or (
-            self.has_native_fp4_access() and not self.use_trtllm_gen_native_scale_layout
+        # Gather-dequant readers (QSA) index scales per token, so they need it
+        # too — even when no native-FP4 or workspace reader exists.
+        return (
+            self.needs_dequant_workspace()
+            or self.has_gather_dequant_access()
+            or (
+                self.has_native_fp4_access()
+                and not self.use_trtllm_gen_native_scale_layout
+            )
         )
 
     def scale_buffer_view_dtype(self) -> Optional[torch.dtype]:
@@ -1131,6 +1144,45 @@ def resolve_kv_cache_quant(kv_cache_dtype) -> Optional[str]:
     if kv_cache_dtype in KV_CACHE_QUANT_REGISTRY:
         return kv_cache_dtype
     return None
+
+
+def resolve_kv_cache_attention_access(
+    recipe: str,
+    phase,
+    backend_name: str,
+    backend_tags: Iterable[str] = (),
+) -> Optional[KVCacheAttentionAccess]:
+    """Registry rule for one (recipe, phase, backend), or None when that
+    backend cannot read the recipe's storage. Startup validation uses this
+    before any quant method (and its device tensors) exists."""
+    for access in KV_CACHE_ATTENTION_ACCESS_REGISTRY.get(recipe, ()):
+        if access.matches(phase, backend_name, backend_tags):
+            return access
+    return None
+
+
+def describe_kv_cache_attention_backends(recipe: str, phase) -> str:
+    """Backends with a read path for one recipe and phase, for boot errors.
+
+    Reads the registry rules directly so startup validation can describe the
+    supported matrix before any quant method (and its device tensors) exists.
+    """
+    return ", ".join(
+        sorted(
+            {
+                name
+                for access in KV_CACHE_ATTENTION_ACCESS_REGISTRY.get(recipe, ())
+                if access.phase == phase
+                # Mirror KVCacheBackendMatcher.matches(): a rule can name
+                # backends exactly, by tag, or take any backend.
+                for name in (
+                    access.backend_matcher.exact
+                    or access.backend_matcher.tags
+                    or ({"any"} if access.backend_matcher.any_backend else ())
+                )
+            }
+        )
+    )
 
 
 def get_kv_cache_quant_method(name: str, **kwargs) -> KVCacheQuantMethodBase:

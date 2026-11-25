@@ -158,9 +158,12 @@ class Spec(msgspec.Struct):
             "space), so for a small draft it can still rival the target pool: a 5-layer "
             "DFLASH draft costs 10240 bytes/token in bf16. Setting fp8_e4m3 halves the draft "
             "pool; the saving shows up as free device memory, so raise "
-            "--mem-fraction-static to convert it into KV capacity. Default follows "
+            "--mem-fraction-static to convert it into KV capacity. 'nvfp4' packs the draft "
+            "pool about four times smaller than bf16 but is readable only by backends with "
+            "an FP4 KV path (trtllm_mha native decode, flashinfer dequantized reads, or "
+            "qsa gather-dequant) on an EAGLE/EAGLE3/NEXTN draft. Default follows "
             "--kv-cache-dtype.",
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "nvfp4"],
             resolvable=True,
         ),
     ] = None
