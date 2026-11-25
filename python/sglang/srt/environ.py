@@ -1597,6 +1597,12 @@ class Envs:
     # safe margin, but the W4A4 arm quantizes activations (slightly less
     # accurate), so enabling it stays a deliberate accuracy tradeoff.
     SGLANG_SM12X_W4A4_PREFILL_MIN_TOKENS = EnvInt(0)
+
+    # MXFP4 W4A4 CuTe DSL arm (sm12x_mxfp4_w4a4_cute kernel) inside the
+    # sm12x_mxfp4 runner: token counts >= this value route to the W4A4
+    # fused kernel (BF16 x quantized to NVFP4 in-kernel, E8M0 word
+    # scales). 0 disables the arm and everything stays W4A16.
+    SGLANG_SM12X_MXFP4_W4A4_MIN_TOKENS = EnvInt(0)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)

@@ -62,6 +62,11 @@ class Sm12xMxfp4W4A16MoeQuantInfo(MoeQuantInfo):
     w2: torch.Tensor  # uint8 [E, H, I/2]
     w2_sf: torch.Tensor  # uint8 [E, pad128(H), pad4(I/16)]
     w2_gs: torch.Tensor  # fp32 [E]
+    # Native K/32 E8M0 grids re-swizzled into the W4A4 4-byte-word layout
+    # (byte lane = kb32 % 2); set by _process_weights_for_sm12x_mxfp4 when
+    # the MXFP4 W4A4 arm is available (M5 kernel mirror).
+    w13_sf_w4a4: torch.Tensor | None = None  # uint8 [E, pad128(2I), pad4(H/16)]
+    w2_sf_w4a4: torch.Tensor | None = None  # uint8 [E, pad128(H), pad4(I/16)]
 
 
 # Workspace cache keyed exactly like sm12x_nvfp4_bf16's: one entry per
@@ -110,6 +115,35 @@ def _pad_rows(x: torch.Tensor, rows: int, dtype: torch.dtype, pad_value: float):
     out = torch.full((rows, *x.shape[1:]), pad_value, dtype=dtype, device=x.device)
     out[: x.shape[0]] = x.to(dtype)
     return out
+
+
+def _workspace_w4a4(
+    bucket: int,
+    h: int,
+    i: int,
+    n13: int,
+    e: int,
+    topk: int,
+    device: torch.device,
+) -> list[torch.Tensor]:
+    from sglang.kernels.ops.moe.sm12x_mxfp4_w4a4_cute import (
+        allocate_workspace as _alloc_w4a4,
+    )
+
+    key = (bucket, h, i, n13, e, topk, device, True)
+    ws = _WORKSPACE_CACHE.get(key)
+    if ws is None:
+        ws = _alloc_w4a4(
+            num_tokens=bucket,
+            hidden_size=h,
+            intermediate_size=i,
+            num_experts=e,
+            top_k=topk,
+            is_gated=n13 == 2 * i,
+            device=device,
+        )
+        _WORKSPACE_CACHE[key] = ws
+    return ws
 
 
 def _workspace(
@@ -192,6 +226,43 @@ def fused_experts_none_to_sm12x_mxfp4(
     # Routing slots whose expert id is out of range (padding) are skipped by
     # the kernel, so rows past ``t`` are never written.
     out = torch.empty((bucket, h), dtype=torch.bfloat16, device=hidden.device)
+
+    # MXFP4 W4A4 arm: the M5 CuTe DSL fork quantizes BF16 x to NVFP4
+    # in-kernel (E8M0 g32 activation scales) and consumes the native
+    # K/32 word-swizzled weight scales. Benchmarked 29-43% faster than
+    # W4A16 once the route-tile padding cliff kicks in (T >= 8); the
+    # env default keeps W4A16 (calibration-free decode) and raises the
+    # arm explicitly for prefill/large-batch serving.
+    w4a4_min = envs.SGLANG_SM12X_MXFP4_W4A4_MIN_TOKENS.get()
+    if (
+        w4a4_min > 0
+        and t >= w4a4_min
+        and quant_info.w13_sf_w4a4 is not None
+        and quant_info.w2_sf_w4a4 is not None
+    ):
+        from sglang.kernels.ops.moe.sm12x_mxfp4_w4a4_cute import (
+            run_moe_w4a4,
+        )
+
+        one = torch.ones(1, dtype=torch.float32, device=hidden.device)
+        workspace = _workspace_w4a4(bucket, h, i, n13, e, topk, hidden.device)
+        run_moe_w4a4(
+            x,
+            ids,
+            weights,
+            quant_info.w13,
+            quant_info.w13_sf_w4a4,
+            quant_info.w13_gs,
+            quant_info.w2,
+            quant_info.w2_sf_w4a4,
+            quant_info.w2_gs,
+            one,
+            one,
+            out,
+            workspace=workspace,
+        )
+        return StandardCombineInput(hidden_states=out[:t])
+
     workspace = _workspace(bucket, h, i, n13, e, topk, hidden.device)
     run_moe_w4a16(
         x,

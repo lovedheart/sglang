@@ -1479,6 +1479,34 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer._mxfp4_backend = "flashinfer_cutlass_sm120"
         torch.cuda.empty_cache()
 
+    @staticmethod
+    def _swizzle_w4a4_words(scale_ng: torch.Tensor) -> torch.Tensor:
+        """[E, R, K/32] E8M0 -> [E, pad128(R), pad4(K/16)] W4A4 word layout.
+
+        Same tile addressing as the NVFP4 128x4 swizzle, but the byte lane
+        inside each U32 word is the vec32 parity (kb32 % 2) instead of
+        k16 % 4, so each word carries two real scales (bytes 2,3 padding).
+        Byte-exact port of the numerics-verified M5 helper.
+        """
+        e_, r_, kt = scale_ng.shape
+        nkt = kt // 2  # K/64 words per 128-row tile
+        mp = (r_ + 127) // 128 * 128
+        kp = (2 * kt + 3) // 4 * 4
+        dev = scale_ng.device
+        out = torch.zeros(e_ * mp * kp, dtype=torch.uint8, device=dev)
+        rv = torch.arange(r_, device=dev)[:, None]
+        kbv = torch.arange(kt, device=dev)[None, :]
+        w = (
+            (rv // 128) * (nkt * 128)
+            + (kbv // 2) * 128
+            + (rv % 32) * 4
+            + ((rv // 32) % 4)
+        )
+        addr = (w * 4 + (kbv % 2)).reshape(-1)
+        blk = torch.arange(e_, device=dev)[:, None] * (mp * kp)
+        out.index_put_(((blk + addr).reshape(-1),), scale_ng.reshape(-1))
+        return out.view(e_, mp, kp)
+
     def _process_weights_for_sm12x_mxfp4(self, layer):
         """Prepare MXFP4 experts for the SM12x CuTe-DSL W4A16 fused MoE kernel.
 
@@ -1532,13 +1560,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return swizzle_blockscale(dup.view(torch.float8_e4m3fn)).view(torch.uint8)
 
         w13_gu = torch.cat([gate_w, up_w], dim=1).contiguous()
-        s13_sw = _swizzle_dup(torch.cat([gate_s, up_s], dim=1).contiguous())
+        s13_ng = torch.cat([gate_s, up_s], dim=1).contiguous()
+        s13_sw = _swizzle_dup(s13_ng)
         s2_sw = _swizzle_dup(s2.contiguous())
 
         layer.w13_weight.data = w13_gu
         layer.w2_weight.data = w2
         layer.w13_weight_scale = Parameter(s13_sw, requires_grad=False)
         layer.w2_weight_scale = Parameter(s2_sw, requires_grad=False)
+        # MXFP4 W4A4 arm (sm12x_mxfp4_w4a4_cute): native K/32 E8M0 grid
+        # re-swizzled into the 4-byte-word layout (vec32 block kb32 lives in
+        # byte lane kb32 % 2 of word (kb32 // 2)); numerics verified
+        # end-to-end in gemm_dev M5 (test_mxfp4_cute.py, relL2 0.0201).
+        layer.w13_weight_scale_w4a4 = Parameter(
+            self._swizzle_w4a4_words(s13_ng), requires_grad=False
+        )
+        layer.w2_weight_scale_w4a4 = Parameter(
+            self._swizzle_w4a4_words(s2.contiguous()), requires_grad=False
+        )
         ones = torch.ones(e, dtype=torch.float32, device=dev)
         layer.w13_gs = Parameter(ones, requires_grad=False)
         layer.w2_gs = Parameter(ones.clone(), requires_grad=False)
@@ -1563,6 +1602,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2=layer.w2_weight.data,
             w2_sf=layer.w2_weight_scale.data,
             w2_gs=layer.w2_gs.data,
+            w13_sf_w4a4=getattr(layer, "w13_weight_scale_w4a4", None).data
+            if getattr(layer, "w13_weight_scale_w4a4", None) is not None
+            else None,
+            w2_sf_w4a4=getattr(layer, "w2_weight_scale_w4a4", None).data
+            if getattr(layer, "w2_weight_scale_w4a4", None) is not None
+            else None,
         )
         return self.runner.run(dispatch_output, quant_info)
 
