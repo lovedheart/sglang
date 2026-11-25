@@ -135,7 +135,7 @@ class Mxfp4W4A4Runner:
             l, r = lrow // m, lrow % m
             valid = r < cs[l]
             rowmap = torch.where(valid, off[e0:e1][l] + r, torch.full_like(l, -1)).to(torch.int32)
-            buckets.append((e0, L, m, rowmap, (order // tk)[lrow[valid]].to(torch.int32)))
+            buckets.append((e0, L, m, rowmap))
             e0 = e1
         return tok, w, buckets
 
@@ -145,7 +145,7 @@ class Mxfp4W4A4Runner:
         I, Ipad = self.I, self.Ipad
         xsorted = hidden[tok.long()]
         results = []
-        for e0, L, m, rowmap, _slots in buckets:
+        for e0, L, m, rowmap in buckets:
             Xg = torch.empty((L * m, H), dtype=hidden.dtype, device=self.dev)
             _gather_rows_kernel[(L * m,)](xsorted, rowmap, Xg, H, xsorted.stride(0),
                                           BLOCK=1024, num_warps=4)
