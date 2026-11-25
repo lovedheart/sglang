@@ -29,13 +29,24 @@ try:
 except ImportError:
     from sglang.kernels.ops.moe.sm12x_mxfp4_act_quant import quant_act_mxfp4
 
-_BM_MAX = 32  # max align tile; workspace sized for it
+_BM_MAX = 128  # align-tile ceiling for workspace sizing (runtime picks 16-128)
 
 
 def _align_bm(npair: int, num_experts: int) -> int:
     """Low slots/expert -> small tile (padding dominates); high -> BM=32
     (tile efficiency dominates). Measured crossover ~16 slots/expert."""
-    return 16 if npair <= num_experts * 16 else _BM_MAX
+    import os
+    fb = os.environ.get("FLAT_BM")
+    if fb:
+        return int(fb)
+    # measured crossover (RTX PRO 6000, topk=10): padding dominates below ~16
+    # slots/expert, tile efficiency dominates above ~32; BM=128 regresses hard
+    # (3.2x padding) and spills G1 BN256/BK256 smem.
+    if npair <= num_experts * 16:
+        return 16
+    if npair <= num_experts * 32:
+        return 32
+    return 64
 
 
 @triton.jit
