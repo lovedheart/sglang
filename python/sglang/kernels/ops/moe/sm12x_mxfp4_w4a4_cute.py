@@ -1037,9 +1037,9 @@ def _build(T, H, I, N13, E, TOPK, swiglu):
                             vq[j] = rv[j].to(F32)
                             am = cute.arch.fmax(am, cute.arch.fmax(vq[j], -vq[j]))
                         e2 = _e8m0_byte(am)
-                        mQs[I64(r0 + mq) * (I // 16) + I64(bq) + I64((n0 // 64) * 4)] = U8(
-                            e2
-                        )
+                        mQs[
+                            I64(r0 + mq) * (I // 16) + I64(bq) + I64((n0 // 64) * 4)
+                        ] = U8(e2)
                         ratio = cute.arch.exp2(F32(127.0) - F32(e2))
                         wb = I64(r0 + mq) * (I // 8) + I64(n0 // 8 + bq * 4)
                         for w in cutlass.range_constexpr(4):

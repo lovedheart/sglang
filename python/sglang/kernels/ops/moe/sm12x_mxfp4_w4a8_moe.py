@@ -19,9 +19,9 @@ Everything else (PRMT e2m1 decode, per-row fp8 activation quant, moe_align
 tiles, silu*up + per-row requant, bf16 atomic finalize) matches the NVFP4
 parent and its numerics docstring.
 """
+
 from __future__ import annotations
 
-import os
 
 import torch
 import triton
@@ -77,8 +77,13 @@ or.b32 $1, ma, t1;
 def _decode_e2m1(packed):
     """(lo, hi) signed e4m3 magnitudes per e2m1 nibble pair (MXFP4: no flag)."""
     return tl.inline_asm_elementwise(
-        asm=_PRMT_ASM, constraints="=r,=r,r", args=[packed],
-        dtype=(tl.float8e4nv, tl.float8e4nv), is_pure=True, pack=4)
+        asm=_PRMT_ASM,
+        constraints="=r,=r,r",
+        args=[packed],
+        dtype=(tl.float8e4nv, tl.float8e4nv),
+        is_pure=True,
+        pack=4,
+    )
 
 
 @triton.jit
@@ -89,18 +94,32 @@ def _row_quant(x_ptr, q_ptr, s_ptr, n_cols: tl.constexpr, BK: tl.constexpr):
     v = tl.load(x_ptr + r * n_cols + offs, mask=m, other=0.0).to(tl.float32)
     amax = tl.maximum(tl.max(tl.abs(v), axis=0), 1e-12)
     scale = amax / 448.0
-    tl.store(q_ptr + r * n_cols + offs,
-             tl.clamp(v / scale, -448.0, 448.0).to(q_ptr.dtype.element_ty), mask=m)
+    tl.store(
+        q_ptr + r * n_cols + offs,
+        tl.clamp(v / scale, -448.0, 448.0).to(q_ptr.dtype.element_ty),
+        mask=m,
+    )
     tl.store(s_ptr + r, scale)
 
 
 @triton.jit
 def _w4a8_gemm_mx(
-    a_ptr, a_s_ptr, w_ptr, sf_ptr, sid_ptr, ntp_ptr, eid_ptr, rw_ptr, out_ptr,
+    a_ptr,
+    a_s_ptr,
+    w_ptr,
+    sf_ptr,
+    sid_ptr,
+    ntp_ptr,
+    eid_ptr,
+    rw_ptr,
+    out_ptr,
     npair,
-    N: tl.constexpr, K: tl.constexpr, TOPK: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    TOPK: tl.constexpr,
     OUT_MODE: tl.constexpr,  # 0: store sorted rows (GEMM1); 1: atomic token rows
-    BM: tl.constexpr, BN: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
 ):
     """BK fixed to 32 = the MX SF group; pow2 scale folded between group dots."""
     pid = tl.program_id(0)
@@ -136,22 +155,37 @@ def _w4a8_gemm_mx(
     if OUT_MODE == 0:
         a_s = tl.load(a_s_ptr + tok, mask=valid, other=0.0)
         acc = acc * a_s[:, None]
-        tl.store(out_ptr + r[:, None] * N + ns[None, :],
-                 acc.to(out_ptr.dtype.element_ty), mask=valid[:, None])
+        tl.store(
+            out_ptr + r[:, None] * N + ns[None, :],
+            acc.to(out_ptr.dtype.element_ty),
+            mask=valid[:, None],
+        )
     else:
         a_s = tl.load(a_s_ptr + r, mask=valid, other=0.0)
         acc = acc * a_s[:, None]
         rw = tl.load(rw_ptr + sid, mask=valid, other=0.0)
         row = tl.minimum(sid, npair - 1) // TOPK
-        tl.atomic_add(out_ptr + row[:, None] * N + ns[None, :],
-                      (acc * rw[:, None]).to(out_ptr.dtype.element_ty),
-                      mask=rw[:, None] != 0)
+        tl.atomic_add(
+            out_ptr + row[:, None] * N + ns[None, :],
+            (acc * rw[:, None]).to(out_ptr.dtype.element_ty),
+            mask=rw[:, None] != 0,
+        )
 
 
 @triton.jit
-def _act_quant(g_ptr, u_ptr, sid_ptr, ntp_ptr, a2_ptr, a2s_ptr, npair,
-               K: tl.constexpr, TOPK: tl.constexpr,
-               BM: tl.constexpr, BK: tl.constexpr):
+def _act_quant(
+    g_ptr,
+    u_ptr,
+    sid_ptr,
+    ntp_ptr,
+    a2_ptr,
+    a2s_ptr,
+    npair,
+    K: tl.constexpr,
+    TOPK: tl.constexpr,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+):
     pid = tl.program_id(0)
     if pid * BM >= tl.load(ntp_ptr):
         return
@@ -159,16 +193,24 @@ def _act_quant(g_ptr, u_ptr, sid_ptr, ntp_ptr, a2_ptr, a2s_ptr, npair,
     valid = r < tl.load(ntp_ptr)
     c = tl.arange(0, BK)
     cm = c < K
-    g = tl.load(g_ptr + r[:, None] * (2 * K) + c[None, :],
-                mask=valid[:, None] & cm[None, :], other=0.0).to(tl.float32)
-    u = tl.load(u_ptr + r[:, None] * (2 * K) + c[None, :],
-                mask=valid[:, None] & cm[None, :], other=0.0).to(tl.float32)
+    g = tl.load(
+        g_ptr + r[:, None] * (2 * K) + c[None, :],
+        mask=valid[:, None] & cm[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    u = tl.load(
+        u_ptr + r[:, None] * (2 * K) + c[None, :],
+        mask=valid[:, None] & cm[None, :],
+        other=0.0,
+    ).to(tl.float32)
     act = (g * tl.sigmoid(g)) * u
     amax = tl.maximum(tl.max(tl.abs(act), axis=1), 1e-12)
     s = amax / 448.0
-    tl.store(a2_ptr + r[:, None] * K + c[None, :],
-             tl.clamp(act / s[:, None], -448.0, 448.0).to(a2_ptr.dtype.element_ty),
-             mask=valid[:, None] & cm[None, :])
+    tl.store(
+        a2_ptr + r[:, None] * K + c[None, :],
+        tl.clamp(act / s[:, None], -448.0, 448.0).to(a2_ptr.dtype.element_ty),
+        mask=valid[:, None] & cm[None, :],
+    )
     tl.store(a2s_ptr + r, s, mask=valid)
 
 
@@ -186,8 +228,9 @@ def _align(topk_ids, num_experts, block):
     eids = []
     parts = []
     for e in range(num_experts):
-        seg = torch.full((int(pad[e]),), flat.numel(), dtype=torch.int32,
-                         device=flat.device)
+        seg = torch.full(
+            (int(pad[e]),), flat.numel(), dtype=torch.int32, device=flat.device
+        )
         ids_e = order[flat == e]
         seg[: ids_e.numel()] = ids_e
         parts.append(seg)
@@ -198,8 +241,9 @@ def _align(topk_ids, num_experts, block):
     return sids, eidt, ntp
 
 
-def allocate_workspace(num_tokens, hidden_size, intermediate_size, num_experts,
-                       top_k, device):
+def allocate_workspace(
+    num_tokens, hidden_size, intermediate_size, num_experts, top_k, device
+):
     device = torch.device(device)
     npair = num_tokens * top_k
     cap = npair + (num_experts + 1) * (_BLOCK - 1)
@@ -216,8 +260,9 @@ def allocate_workspace(num_tokens, hidden_size, intermediate_size, num_experts,
     }
 
 
-def run_moe_w4a4m(hidden_states, topk_ids, topk_weights, w13, w13_sf, w2, w2_sf,
-                  workspace=None):
+def run_moe_w4a4m(
+    hidden_states, topk_ids, topk_weights, w13, w13_sf, w2, w2_sf, workspace=None
+):
     """MXFP4 W4A8: w13 uint8 [E,2I,H/2], w13_sf uint8 [E,2I,H/32] row-major
     E8M0; w2/w2_sf [E,H,I/2], [E,H,I/32]. Returns bf16 [T,H]."""
     t, h = hidden_states.shape
@@ -226,31 +271,81 @@ def run_moe_w4a4m(hidden_states, topk_ids, topk_weights, w13, w13_sf, w2, w2_sf,
     topk = topk_ids.shape[1]
     dev = hidden_states.device
     npair = t * topk
-    ws = workspace if workspace is not None else allocate_workspace(
-        t, h, i, e, topk, dev)
+    ws = (
+        workspace
+        if workspace is not None
+        else allocate_workspace(t, h, i, e, topk, dev)
+    )
 
     x8, x_s = ws["a8"], ws["a_s"]
-    _row_quant[(t,)](hidden_states, x8[:t], x_s[:t], n_cols=h,
-                     BK=triton.next_power_of_2(h), num_warps=8)
+    _row_quant[(t,)](
+        hidden_states,
+        x8[:t],
+        x_s[:t],
+        n_cols=h,
+        BK=triton.next_power_of_2(h),
+        num_warps=8,
+    )
 
     sids, eids, ntp = _align(topk_ids, e, _BLOCK)
     rp = sids.numel()
     inter, a2, a2_s = ws["inter"][:rp], ws["a2"][:rp], ws["a2_s"][:rp]
 
     _w4a8_gemm_mx[(rp // _BLOCK * (2 * i // 256),)](
-        x8, x_s, w13.view(torch.uint8), w13_sf.view(torch.uint8),
-        sids, ntp, eids, topk_weights, inter, npair,
-        N=2 * i, K=h, TOPK=topk, OUT_MODE=0,
-        BM=_BLOCK, BN=256, num_warps=8, num_stages=3)
+        x8,
+        x_s,
+        w13.view(torch.uint8),
+        w13_sf.view(torch.uint8),
+        sids,
+        ntp,
+        eids,
+        topk_weights,
+        inter,
+        npair,
+        N=2 * i,
+        K=h,
+        TOPK=topk,
+        OUT_MODE=0,
+        BM=_BLOCK,
+        BN=256,
+        num_warps=8,
+        num_stages=3,
+    )
 
     _act_quant[(triton.cdiv(rp, 8),)](
-        inter, inter[:, i:], sids, ntp, a2, a2_s, npair,
-        K=i, TOPK=topk, BM=8, BK=triton.next_power_of_2(i), num_warps=4)
+        inter,
+        inter[:, i:],
+        sids,
+        ntp,
+        a2,
+        a2_s,
+        npair,
+        K=i,
+        TOPK=topk,
+        BM=8,
+        BK=triton.next_power_of_2(i),
+        num_warps=4,
+    )
 
     out = torch.zeros(t, h, dtype=torch.bfloat16, device=dev)
     _w4a8_gemm_mx[(rp // _BLOCK * (h // 128),)](
-        a2, a2_s, w2.view(torch.uint8), w2_sf.view(torch.uint8),
-        sids, ntp, eids, topk_weights, out, npair,
-        N=h, K=i, TOPK=topk, OUT_MODE=1,
-        BM=_BLOCK, BN=128, num_warps=4, num_stages=2)
+        a2,
+        a2_s,
+        w2.view(torch.uint8),
+        w2_sf.view(torch.uint8),
+        sids,
+        ntp,
+        eids,
+        topk_weights,
+        out,
+        npair,
+        N=h,
+        K=i,
+        TOPK=topk,
+        OUT_MODE=1,
+        BM=_BLOCK,
+        BN=128,
+        num_warps=4,
+        num_stages=2,
+    )
     return out

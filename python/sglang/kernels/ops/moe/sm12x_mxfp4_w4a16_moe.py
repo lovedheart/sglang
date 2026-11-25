@@ -472,7 +472,9 @@ def k_gemm1(
                                         sx8[(None, (sbase + q * 8) // 8)],
                                         rxv[(None, q)],
                                     )
-                                acc[m] = acc[m] + _dot16(wf, rx, DOTC) * (g0 if j == 0 else g1)
+                                acc[m] = acc[m] + _dot16(wf, rx, DOTC) * (
+                                    g0 if j == 0 else g1
+                                )
 
         gs = gGS[e]
         for i in cutlass.range_constexpr(BM):

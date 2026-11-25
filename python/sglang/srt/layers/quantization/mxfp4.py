@@ -1534,7 +1534,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         for name in ("w13_weight_bias", "w2_weight_bias"):
             bias = getattr(layer, name, None)
             if bias is not None and bias.abs().amax().item() != 0.0:
-                raise NotImplementedError(f"sm12x_mxfp4 supports no expert bias ({name} is nonzero).")
+                raise NotImplementedError(
+                    f"sm12x_mxfp4 supports no expert bias ({name} is nonzero)."
+                )
 
         w13 = layer.w13_weight.data.view(torch.uint8)  # [E, 2I, H/2]
         s13 = layer.w13_weight_scale.data.view(torch.uint8)  # [E, 2I, H/32]
