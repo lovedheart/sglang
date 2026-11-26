@@ -1277,11 +1277,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
             table, ids = self.weight, flat_ids
+            row_scales = self.row_scales
             vocab_start = self.shard_indices.org_vocab_start_index
             vocab_end = self.shard_indices.org_vocab_end_index
             stage_on_host = self._gathers_on_host(flat_ids)
             if stage_on_host:
-                table, ids = self._stage_rows(flat_ids, vocab_start, vocab_end)
+                table, ids, row_scales = self._stage_rows(
+                    flat_ids, vocab_start, vocab_end
+                )
                 vocab_start, vocab_end = 0, table.shape[0]
             elif self._file_prefetcher is not None:
                 self._file_prefetcher.enqueue(
@@ -1302,7 +1305,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 seg_block, seg_count = 1, 0
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
                 0 if with_segment_bases else table.data_ptr(),
-                self.row_scales.data_ptr() if self._is_fp6 else 0,
+                row_scales.data_ptr() if self._is_fp6 else 0,
                 ids,
                 output,
                 embedding_dim=self.embedding_dim,
@@ -1336,7 +1339,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         """This rank's distinct rows of ``flat_ids``, read from the table on the host into
         pinned memory and copied to the device in one transfer, and the ids remapped into
         them (-1 outside the shard). The kernel then converts the staged rows exactly as it
-        converts the table's."""
+        converts the table's.
+        """
         ids = flat_ids.cpu()  # a prefill chunk's ids: one sync, as the page hint takes
         in_range = (ids >= vocab_start) & (ids < vocab_end)
         rows, inverse = torch.unique(ids[in_range] - vocab_start, return_inverse=True)
@@ -1348,7 +1352,17 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         local[in_range] = inverse
         device = flat_ids.device
         staged = staged.to(device, non_blocking=True).view(self.weight.dtype)
-        return staged, local.pin_memory().to(device, non_blocking=True)
+        scales = self.row_scales
+        if self._is_fp6:
+            # The kernel scales an fp6 row with ``row_scales`` *at the id it is
+            # handed*, and staging has just remapped those ids into positions of
+            # ``staged``. The scales are not part of the table's bytes, so they
+            # have to follow the rows here or every staged value is multiplied by
+            # whichever row happens to share its staged position.
+            scales = self.row_scales.index_select(
+                0, rows.pin_memory().to(device, non_blocking=True)
+            )
+        return staged, local.pin_memory().to(device, non_blocking=True), scales
 
     def _stage_table_rows(self, rows: torch.Tensor) -> torch.Tensor:
         """``rows`` of the table read on the host into a pinned [rows, row_bytes] buffer.

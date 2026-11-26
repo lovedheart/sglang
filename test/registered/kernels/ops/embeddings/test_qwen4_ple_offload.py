@@ -462,25 +462,31 @@ def test_qwen4_ple_file_backend_keeps_gathers_in_kernel_with_host_page_tables(
 _SAFE_PREFIX = "model.layers.2.ple.ple_embedding.ngram_embedding"
 
 
-def _write_ple_checkpoint(d, *, shards, rows, row_bytes):
-    """Mini safetensors checkpoint of ``shards`` fp8 shards, no scales; returns
-    the whole table as one tensor, in the row order the gather sees."""
+def _write_ple_checkpoint(d, *, shards, rows, row_bytes, dtype=torch.float8_e4m3fn):
+    """Mini safetensors checkpoint of ``shards`` ``dtype`` shards, no scales; returns
+    the whole table as one tensor, in the row order the gather sees. ``row_bytes``
+    is the stored row width, so it is the packed width for fp6."""
     import json
 
     from safetensors.torch import save_file
 
+    # One stream for the whole table, so every row of every shard differs: a
+    # gather that resolved the wrong segment or the wrong row cannot land on
+    # bytes that happen to match.
+    seed = torch.Generator().manual_seed(0)
     weight_map, table = {}, []
     for i in range(shards):
         key = (
             f"model.language_model.layers.1.ple.ple_embedding"
             f".ngram_embedding.shard_{i}.weight"
         )
-        values = (
-            torch.arange(rows * row_bytes, dtype=torch.float32)
-            .reshape(rows, row_bytes)
-            .div(64)
-            .to(torch.float8_e4m3fn)
-        )
+        if dtype is torch.uint8:
+            # Packed fp6 codes: any byte stream is a legal code sequence.
+            values = torch.randint(
+                1, 256, (rows, row_bytes), generator=seed, dtype=torch.int32
+            ).to(torch.uint8)
+        else:
+            values = torch.randn(rows, row_bytes, generator=seed).to(dtype)
         save_file({key: values}, os.path.join(d, f"ple-{i:05d}.safetensors"))
         weight_map[key] = f"ple-{i:05d}.safetensors"
         table.append(values)
@@ -577,6 +583,99 @@ def test_qwen4_ple_safetensors_gathers_prefill_rows_on_the_host(monkeypatch):
         assert not kernel._stages_on_host
         torch.testing.assert_close(gather(kernel, big), expected(big), rtol=0, atol=0)
         assert len(staged) == 1  # the control never staged
+
+
+@pytest.mark.skipif(
+    not _file_backend_supported(),
+    reason="the control gather reads the shard mappings straight from the device",
+)
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16, torch.uint8])
+def test_qwen4_ple_staged_gather_matches_the_table_for_every_dtype(monkeypatch, dtype):
+    """Host staging has to hand the gather kernel the same bytes the table holds for
+    every storage dtype: the kernel's own read of the shard mappings (what a GPU on
+    the host page tables does) and the ``pinned`` tier are the oracles.
+
+    Packed fp6 is the dtype the staged buffer cannot cover on its own: its per-row
+    scales live outside the table, in ``row_scales``, which the kernel indexes by
+    the row id it is handed. Staging remaps that id, so the scales have to be
+    gathered with the rows -- a staged fp6 row otherwise comes out multiplied by
+    whichever row shares its staged position. The scales here vary per row, so a
+    missing scale gather shows up as a wrong value rather than a lucky tie.
+    """
+    embedding_dim, rows_per_shard, shards = 160, 64, 3
+    rows = shards * rows_per_shard
+    is_fp6 = dtype is torch.uint8
+    # The stored row width the checkpoint holds; fp6 packs 4 codes per 3 bytes.
+    stored_row = embedding_dim // 4 * 3 if is_fp6 else embedding_dim
+    staged_rows = []
+    stage = Qwen4ExpPinnedHostEmbedding._stage_table_rows
+    monkeypatch.setattr(
+        Qwen4ExpPinnedHostEmbedding,
+        "_stage_table_rows",
+        lambda self, r: staged_rows.append(r.numel()) or stage(self, r),
+    )
+
+    with tempfile.TemporaryDirectory() as d:
+        table = _write_ple_checkpoint(
+            d, shards=shards, rows=rows_per_shard, row_bytes=stored_row, dtype=dtype
+        )
+
+        def new(backend, staging):
+            monkeypatch.setattr(
+                qwen4_exp_module,
+                "device_faults_pageable_pages",
+                lambda device_index=0: staging,
+            )
+            source = _make_source_embedding(
+                dtype=dtype,
+                embedding_dim=embedding_dim,
+                vocab_start=0,
+                vocab_end=rows,
+                org_vocab_size=rows,
+            )
+            if is_fp6:
+                source.weight_scale = torch.ones(1, dtype=torch.bfloat16, device=DEVICE)
+            model = Qwen4ExpPinnedHostEmbedding(
+                source,
+                backend=backend,
+                table_dir=d,
+                safetensors_shard_size=rows_per_shard,
+                safetensors_key_prefix=_SAFE_PREFIX,
+            )
+            if is_fp6:
+                model.row_scales.copy_(
+                    torch.linspace(0.5, 4.0, rows, device=DEVICE).unsqueeze(1)
+                )
+            if backend == "pinned":
+                model.weight.copy_(table.to(model.weight.device))
+            return model
+
+        staged = new("safetensors", True)
+        assert staged._stages_on_host
+        kernel = new("safetensors", False)
+        pinned = new("pinned", True)  # the tier the staged path claims to match
+
+        # Rows a gather touches, with gaps, so a staged position is never the
+        # table row it came from -- plus the ids outside this rank's shard.
+        pool = torch.arange(3, rows, 7, device=DEVICE)
+        ids = torch.cat(
+            [
+                pool[torch.randint(0, pool.numel(), (4096,), device=DEVICE)],
+                torch.tensor([rows, -1], device=DEVICE),
+            ]
+        )
+
+        def gather(model):
+            out = torch.empty(
+                *ids.shape, embedding_dim, dtype=torch.bfloat16, device=DEVICE
+            )
+            return model.gather(ids, out=out)
+
+        got = gather(staged)
+        torch.testing.assert_close(got, gather(kernel), rtol=0, atol=0)
+        torch.testing.assert_close(got, gather(pinned), rtol=0, atol=0)
+        assert len(staged_rows) == 1  # neither control staged
+        assert torch.count_nonzero(got[(ids < 0) | (ids >= rows)]) == 0
 
 
 if __name__ == "__main__":
