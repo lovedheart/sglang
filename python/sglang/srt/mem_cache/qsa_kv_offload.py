@@ -309,6 +309,9 @@ class HotTailSplit(msgspec.Struct, frozen=True):
     tail_count: int
 
 
+_SF_STAGE_DEPTH = 4  # pinned stage slots per plane, see _sf_host_stage
+
+
 def _pinned_h2d(cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
     if device.type != "cuda":
         return cpu.to(device)
@@ -328,7 +331,10 @@ def make_hot_tail_split(
     host_np, tail_np = [], []
     total = 0
     for rows, host in zip(counts, host_counts):
-        assert 0 <= host <= rows
+        if not 0 <= host <= rows:
+            raise ValueError(
+                f"QSA K/V offload: {host} host rows for a {rows}-row request"
+            )
         host_np.append(np.arange(total, total + host, dtype=np.int64))
         tail_np.append(np.arange(total + host, total + rows, dtype=np.int64))
         total += rows
@@ -500,9 +506,10 @@ class QSAKVHostOffload:
         self._prefetched: Optional[_QsaPrefetch] = None
         self._prefetch_write_gate: Optional[torch.cuda.Event] = None
         self._prefetch_stream = None  # the "qsa_kv_h2d" lease, taken eagerly
-        # Grow-only pinned staging for the CPU scale-plane leg of
-        # gather_context_hot_tail_split, keyed "k" / "v".
-        self._sf_stages: Dict[str, torch.Tensor] = {}
+        # Rotating pinned staging for the CPU scale-plane leg of
+        # gather_context_hot_tail_split, keyed "k" / "v"; each entry holds
+        # _SF_STAGE_DEPTH stage slots and the HtoD event per slot.
+        self._sf_stages: Dict[str, dict] = {}
         # The fused resolve reads the host store through raw UVA pointers,
         # validated on CUDA only.
         self.use_fused = (
@@ -893,23 +900,37 @@ class QSAKVHostOffload:
 
     def _sf_host_stage(
         self, key: str, rows: int, like: torch.Tensor
-    ) -> Tuple[torch.Tensor, Optional[list]]:
-        """Grow-only pinned staging for the CPU scale-plane leg, plus the
-        slot record. Reusing the slot on the CPU must not race its previous
-        async HtoD: the caller synchronizes the stored event (already
-        complete in steady state, so this never blocks in practice)."""
+    ) -> Tuple[torch.Tensor, dict, int]:
+        """Next slot of a rotating pinned staging ring for the CPU scale-plane
+        leg, plus its entry and index. The CPU may not overwrite a slot whose
+        async HtoD has not run, so the slot's recorded event is waited on; the
+        rotation makes that event ``_SF_STAGE_DEPTH`` stage-uses old, which the
+        CPU has overtaken only if the GPU fell that far behind (then waiting
+        is the correct, and rare, answer)."""
         entry = self._sf_stages.get(key)
-        if entry is None or entry[0].shape[0] < rows or entry[0].dtype != like.dtype:
-            stage = torch.empty(
-                (max(rows, 8192), *like.shape[1:]),
-                dtype=like.dtype,
-                pin_memory=like.device.type == "cuda",
-            )
-            entry = [stage, None]
+        if entry is None or entry["cap"] < rows or entry["stage"].dtype != like.dtype:
+            cap = max(rows, 8192)
+            entry = {
+                "stage": torch.empty(
+                    (_SF_STAGE_DEPTH * cap, *like.shape[1:]),
+                    dtype=like.dtype,
+                    pin_memory=like.device.type == "cuda",
+                ),
+                "cap": cap,
+                "events": [None] * _SF_STAGE_DEPTH,
+                "next": 0,
+            }
             self._sf_stages[key] = entry
-        if entry[1] is not None:
-            entry[1].synchronize()
-        return entry[0][:rows], entry
+        i = entry["next"]
+        entry["next"] = (i + 1) % _SF_STAGE_DEPTH
+        if entry["events"][i] is not None:
+            entry["events"][i].synchronize()
+            entry["events"][i] = None
+        return (
+            entry["stage"][i * entry["cap"] : (i + 1) * entry["cap"]][:rows],
+            entry,
+            i,
+        )
 
     def gather_context_hot_tail_split(
         self,
@@ -917,7 +938,7 @@ class QSAKVHostOffload:
         layer_idx: int,
         slots: torch.Tensor,
         split: HotTailSplit,
-        slots_cpu: torch.Tensor,
+        slots_cpu: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
     ]:
@@ -927,9 +948,11 @@ class QSAKVHostOffload:
         mask read as counts — but every index arrives prebuilt from the host,
         so no leg carries a device synchronization or a data-dependent shape:
         the scale planes' host leg gathers on the CPU (``slots_cpu`` is
-        ``slots`` read back once, away from this gather) and rides one pinned
-        copy up, which the masked path's 32-byte-row ``_copy_plane`` fallback
-        cannot do.
+        ``slots`` read back once, away from this gather; pass it only for a
+        quantized pool, whose CPU host-plane reads also barrier the layer's
+        write-through copies, and it is read back here if absent) and rides
+        one pinned copy up, which the masked path's 32-byte-row
+        ``_copy_plane`` fallback cannot do.
         """
         k, v, ksf, vsf = self._gather_output(layer_idx, slots.numel())
         if split.host_count:
@@ -942,12 +965,16 @@ class QSAKVHostOffload:
                 slots.index_select(0, split.host_idx).long(),
             )
             if self.quantized:
+                if slots_cpu is None:
+                    # Quantized host leg: this also drains this layer's
+                    # write-through copies before the CPU reads host rows.
+                    slots_cpu = slots.to("cpu")
                 hi_slots = slots_cpu.index_select(0, split.host_idx_cpu)
                 for dst, src, key in (
                     (ksf, self.host_ksf[layer_idx], "k"),
                     (vsf, self.host_vsf[layer_idx], "v"),
                 ):
-                    stage, slot = self._sf_host_stage(key, split.host_count, dst)
+                    stage, entry, slot = self._sf_host_stage(key, split.host_count, dst)
                     torch.index_select(src, 0, hi_slots, out=stage)
                     dst.index_copy_(
                         0, split.host_idx, stage.to(dst.device, non_blocking=True)
@@ -955,7 +982,7 @@ class QSAKVHostOffload:
                     if stage.is_pinned():
                         ev = torch.cuda.Event()
                         ev.record()
-                        slot[1] = ev
+                        entry["events"][slot] = ev
         if split.tail_count:
             _copy_rows(
                 k_dst=k,

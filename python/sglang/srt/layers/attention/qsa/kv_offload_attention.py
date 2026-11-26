@@ -302,20 +302,6 @@ def gather_offloaded_context_union(
         ([0], np.cumsum(exts_np[: max(num_sequences - 1, 0)]))
     ).astype(np.int64)
     tail_np = positions_np >= priors_np[owners_np]
-    split = make_hot_tail_split(
-        counts=counts_h,
-        host_counts=(
-            counts_h - np.bincount(owners_np[tail_np], minlength=num_sequences)
-        ).tolist(),
-        tail_rows_cpu=torch.from_numpy(
-            (
-                offload.layout.scratch_base
-                + befores_np[owners_np[tail_np]]
-                + (positions_np - priors_np[owners_np])[tail_np]
-            ).astype(np.int64)
-        ),
-        device=device,
-    )
     owners = _pinned_h2d(torch.from_numpy(owners_np), device)
     positions = _pinned_h2d(torch.from_numpy(positions_np), device)
     slots = offload.req_to_token[
@@ -344,12 +330,26 @@ def gather_offloaded_context_union(
             extend_lens=extend_lens,
             req_ids=req_ids,
         )
-    elif split.tail_count:
+    elif tail_np.any():
+        split = make_hot_tail_split(
+            counts=counts_h,
+            host_counts=(
+                counts_h - np.bincount(owners_np[tail_np], minlength=num_sequences)
+            ).tolist(),
+            tail_rows_cpu=torch.from_numpy(
+                (
+                    offload.layout.scratch_base
+                    + befores_np[owners_np[tail_np]]
+                    + (positions_np - priors_np[owners_np])[tail_np]
+                ).astype(np.int64)
+            ),
+            device=device,
+        )
         k, v, k_sf, v_sf = offload.gather_context_hot_tail_split(
             layer_idx=layer_idx,
             slots=slots,
             split=split,
-            slots_cpu=slots.to("cpu"),
+            slots_cpu=slots.to("cpu") if offload.quantized else None,
         )
     else:
         k, v, k_sf, v_sf = offload.gather_context(layer_idx=layer_idx, slots=slots)
@@ -606,7 +606,7 @@ def gather_offloaded_context(
             layer_idx=layer_idx,
             slots=slots,
             split=split,
-            slots_cpu=slots.to("cpu").long(),
+            slots_cpu=slots.to("cpu").long() if offload.quantized else None,
         )
     else:
         k, v, k_sf, v_sf = offload.gather_context(layer_idx=layer_idx, slots=slots)
