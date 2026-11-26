@@ -839,6 +839,40 @@ class TestPleSafetensorsAllocator(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "outside"):
                     tbl.read_rows(torch.tensor(rows, dtype=torch.int64), out)
 
+    def test_row_index_tensors_stay_on_the_host(self):
+        # The model is built under ``with torch.device(device)`` by the loader, so
+        # a tensor created without an explicit device lands on the GPU -- and then
+        # the first staged prefill dies in the row binning ("self is on cpu,
+        # different from other tensors on cuda:0"), because the host-side staging
+        # copy searches its CPU row ids against bounds that are not on the host.
+        # ``meta`` stands in for a non-CPU default device without a GPU.
+        previous = torch.get_default_device()
+        with tempfile.TemporaryDirectory() as d:
+            # The fixture writes real tensors, so it stays outside the meta block.
+            _write_fake_ple_checkpoint(d, shards=3, rows=64)
+            torch.set_default_device("meta")
+            try:
+                tbl = self._alloc(d, shards=3, rows=64)
+                prefetcher = PleFilePrefetcher(row_bytes=120, segments=tbl, min_rows=1)
+            finally:
+                torch.set_default_device(previous)
+        try:
+            for name in ("_bounds", "_starts", "_ends", "_slice_first"):
+                holder = prefetcher if name == "_slice_first" else tbl
+                self.assertEqual(
+                    getattr(holder, name).device.type, "cpu", f"{name} left the host"
+                )
+            rows = torch.tensor([0, 130], dtype=torch.int64)
+            out = torch.empty((2, 120), dtype=torch.uint8)
+            self.assertEqual(tbl.read_rows(rows, out), 2)
+            # Row 130 lives in shard 2 (64 rows each): the copy resolved the
+            # segment through host bounds, not a device-side lookup.
+            self.assertTrue(torch.equal(out[1], tbl._row_views[2][130 - 128]))
+            prefetcher.note_rows(rows)
+            self.assertTrue(any(prefetcher.hit_cycles()))
+        finally:
+            prefetcher.close()
+
     def test_rss_trim_keeps_the_hot_slice_of_a_cold_mapping(self):
         # One shard mapping, one hot slice inside it: ranking whole mappings (the
         # unit before the trim grid) drops the rows the gather read a moment ago

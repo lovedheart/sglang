@@ -133,10 +133,20 @@ class PleSegmentTable:
         self.segments = segments
         self.row_bytes = int(row_bytes)
         # Row reads (the host gather's staging copy) want a tensor per mapping, and
-        # the split wants row bounds; all three are fixed at mapping time.
-        self._bounds = torch.tensor(self.segment_bounds(), dtype=torch.int64)
-        self._starts = torch.tensor([s.row_start for s in segments], dtype=torch.int64)
-        self._ends = torch.tensor([s.row_end for s in segments], dtype=torch.int64)
+        # the split wants row bounds; all three are fixed at mapping time. Device
+        # is pinned to CPU: the model is built under ``with torch.device(device)``
+        # (model_loader/loader.py), which would otherwise put these on the GPU,
+        # where they can neither index the host row views nor be read by the
+        # host-side staging copy.
+        self._bounds = torch.tensor(
+            self.segment_bounds(), dtype=torch.int64, device="cpu"
+        )
+        self._starts = torch.tensor(
+            [s.row_start for s in segments], dtype=torch.int64, device="cpu"
+        )
+        self._ends = torch.tensor(
+            [s.row_end for s in segments], dtype=torch.int64, device="cpu"
+        )
         self._row_views = self._build_row_views()
 
     @property
@@ -246,7 +256,7 @@ class PleSegmentTable:
         there too.
         """
         if rows.numel() == 0:
-            return torch.empty(0, dtype=torch.int64)
+            return torch.empty(0, dtype=torch.int64, device="cpu")
         rows = rows.to(torch.int64)
         segment = torch.searchsorted(self._bounds, rows, right=True) - 1
         keep = (
@@ -256,7 +266,7 @@ class PleSegmentTable:
         )
         rows, segment = rows[keep], segment[keep]
         if rows.numel() == 0:
-            return torch.empty(0, dtype=torch.int64)
+            return torch.empty(0, dtype=torch.int64, device="cpu")
         if grid.range_bytes <= 0:
             # One slice per mapping: the slice id is the segment id.
             return segment.unique()
@@ -500,7 +510,9 @@ class PleFilePrefetcher:
         self.grid = segments.range_grid(range_bytes) if segments else None
         self._hit_cycle = [0] * (len(self.grid.ranges) if self.grid else 0)
         self._slice_first = (
-            torch.tensor(self.grid.first, dtype=torch.int64) if self.grid else None
+            torch.tensor(self.grid.first, dtype=torch.int64, device="cpu")
+            if self.grid
+            else None
         )
         self._cycle = 0
 
