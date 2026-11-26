@@ -1323,7 +1323,11 @@ class ExecOffload(msgspec.Struct):
             "read-only (no extra disk, no startup repack; the checkpoint "
             "dtype must match ple_embedding_dtype). 'file' and "
             "'safetensors' require a device that reports "
-            "cudaDevAttrPageableMemoryAccess (GB10, or HMM).",
+            "cudaDevAttrPageableMemoryAccess (GB10, or HMM). On a device that "
+            "reaches host memory by faulting it through the driver (HMM), a "
+            "prefill-sized gather of either reads its distinct rows on the host "
+            "into pinned memory first, so the kernel never faults table pages; "
+            "only the touched rows are read, so nothing extra stays resident.",
             choices=["pinned", "file", "safetensors"],
         ),
     ] = "pinned"

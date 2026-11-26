@@ -1159,6 +1159,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 table_shape[0],
                 self.embedding_dim // 4 * 3,
             )
+        # One row of the table, in bytes: uint8/fp8 rows are one byte per element
+        # already, bf16 rows are two. (table_shape is the *packed* shape for fp6.)
+        self._row_bytes = int(table_shape[-1]) * source_weight.element_size()
         self._segments = None
         if backend == "safetensors":
             # Map the checkpoint's own shard tensors read-only; the gather
@@ -1168,9 +1171,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 model_dir=table_dir,
                 prefix=safetensors_key_prefix,
                 dtype=source_weight.dtype,
-                # uint8/fp8 rows are one byte per element already; bf16 rows
-                # are two. (table_shape is the *packed* shape for fp6.)
-                row_bytes=int(table_shape[-1]) * source_weight.element_size(),
+                row_bytes=self._row_bytes,
                 shard_size=safetensors_shard_size,
                 vocab_start=self.shard_indices.org_vocab_start_index,
                 vocab_end=self.shard_indices.org_vocab_end_index,
@@ -1191,17 +1192,21 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             )
         # Only the file backend has anything to prefetch (rows live on storage).
         self._file_prefetcher = make_ple_file_prefetcher(host_table)
-        # ... and only there does a prefill-sized gather read its rows on the host, on a
-        # GPU that faults each row's page through the driver (see _gathers_on_host).
+        # ... and only on a file-backed table does a prefill-sized gather read its
+        # rows on the host, on a GPU that faults each row's page through the driver
+        # (see _gathers_on_host).
         table_path = getattr(host_table, "_sglang_ple_file_path", None)
         self._stages_on_host = (
-            table_path is not None
+            (table_path is not None or self._segments is not None)
             and torch.cuda.is_available()
             and device_faults_pageable_pages(torch.cuda.current_device())
         )
-        # The host copy advises its rows' pages through this descriptor first.
+        # The host copy advises its rows' pages through this descriptor first; a
+        # checkpoint-backed table advises through each segment's own descriptor.
         self._table_fd = (
-            os.open(table_path, os.O_RDONLY) if self._stages_on_host else None
+            os.open(table_path, os.O_RDONLY)
+            if self._stages_on_host and table_path is not None
+            else None
         )
         # ... and only it needs its resident set bounded: a fault maps a whole
         # folio, so the mapping would otherwise creep towards the full table.
@@ -1274,14 +1279,18 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             table, ids = self.weight, flat_ids
             vocab_start = self.shard_indices.org_vocab_start_index
             vocab_end = self.shard_indices.org_vocab_end_index
-            if self._gathers_on_host(flat_ids):
+            stage_on_host = self._gathers_on_host(flat_ids)
+            if stage_on_host:
                 table, ids = self._stage_rows(flat_ids, vocab_start, vocab_end)
                 vocab_start, vocab_end = 0, table.shape[0]
             elif self._file_prefetcher is not None:
                 self._file_prefetcher.enqueue(
                     flat_ids, vocab_start=vocab_start, vocab_end=vocab_end
                 )
-            if self._segments is not None:
+            # Staged rows are one buffer with remapped ids, so the kernel reads them
+            # through a single base; the per-shard bases are only for the mappings.
+            with_segment_bases = self._segments is not None and not stage_on_host
+            if with_segment_bases:
                 if self._seg_tensors is None:
                     self._seg_tensors = self._segments.indirection_tensors(
                         input_ids.device
@@ -1292,7 +1301,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 seg_starts = seg_ends = seg_bases = 0
                 seg_block, seg_count = 1, 0
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                0 if self._seg_tensors is not None else table.data_ptr(),
+                0 if with_segment_bases else table.data_ptr(),
                 self.row_scales.data_ptr() if self._is_fp6 else 0,
                 ids,
                 output,
@@ -1334,19 +1343,39 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         if rows.numel() == 0:
             # The kernel reads row 0 for an id outside the shard before zeroing it.
             rows = torch.zeros(1, dtype=torch.int64)
-        # [rows, row bytes], whatever the dtype.
-        table = self.weight.data.view(torch.uint8)
-        # The copy below runs on one thread: queue every cold row's read first.
-        advise_rows_willneed(self._table_fd, rows, table.shape[1])
-        staged = torch.empty(
-            (rows.numel(), table.shape[1]), dtype=torch.uint8, pin_memory=True
-        )
-        torch.index_select(table, 0, rows, out=staged)
+        staged = self._stage_table_rows(rows)
         local = torch.full(ids.shape, -1, dtype=torch.int64)
         local[in_range] = inverse
         device = flat_ids.device
         staged = staged.to(device, non_blocking=True).view(self.weight.dtype)
         return staged, local.pin_memory().to(device, non_blocking=True)
+
+    def _stage_table_rows(self, rows: torch.Tensor) -> torch.Tensor:
+        """``rows`` of the table read on the host into a pinned [rows, row_bytes] buffer.
+
+        The cold reads are queued before the pinned buffer is allocated: that
+        allocation is slow enough for them to overlap it, and both run on this
+        one thread.
+        """
+        # A checkpoint-backed table has no host tensor of its own: its rows are the
+        # per-shard mappings, and each shard has its own descriptor.
+        if self._segments is None:
+            advise_rows_willneed(self._table_fd, rows, self._row_bytes)
+        else:
+            # The resident-set trim ranks by the gather's row stream, and a staged
+            # gather never reaches the prefetcher's own hint -- so record the touch
+            # here too, or the trim stops learning what is warm.
+            if self._file_prefetcher is not None:
+                self._file_prefetcher.note_rows(rows)
+            self._segments.advise_rows(rows)
+        staged = torch.empty(
+            (rows.numel(), self._row_bytes), dtype=torch.uint8, pin_memory=True
+        )
+        if self._segments is None:
+            torch.index_select(self.weight.data.view(torch.uint8), 0, rows, out=staged)
+        else:
+            self._segments.read_rows(rows, staged)
+        return staged
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:

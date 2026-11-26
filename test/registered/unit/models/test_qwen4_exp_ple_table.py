@@ -167,13 +167,6 @@ def _process_rss_bytes() -> int:
 
 
 class TestPleFilePrefetcher(CustomTestCase):
-    def test_page_set_covers_row_start_and_end(self):
-        # 160-byte rows: row 25 spans bytes 4000-4159, i.e. pages 0 and 1.
-        pages = PleFilePrefetcher.pages_for_rows(torch.tensor([25, 0]), 160)
-        self.assertEqual(pages, [0, 1])
-        pages = PleFilePrefetcher.pages_for_rows(torch.tensor([1000, 1000]), 160)
-        self.assertEqual(pages, [39])  # dedup, single page
-
     def test_enqueue_uses_local_tp_offsets_and_ignores_other_shards(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "t.bin")
@@ -195,8 +188,11 @@ class TestPleFilePrefetcher(CustomTestCase):
                         )
                     )
                     pf._pool.shutdown(wait=True)
+                    # Local rows 0 and 25 (bytes 4000-4159) cover adjacent pages
+                    # 0-1: one advice for the run, at the local offsets.
                     self.assertEqual(
-                        sorted(c.args[1] for c in fadvise.call_args_list), [0, 4096]
+                        [c.args for c in fadvise.call_args_list],
+                        [(pf._fd, 0, 2 * 4096, os.POSIX_FADV_WILLNEED)],
                     )
             finally:
                 pf.close()
@@ -210,11 +206,41 @@ class TestPleFilePrefetcher(CustomTestCase):
             try:
                 self.assertFalse(pf.enqueue(torch.tensor([1, 2, 3])))
                 with mock.patch("os.posix_fadvise") as fadvise:
-                    self.assertTrue(pf.enqueue(torch.tensor([0, 1, 2, 30])))
+                    self.assertTrue(pf.enqueue(torch.tensor([0, 1, 2, 30, 100])))
                     pf._pool.shutdown(wait=True)
-                    offsets = sorted(c.args[1] for c in fadvise.call_args_list)
-                    # rows 0-2 live in page 0; row 30 (bytes 4800-4959) in page 1
-                    self.assertEqual(offsets, [0, 4096])
+                    # rows 0-2 and row 30 (bytes 4800-4959) fill pages 0-1; row 100
+                    # (bytes 16000-16159) is page 3, a run of its own.
+                    self.assertEqual(
+                        [c.args for c in fadvise.call_args_list],
+                        [
+                            (pf._fd, 0, 2 * 4096, os.POSIX_FADV_WILLNEED),
+                            (pf._fd, 3 * 4096, 4096, os.POSIX_FADV_WILLNEED),
+                        ],
+                    )
+            finally:
+                pf.close()
+
+    def test_advice_merges_adjacent_pages_within_each_file(self):
+        # A prefill chunk's pages are dominated by short adjacent runs: each run is
+        # one read to the kernel, so one advice, and neither a different file nor a
+        # gap may be merged into it. 160-byte rows: rows 0-2 and row 25 (bytes
+        # 4000-4159) fill pages 0-1 of one file; row 100 (bytes 16000-16159) starts
+        # page 3.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.bin")
+            with open(path, "wb") as f:
+                f.truncate(1 << 20)
+            pf = PleFilePrefetcher(path, row_bytes=160, min_rows=1)
+            try:
+                with mock.patch("os.posix_fadvise") as fadvise:
+                    pf._advise(torch.tensor([0, 1, 2, 25, 100]))
+                    self.assertEqual(
+                        [c.args for c in fadvise.call_args_list],
+                        [
+                            (pf._fd, 0, 2 * 4096, os.POSIX_FADV_WILLNEED),
+                            (pf._fd, 3 * 4096, 4096, os.POSIX_FADV_WILLNEED),
+                        ],
+                    )
             finally:
                 pf.close()
 
@@ -621,7 +647,8 @@ class TestPleSafetensorsAllocator(CustomTestCase):
                 os.path.join(d, wmap[key]), framework="np"
             ) as f:
                 want = f.get_tensor(key)[5:20].reshape(-1)
-            seg = tbl.segments[tbl._segment_of(37)]  # row 37 -> shard 1 local 5
+            (shard, _, _) = tbl._segment_runs(torch.tensor([37], dtype=torch.int64))[0]
+            seg = tbl.segments[shard]  # row 37 -> shard 1 local 5
             got = np.frombuffer(
                 ctypes.string_at(seg.addr + 5 * 120, 15 * 120), np.uint8
             )
@@ -711,26 +738,26 @@ class TestPleSafetensorsAllocator(CustomTestCase):
             self.assertGreater(rss[3], 1 << 20, "hot segment was evicted")
 
     def test_prefetcher_advises_the_covered_segment_pages(self):
-        # The kernel crashed on launch until this path existed: the
-        # prefetcher must resolve rows through the segment table, not the
-        # single-file offsets the "file" backend uses.
+        # The kernel crashed on launch until this path existed: the prefetcher
+        # must resolve rows through the segment table, not the single-file
+        # offsets the "file" backend uses -- and an id outside every segment
+        # (the last one here) must be skipped, not refused.
         with tempfile.TemporaryDirectory() as d:
             _write_fake_ple_checkpoint(d, shards=3, rows=256)
             tbl = self._alloc(d, shards=3, rows=256)
-            advised = []
-
-            class Probe(PleFilePrefetcher):
-                def _advise(self, pages):
-                    advised.extend(pages)
-
-            p = Probe.__new__(Probe)
-            PleFilePrefetcher.__init__(
-                p, path=None, row_bytes=120, min_rows=0, segments=tbl
+            fds = []
+            prefetcher = PleFilePrefetcher(
+                row_bytes=120, min_rows=0, segments=tbl, range_bytes=64 << 10
             )
-            p.enqueue(torch.tensor([0, 255, 256, 511, 512, 767, 999999]))
-            p.close()
-            self.assertTrue(advised)
-            self.assertEqual(len({fd for fd, _ in advised}), 3)  # one per shard
+            with mock.patch(
+                "sglang.srt.models.qwen4_exp_ple_table.advise_rows_willneed"
+            ) as willneed:
+                prefetcher._advise(torch.tensor([0, 255, 256, 511, 512, 767, 999999]))
+            self.assertTrue(willneed.call_args_list)
+            for call in willneed.call_args_list:
+                fds.append(call.args[0])
+            self.assertEqual(len(set(fds)), 3)  # one per shard
+            prefetcher.close()
 
     def test_fp8_checkpoint_maps_rows(self):
         # fp8 rows are embedding_dim 1-byte elements; scales do not exist.
@@ -753,6 +780,141 @@ class TestPleSafetensorsAllocator(CustomTestCase):
             )
             self.assertEqual((tbl.row_start, tbl.row_end), (0, 64))
             self.assertEqual(tbl.total_bytes(), 2 * 32 * 160)
+
+    def test_read_rows_splits_at_segment_boundary(self):
+        """The host gather reads a multi-shard table: rows on either side of every
+        shard edge come back as the bytes the checkpoint holds for them."""
+        import safetensors.numpy
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(d, shards=3, rows=64)
+            tbl = self._alloc(d, shards=3, rows=64)
+            want = torch.cat(
+                [
+                    torch.from_numpy(
+                        safetensors.numpy.load_file(
+                            os.path.join(d, f"ple-{i:05d}.safetensors")
+                        )[
+                            "model.language_model.layers.1.ple.ple_embedding"
+                            f".ngram_embedding.shard_{i}.weight"
+                        ]
+                    )
+                    for i in range(3)
+                ]
+            )
+            rows = torch.tensor([0, 63, 64, 65, 127, 128, 191], dtype=torch.int64)
+            out = torch.empty((rows.numel(), 120), dtype=torch.uint8)
+            self.assertEqual(tbl.read_rows(rows, out), rows.numel())
+            torch.testing.assert_close(out, want.index_select(0, rows))
+
+    def test_read_rows_refuses_unmapped_rows(self):
+        # A row no mapping covers has no source bytes: reading one means the
+        # checkpoint is incomplete, and it must fail loudly rather than return a
+        # neighbouring shard's rows (which is what the row bisect alone would do).
+        from sglang.srt.models.qwen4_exp_ple_table import (
+            PleSegmentTable,
+            allocate_ple_safetensors_table,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(d, shards=3, rows=64)
+            head = self._alloc(d, shards=1, rows=64)
+            tail = allocate_ple_safetensors_table(
+                model_dir=d,
+                prefix=self.PREFIX,
+                dtype=torch.uint8,
+                row_bytes=120,
+                shard_size=64,
+                vocab_start=128,
+                vocab_end=192,
+            )
+            # Local rows [128, 192) of the third shard, leaving [64, 128) unmapped.
+            gap = tail.segments[0]._replace(row_start=128, row_end=192)
+            tbl = PleSegmentTable([*head.segments, gap], 120)
+            self.assertEqual((tbl.row_start, tbl.row_end), (0, 192))
+            out = torch.empty((1, 120), dtype=torch.uint8)
+            with self.assertRaisesRegex(ValueError, "gap"):
+                tbl.read_rows(torch.tensor([10, 100], dtype=torch.int64), out)
+            for rows in ([200], [-1]):
+                with self.assertRaisesRegex(ValueError, "outside"):
+                    tbl.read_rows(torch.tensor(rows, dtype=torch.int64), out)
+
+    def test_rss_trim_keeps_the_hot_slice_of_a_cold_mapping(self):
+        # One shard mapping, one hot slice inside it: ranking whole mappings (the
+        # unit before the trim grid) drops the rows the gather read a moment ago
+        # along with the cold ones around them. The hot slice must survive a trim
+        # that otherwise empties the same mapping.
+        import ctypes
+
+        from sglang.srt.models.qwen4_exp_ple_table import _ranges_rss_bytes
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(d, shards=1, rows=40000)
+            tbl = self._alloc(d, shards=1, rows=40000)
+            self.assertEqual(len(tbl.segments), 1)
+            prefetcher = PleFilePrefetcher(
+                row_bytes=120, segments=tbl, min_rows=1, range_bytes=64 << 10
+            )
+            # Fault every page in, then touch rows of the last slice only.
+            seg = tbl.segments[0]
+            ctypes.string_at(seg.buffer._addr, seg.buffer._nbytes)
+            grid = prefetcher.grid
+            self.assertGreater(len(grid.ranges), 8)
+            hot = len(grid.ranges) - 1
+            # The rows that bin into that last slice: its first row to the end.
+            rows = torch.arange(grid.range_rows * hot, tbl.row_end, dtype=torch.int64)
+            prefetcher.note_rows(rows)
+            self.assertEqual(prefetcher.hit_cycles()[hot], prefetcher._cycle)
+            trimmer = PleFileRssTrimmer(
+                segments=tbl,
+                prefetcher=prefetcher,
+                budget_bytes=64 << 10,
+                interval_s=999,
+            )
+            try:
+                self.assertTrue(trimmer._lru)
+                warm = sum(_ranges_rss_bytes(tbl.mappings()))
+                self.assertGreater(trimmer.trim_once(), 0)
+                left = sum(_ranges_rss_bytes(tbl.mappings()))
+            finally:
+                trimmer.close()
+            self.assertLess(left, warm // 2, "the trim did not reduce residency")
+            self.assertGreater(left, 0, "the hot slice was evicted with the cold ones")
+            prefetcher.close()
+
+    def test_range_grid_slices_are_disjoint_and_page_aligned(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(d, shards=3, rows=4000)
+            tbl = self._alloc(d, shards=3, rows=4000)
+            grid = tbl.range_grid(64 << 10)
+            for base, nbytes in grid.ranges:
+                self.assertEqual(base % 4096, 0)
+                self.assertGreater(nbytes, 0)
+            # Page-widening may share a boundary page, but no slice is empty and
+            # every slice sits inside the mapping of the segment that owns it.
+            mappings = tbl.mappings()
+            for index, (base, nbytes) in enumerate(grid.ranges):
+                owner = mappings[grid.owner[index]]
+                self.assertGreaterEqual(base, owner[0])
+                self.assertLessEqual(base + nbytes, owner[0] + owner[1])
+            # A row of each segment bins into a slice of that same segment.
+            first = torch.tensor(grid.first, dtype=torch.int64)
+            for index, segment in enumerate(tbl.segments):
+                row = torch.tensor([segment.row_start + 1], dtype=torch.int64)
+                got = tbl.range_ids_for_rows(row, grid, first)
+                self.assertEqual(got.numel(), 1)
+                self.assertEqual(grid.owner[int(got)], index)
+            # range_bytes 0 restores the whole-mapping unit: the slices are the
+            # mappings and a row bins to its segment's index, so the pre-range
+            # ranking keeps working through the same code.
+            legacy = tbl.range_grid(0)
+            self.assertEqual(legacy.ranges, tbl.mappings())
+            got = tbl.range_ids_for_rows(
+                torch.tensor([tbl.segments[1].row_start]),
+                legacy,
+                torch.tensor(legacy.first, dtype=torch.int64),
+            )
+            self.assertEqual(got.tolist(), [1])
 
     def test_indirection_tensors_pad_to_power_of_two(self):
         import torch

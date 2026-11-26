@@ -459,6 +459,126 @@ def test_qwen4_ple_file_backend_keeps_gathers_in_kernel_with_host_page_tables(
         assert staged == []
 
 
+_SAFE_PREFIX = "model.layers.2.ple.ple_embedding.ngram_embedding"
+
+
+def _write_ple_checkpoint(d, *, shards, rows, row_bytes):
+    """Mini safetensors checkpoint of ``shards`` fp8 shards, no scales; returns
+    the whole table as one tensor, in the row order the gather sees."""
+    import json
+
+    from safetensors.torch import save_file
+
+    weight_map, table = {}, []
+    for i in range(shards):
+        key = (
+            f"model.language_model.layers.1.ple.ple_embedding"
+            f".ngram_embedding.shard_{i}.weight"
+        )
+        values = (
+            torch.arange(rows * row_bytes, dtype=torch.float32)
+            .reshape(rows, row_bytes)
+            .div(64)
+            .to(torch.float8_e4m3fn)
+        )
+        save_file({key: values}, os.path.join(d, f"ple-{i:05d}.safetensors"))
+        weight_map[key] = f"ple-{i:05d}.safetensors"
+        table.append(values)
+    with open(os.path.join(d, "model.safetensors.index.json"), "w") as f:
+        json.dump({"metadata": {}, "weight_map": weight_map}, f)
+    return torch.cat(table)
+
+
+@pytest.mark.skipif(
+    not _file_backend_supported(),
+    reason="the file backend needs a device that reads pageable host memory",
+)
+def test_qwen4_ple_safetensors_gathers_prefill_rows_on_the_host(monkeypatch):
+    """A prefill-sized gather from the checkpoint-backed table reads its distinct
+    rows on the host too -- its rows live in per-shard mappings, so the staging copy
+    has to resolve them through the segment table. Control: the same table on a GPU
+    that reads through the host's page tables stays in the kernel, byte for byte.
+    """
+    monkeypatch.setattr(
+        qwen4_exp_module, "device_faults_pageable_pages", lambda device_index=0: True
+    )
+    embedding_dim, rows_per_shard, shards = 160, 64, 3
+    rows = shards * rows_per_shard
+    staged = []
+    stage = Qwen4ExpPinnedHostEmbedding._stage_table_rows
+    monkeypatch.setattr(
+        Qwen4ExpPinnedHostEmbedding,
+        "_stage_table_rows",
+        lambda self, r: staged.append(r.numel()) or stage(self, r),
+    )
+
+    def new_embedding():
+        return Qwen4ExpPinnedHostEmbedding(
+            _make_source_embedding(
+                embedding_dim=embedding_dim,
+                dtype=torch.float8_e4m3fn,
+                vocab_start=0,
+                vocab_end=rows,
+                org_vocab_size=rows,
+            ),
+            backend="safetensors",
+            table_dir=d,
+            safetensors_shard_size=rows_per_shard,
+            safetensors_key_prefix=_SAFE_PREFIX,
+        )
+
+    with tempfile.TemporaryDirectory() as d:
+        table = (
+            _write_ple_checkpoint(
+                d, shards=shards, rows=rows_per_shard, row_bytes=embedding_dim
+            )
+            .to(torch.bfloat16)
+            .to("cuda")
+        )
+        embedded = new_embedding()
+        # The gate this guards: a checkpoint-backed table has no host tensor, so it
+        # used to be read only through the kernel.
+        assert embedded._stages_on_host and embedded._table_fd is None
+
+        def gather(model, ids):
+            # The table is sharded: allocate the output as the model does, since
+            # allocating one goes through the TP group, which this test has none of.
+            out = torch.empty(
+                (*ids.shape, embedding_dim), dtype=torch.bfloat16, device="cuda"
+            )
+            return model.gather(ids, out=out)
+
+        def expected(ids):
+            inside = (ids >= 0) & (ids < rows)
+            rows_out = table.index_select(0, ids.clamp(0, rows - 1).flatten())
+            return (rows_out * inside.flatten()[:, None]).reshape(*ids.shape, -1)
+
+        big = torch.randint(-2, rows + 2, (4096,), device="cuda")
+        big[:4] = torch.tensor([0, rows - 1, rows, -1], device="cuda")
+        torch.testing.assert_close(gather(embedded, big), expected(big), rtol=0, atol=0)
+        # The out-of-shard ids stage no row of their own.
+        assert staged == [int(big[(big >= 0) & (big < rows)].unique().numel())]
+        # A staged gather never reaches the prefetcher's hint, so it has to record
+        # its own touch or the resident-set trim stops learning what is warm.
+        assert any(embedded._file_prefetcher.hit_cycles())
+
+        small = torch.tensor([[0, rows - 1, 3]], device="cuda")
+        torch.testing.assert_close(
+            gather(embedded, small), expected(small), rtol=0, atol=0
+        )
+        assert len(staged) == 1  # decode-sized: the kernel reads the mappings
+
+        monkeypatch.setattr(
+            qwen4_exp_module,
+            "device_faults_pageable_pages",
+            lambda device_index=0: False,
+        )
+        kernel = new_embedding()
+        assert not kernel._stages_on_host
+        torch.testing.assert_close(gather(kernel, big), expected(big), rtol=0, atol=0)
+        assert len(staged) == 1  # the control never staged
+
+
 if __name__ == "__main__":
     import sys
 

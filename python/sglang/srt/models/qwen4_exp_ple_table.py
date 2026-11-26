@@ -68,6 +68,15 @@ PLE_FILE_RSS_TRIM_CHUNK_BYTES = 1 << 30
 # Below this many rows a gather is decode-sized (16 rows per token): the page
 # faults are cheap and the host-side hint would cost more than it saves.
 PLE_FILE_PREFETCH_MIN_ROWS = 2048
+# Default unit of the resident-set trim and of the gather's recency tracking.
+# 32 MiB, not smaller, because of the trimmer's own pacing: _evict_range madvises
+# a PLE_FILE_RSS_TRIM_CHUNK_BYTES slice and then waits 5 ms for faults queued
+# behind mmap_lock, so dropping N slices costs N x 5 ms. A 2 MiB unit would make
+# the worst case 887 waits (~4.4 s per cycle); at 32 MiB the same table is 1 143
+# slices and a trim that still has to drop most of it stays near a second. Bigger
+# than a working set, smaller than a shard mapping (hundreds of MiB), so one hot
+# slice no longer keeps an entire cold shard resident.
+PLE_FILE_RSS_RANGE_BYTES = 32 << 20
 
 
 class PleSegment(NamedTuple):
@@ -90,6 +99,24 @@ class PleSegment(NamedTuple):
     buffer: object  # keeps the mmap alive
 
 
+class PleRangeGrid(NamedTuple):
+    """The resident-set trim's eviction grid: fixed-size slices of the mappings.
+
+    A slice is what the trim drops at once and what the gather's recency is
+    tracked per, so a hot slice keeps its rows while its colder neighbours go
+    (a shard mapping is hundreds of MiB; the working set is tens of them).
+    ``first[i]``/``ends[i]`` bound segment ``i``'s slices and ``owner[j]`` is the
+    segment (mapping) slice ``j`` lives in; row binning uses ``range_rows``.
+    """
+
+    range_bytes: int  # nominal slice size; <= 0 = one slice per mapping
+    range_rows: int  # rows per slice, what a row is divided by
+    ranges: list  # (addr, nbytes) per slice, page-aligned inside its mapping
+    first: list  # first slice of each segment
+    ends: list  # one past the last slice of each segment
+    owner: list  # segment index of each slice
+
+
 class PleSegmentTable:
     """Shard-indirection descriptor for a table split across checkpoint files.
 
@@ -105,6 +132,12 @@ class PleSegmentTable:
                 raise ValueError("overlapping PLE table segments")
         self.segments = segments
         self.row_bytes = int(row_bytes)
+        # Row reads (the host gather's staging copy) want a tensor per mapping, and
+        # the split wants row bounds; all three are fixed at mapping time.
+        self._bounds = torch.tensor(self.segment_bounds(), dtype=torch.int64)
+        self._starts = torch.tensor([s.row_start for s in segments], dtype=torch.int64)
+        self._ends = torch.tensor([s.row_end for s in segments], dtype=torch.int64)
+        self._row_views = self._build_row_views()
 
     @property
     def row_start(self) -> int:
@@ -124,53 +157,151 @@ class PleSegmentTable:
         offset is relative: ``base + (local_idx - bound) * row_bytes``."""
         return [s.addr for s in self.segments]
 
-    def _segment_of(self, row: int) -> int:
-        """Last segment whose bound is <= ``row`` (caller bounds-checks)."""
-        segs, lo, hi = self.segments, 0, len(self.segments)
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if segs[mid].row_start <= row:
-                lo = mid + 1
-            else:
-                hi = mid
-        return lo - 1
+    def _segment_runs(self, rows: torch.Tensor) -> list[tuple[int, int, int]]:
+        """(segment index, first row, count) triples for ascending unique ``rows``.
 
-    def pages_for_rows(self, row_ids: Sequence[int]) -> list[tuple[int, int]]:
-        """(fd, page-aligned file offset) pairs covering the given rows."""
-        out: list[tuple[int, int]] = []
-        seen: set[tuple[int, int]] = set()
-        if not self.segments:
-            return out
-        first, last = self.segments[0].row_start, self.segments[-1].row_end
-        for row in sorted(int(r) for r in row_ids):
-            if not first <= row < last:
-                continue
-            seg = self.segments[self._segment_of(row)]
-            start = seg.file_off + (row - seg.row_start) * self.row_bytes
-            end = start + (self.row_bytes - 1)
-            for page in (start >> _PAGE_SHIFT, end >> _PAGE_SHIFT):
-                key = (seg.fd, page << _PAGE_SHIFT)
-                if key not in seen:
-                    seen.add(key)
-                    out.append(key)
-        return out
-
-    def segments_for_rows(self, row_ids: Sequence[int]) -> set:
-        """Indices of the segments containing any of the given rows.
-
-        Segments (one mapping per checkpoint shard, hundreds of MiB) are the
-        unit the LRU trim evicts by: a row's segment is exactly the kernel's
-        ``count(bounds <= row) - 1``, so this mirrors the gather.
+        Ascending rows meet ascending, non-overlapping bounds, so one segment's
+        rows are always one contiguous run, and the kernel's segment index -- the
+        count of bounds at or below the row, minus one -- is also the run split.
         """
-        out: set = set()
-        if not self.segments:
-            return out
-        first, last = self.segments[0].row_start, self.segments[-1].row_end
-        for row in row_ids:
-            row = int(row)
-            if first <= row < last:
-                out.add(self._segment_of(row))
-        return out
+        if int(rows[0]) < self.row_start or int(rows[-1]) >= self.row_end:
+            raise ValueError(
+                f"PLE table: staged rows {int(rows[0])}..{int(rows[-1])} are "
+                f"outside the mapped rows [{self.row_start}, {self.row_end})"
+            )
+        segment = torch.searchsorted(self._bounds, rows, right=True) - 1
+        if bool((rows >= self._ends[segment]).any()):
+            raise ValueError(
+                "PLE table: staged rows fall in a gap between mapped segments "
+                f"{[s.row_start for s in self.segments]}"
+            )
+        starts = torch.ones(rows.numel(), dtype=torch.bool)
+        starts[1:] = segment[1:] != segment[:-1]
+        starts = torch.nonzero(starts).flatten()
+        lengths = torch.diff(starts, append=starts.new_tensor([int(rows.numel())]))
+        return list(zip(segment[starts].tolist(), starts.tolist(), lengths.tolist()))
+
+    def read_rows(self, rows: torch.Tensor, out: torch.Tensor) -> int:
+        """Copy the ascending unique int64 TP-local ``rows`` into ``out``'s rows.
+
+        One ``index_select`` per segment rather than one per row: a staging copy
+        of a prefill chunk reads tens of thousands of rows, and the segment's
+        rows land in one contiguous slice of ``out``.
+        """
+        for index, start, count in self._segment_runs(rows):
+            local = rows[start : start + count] - self.segments[index].row_start
+            torch.index_select(
+                self._row_views[index], 0, local, out=out[start : start + count]
+            )
+        return int(rows.numel())
+
+    def range_grid(self, range_bytes: int) -> PleRangeGrid:
+        """Slice every mapping into the trim's eviction units (see ``PleRangeGrid``).
+
+        ``range_bytes <= 0`` yields the mappings themselves -- the pre-range LRU
+        unit, so a whole checkpoint shard is still one victim. Otherwise slices are
+        cut on row boundaries but widened out to whole pages, which ``madvise(2)``
+        needs (an address inside a page is EINVAL); widening only ever pulls in a
+        neighbour's page, never drops one of the slice's own rows.
+        """
+        mappings = self.mappings()
+        if range_bytes <= 0:
+            return PleRangeGrid(
+                0,
+                0,
+                list(mappings),
+                list(range(len(mappings))),
+                list(range(1, len(mappings) + 1)),
+                list(range(len(mappings))),
+            )
+        page = 1 << _PAGE_SHIFT
+        rows = max(1, range_bytes // self.row_bytes)
+        out: list = []
+        first: list = []
+        ends: list = []
+        owner: list = []
+        for index, (base, size) in enumerate(mappings):
+            segment = self.segments[index]
+            rows_in_segment = segment.nbytes // self.row_bytes
+            first.append(len(out))
+            for lo in range(0, rows_in_segment, rows):
+                aligned = max(base, (segment.addr + lo * self.row_bytes) & ~(page - 1))
+                end = segment.addr + min(lo + rows, rows_in_segment) * self.row_bytes
+                out.append(
+                    (aligned, min(base + size, -(-end // page) * page) - aligned)
+                )
+                owner.append(index)
+            ends.append(len(out))
+        return PleRangeGrid(range_bytes, rows, out, first, ends, owner)
+
+    def range_ids_for_rows(
+        self, rows: torch.Tensor, grid: PleRangeGrid, first: torch.Tensor
+    ) -> torch.Tensor:
+        """Ascending slice ids (see ``range_grid``) holding any of the ``rows``.
+
+        A row is binned by where its *first* byte falls, so the rare row whose tail
+        crosses a slice boundary names only the first: that row's slice stays warm,
+        and the neighbouring slice at worst loses one row's page. With the legacy
+        whole-mapping unit the slice id is the segment id, so recency keeps working
+        there too.
+        """
+        if rows.numel() == 0:
+            return torch.empty(0, dtype=torch.int64)
+        rows = rows.to(torch.int64)
+        segment = torch.searchsorted(self._bounds, rows, right=True) - 1
+        keep = (
+            (rows >= self.row_start)
+            & (rows < self.row_end)
+            & (rows < self._ends[segment])
+        )
+        rows, segment = rows[keep], segment[keep]
+        if rows.numel() == 0:
+            return torch.empty(0, dtype=torch.int64)
+        if grid.range_bytes <= 0:
+            # One slice per mapping: the slice id is the segment id.
+            return segment.unique()
+        local = rows - self._starts[segment]
+        return (first[segment] + local // grid.range_rows).unique()
+
+    def advise_rows(self, rows: torch.Tensor) -> int:
+        """Queue the page-cache reads of the mapped ``rows``, one ``posix_fadvise``
+        per run of adjacent pages within each segment (see ``advise_rows_willneed``
+        for why the runs matter).
+
+        Rows outside this rank's window are skipped rather than refused: a gather's
+        ids routinely leave the shard, and this path is advisory. A row inside the
+        window but in no segment still raises -- that means the checkpoint is
+        incomplete, which ``read_rows`` would misread as its neighbour's bytes.
+        """
+        rows = rows.to(torch.int64).unique()  # sorted, as _segment_runs wants
+        rows = rows[(rows >= self.row_start) & (rows < self.row_end)]
+        if rows.numel() == 0:
+            return 0
+        advised = 0
+        for index, start, count in self._segment_runs(rows):
+            segment = self.segments[index]
+            local = rows[start : start + count] - segment.row_start
+            advised += advise_rows_willneed(
+                segment.fd, local, self.row_bytes, base_offset=segment.file_off
+            )
+        return advised
+
+    def _build_row_views(self) -> list:
+        """One uint8 ``[rows, row_bytes]`` tensor per segment, over its mapped bytes.
+
+        torch has no ``from_address``, so the bridge is ctypes -> numpy -> torch and
+        every hop shares the mapping. It is ``PROT_READ`` and numpy cannot see that,
+        so it reports the result writable: nothing may write through these views.
+        """
+        import numpy as np
+
+        views = []
+        for segment in self.segments:
+            rows = segment.nbytes // self.row_bytes
+            memory = (ctypes.c_ubyte * segment.nbytes).from_address(segment.addr)
+            array = np.frombuffer(memory, dtype=np.uint8)
+            views.append(torch.from_numpy(array).view(rows, self.row_bytes))
+        return views
 
     def mappings(self) -> list[tuple[int, int]]:
         """(addr, nbytes) per mapping, for madvise and RSS accounting.
@@ -338,10 +469,11 @@ class PleFilePrefetcher:
 
     With the table on storage, a cold prefill chunk faults tens of thousands of
     4 KiB pages one at a time from inside the gather kernel. Advising them
-    first (``posix_fadvise(WILLNEED)`` per distinct page, on one background
-    thread) lets the block layer serve them concurrently. Measured on a GB10 /
-    NVMe: cold prefill 650-750 tok/s -> 1,000-2,100 tok/s (warm: ~2,200-2,600).
-    Decode-sized gathers are skipped; nothing runs during CUDA-graph capture.
+    first (``posix_fadvise(WILLNEED)`` over each run of adjacent pages, on one
+    background thread) lets the block layer serve them concurrently. Measured on
+    a GB10 / NVMe: cold prefill 650-750 tok/s -> 1,000-2,100 tok/s (warm:
+    ~2,200-2,600). Decode-sized gathers are skipped; nothing runs during
+    CUDA-graph capture.
     """
 
     def __init__(
@@ -350,6 +482,7 @@ class PleFilePrefetcher:
         row_bytes: int = 0,
         min_rows: int = PLE_FILE_PREFETCH_MIN_ROWS,
         segments: Optional[PleSegmentTable] = None,
+        range_bytes: int = PLE_FILE_RSS_RANGE_BYTES,
     ) -> None:
         # A checkpoint-backed table spans many files; then PleSegmentTable maps
         # a row to (fd, file offset) and the page math happens there.
@@ -359,37 +492,33 @@ class PleFilePrefetcher:
         self._row_bytes = int(row_bytes)
         self._min_rows = int(min_rows)
         self._pool = ThreadPoolExecutor(max_workers=1)
-        # Monotonic recency per segment, consumed by PleFileRssTrimmer's LRU
-        # mode. Written only from the gather thread, read by the trim thread;
-        # int stores are atomic under the GIL and a racy cycle is harmless.
-        self._hit_cycle = [0] * (len(segments.segments) if segments else 0)
+        # The grid both records recency against and (through ``grid``) that the
+        # resident-set trim evicts by, so the two cannot disagree about which
+        # slice a row fell in. Monotonic counters, one per slice, written only
+        # from the gather thread and read by the trim thread; int stores are
+        # atomic under the GIL and a racy cycle is harmless.
+        self.grid = segments.range_grid(range_bytes) if segments else None
+        self._hit_cycle = [0] * (len(self.grid.ranges) if self.grid else 0)
+        self._slice_first = (
+            torch.tensor(self.grid.first, dtype=torch.int64) if self.grid else None
+        )
         self._cycle = 0
 
-    @staticmethod
-    def pages_for_rows(row_ids: torch.Tensor, row_bytes: int) -> list[int]:
-        start = row_ids.to(torch.int64) * row_bytes
-        end = start + (row_bytes - 1)
-        return (
-            torch.cat([start >> _PAGE_SHIFT, end >> _PAGE_SHIFT])
-            .unique(sorted=True)
-            .tolist()
-        )
+    def _advise(self, rows: torch.Tensor) -> None:
+        """Queue the reads of TP-local ``rows``, one ``posix_fadvise`` per run of
+        adjacent pages of one file.
 
-    def _advise(self, pages) -> None:
+        A prefill chunk touches a few thousand pages and rows are ~34 per page
+        (120 B each), so adjacent ids -- the common case inside a batch -- would
+        otherwise each get their own 4 KiB read issued one at a time. The row
+        stream goes to ``advise_rows_willneed``, the same run merging the host
+        gather uses for its own copy; for a checkpoint-backed table each segment
+        has its own descriptor.
+        """
         if self._segments is not None:
-            for fd, off in pages:
-                try:
-                    os.posix_fadvise(fd, off, 1 << _PAGE_SHIFT, os.POSIX_FADV_WILLNEED)
-                except OSError:
-                    return
-            return
-        for p in pages:
-            try:
-                os.posix_fadvise(
-                    self._fd, p << _PAGE_SHIFT, 1 << _PAGE_SHIFT, os.POSIX_FADV_WILLNEED
-                )
-            except OSError:
-                return
+            self._segments.advise_rows(rows)
+        else:
+            advise_rows_willneed(self._fd, rows, self._row_bytes)
 
     def enqueue(
         self,
@@ -413,21 +542,33 @@ class PleFilePrefetcher:
         if row_ids.numel() == 0:
             return False
         if self._segments is not None:
-            rows = row_ids.tolist()
-            if self._hit_cycle:
-                hits = self._segments.segments_for_rows(rows)
-                if hits:
-                    self._cycle += 1
-                    for i in hits:
-                        self._hit_cycle[i] = self._cycle
-            pages = self._segments.pages_for_rows(rows)
-        else:
-            pages = self.pages_for_rows(row_ids, self._row_bytes)
-        self._pool.submit(self._advise, pages)
+            self.note_rows(row_ids)
+        self._pool.submit(self._advise, row_ids)
         return True
 
+    def note_rows(self, rows: torch.Tensor) -> None:
+        """Record that the gather touched these TP-local rows.
+
+        The trim can only rank what the reads tell it about, and a gather that
+        stages its rows on the host never reaches ``enqueue`` -- so the model
+        calls this from that path too. Without it the resident set would freeze
+        at whatever was warm when staging switched on.
+        """
+        if not self._hit_cycle:
+            return
+        hits = self._segments.range_ids_for_rows(rows, self.grid, self._slice_first)
+        if hits.numel() == 0:
+            return
+        self._cycle += 1
+        for index in hits.tolist():
+            self._hit_cycle[index] = self._cycle
+
     def hit_cycles(self) -> list:
-        """Per-segment last-touch counter (0 = never seen by a gather)."""
+        """Per-slice last-touch counter (0 = never seen by a gather).
+
+        Indexed by ``PleRangeGrid.ranges`` position: the trim may not build its
+        own grid, or the two would rank different bytes.
+        """
         return self._hit_cycle
 
     def close(self) -> None:
@@ -485,9 +626,10 @@ class PleFileRssTrimmer:
         self._budget = int(budget_bytes)
         self._interval = float(interval_s)
         self._chunk = int(chunk_bytes)
-        # LRU mode needs per-segment recency (only the row stream knows it);
-        # single-mapping file tables have one segment, so they keep drop-all.
-        self._lru = bool(lru) and segments is not None and prefetcher is not None
+        # LRU mode needs the gather's per-slice recency, which only the row
+        # stream knows; a single-mapping file table has no grid, so it keeps
+        # drop-all.
+        self._lru = bool(lru) and prefetcher is not None and prefetcher.grid is not None
         self._prefetcher = prefetcher
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -512,44 +654,44 @@ class PleFileRssTrimmer:
             # Let the faults that queued behind mmap_lock through.
             self._stop.wait(0.005)
 
-    def _trim_lru(self, ranges, per_rss, before: int) -> int:
-        """Evict whole mappings, coldest first, until under budget.
+    def _trim_lru(self, per_rss) -> int:
+        """Evict grid slices, coldest first, until the resident set meets the budget.
 
-        Whole mappings are the unit: recency is only known per segment (the
-        row stream), and evicting a slice of one would drop warm rows too.
-        Segments touched since the last trim are left alone, so at most the
-        coldest half goes per cycle and the resident working set migrates
-        instead of collapsing. A never-touched mapping counts as coldest.
+        Recency is per slice (from the gather's row stream, see ``PleRangeGrid``),
+        so a hot slice inside an otherwise cold shard survives: the whole-mapping
+        unit this replaces re-colded hundreds of MiB of rows a gather had just
+        read. Resident bytes are only readable per mapping (smaps), so an evicted
+        slice is credited against its own mapping's residency and capped by it --
+        a slice no gather ever reached costs a no-op madvise, not phantom freed
+        bytes. Slices touched since the trim started are left alone, so at most
+        the cold part of the table goes per cycle and the warm set migrates
+        instead of collapsing.
         """
+        grid = self._prefetcher.grid
         hits = self._prefetcher.hit_cycles()
         cycle = self._prefetcher._cycle
-        # Snapshot totals and copy what we evict: total can only shrink past
-        # the budget, so a stale per-segment value is never re-evicted.
-        evictions = [0] * len(ranges)
-        total = sum(per_rss)
-        for i in sorted(range(len(ranges)), key=lambda i: hits[i]):
+        left = list(per_rss)  # per mapping; a slice cannot credit more than it holds
+        total = sum(left)
+        victims: list[int] = []
+        for index in sorted(range(len(grid.ranges)), key=lambda i: (hits[i], i)):
             if total <= self._budget or self._stop.is_set():
                 break
-            if per_rss[i] == 0:
+            mapping = grid.owner[index]
+            if left[mapping] == 0 or (hits[index] and hits[index] >= cycle):
                 continue
-            if hits[i] and hits[i] >= cycle:
-                # touched during the very trim that measured it -- hot
-                continue
-            evictions[i] = per_rss[i]
-            total -= per_rss[i]
-        for i, victim in enumerate(evictions):
-            if victim:
-                base, nbytes = ranges[i]
-                self._evict_range(base, nbytes)
-        freed = sum(evictions)
+            freed = min(grid.ranges[index][1], left[mapping])
+            left[mapping] -= freed
+            total -= freed
+            victims.append(index)
+        for index in victims:
+            base, nbytes = grid.ranges[index]
+            self._evict_range(base, nbytes)
+        freed = sum(grid.ranges[index][1] for index in victims)
         if freed:
             logger.info(
-                "PLE table: LRU-trimmed %.1f GiB of %d cold segments "
-                "(%.1f GiB left of %.1f GiB, budget %.1f GiB)",
+                "PLE table: LRU-trimmed %d cold slices (~%.1f GiB, budget %.1f GiB)",
+                len(victims),
                 freed / 2**30,
-                sum(1 for v in evictions if v),
-                (before - freed) / 2**30,
-                before / 2**30,
                 self._budget / 2**30,
             )
         return freed
@@ -557,10 +699,10 @@ class PleFileRssTrimmer:
     def trim_once(self) -> int:
         """Cut the mapping's resident set to the budget. Returns bytes freed.
 
-        LRU mode (segment tables with a live gather stream) evicts the
-        coldest mappings only; otherwise every mapping is dropped whole --
-        the pre-LRU behaviour, still right for single-mapping file tables
-        where recency has nothing to rank.
+        LRU mode (a segment table with a live gather stream) evicts the coldest
+        grid slices only; otherwise every mapping is dropped whole -- the
+        pre-LRU behaviour, still right for single-mapping file tables where
+        recency has nothing to rank.
         """
         if self._lru:
             per = _ranges_rss_bytes(self._ranges)
@@ -569,7 +711,7 @@ class PleFileRssTrimmer:
             before = sum(per)
             if before <= self._budget:
                 return 0
-            freed = self._trim_lru(self._ranges, per, before)
+            freed = self._trim_lru(per)
         else:
             before = self.mapping_rss_bytes()
             if before is None or before <= self._budget:
@@ -794,7 +936,13 @@ def make_ple_file_prefetcher(table: torch.Tensor) -> Optional[PleFilePrefetcher]
             else table.element_size()
         )
     if segments is not None:
-        prefetcher = PleFilePrefetcher(row_bytes=row_bytes, segments=segments)
+        # The trimmer ranks and evicts by this prefetcher's grid, so the slice
+        # size is read here and nowhere else.
+        prefetcher = PleFilePrefetcher(
+            row_bytes=row_bytes,
+            segments=segments,
+            range_bytes=int(envs.SGLANG_QWEN4_PLE_FILE_RSS_RANGE_MB.get()) << 20,
+        )
     else:
         prefetcher = PleFilePrefetcher(path=path, row_bytes=row_bytes)
     logger.info(
@@ -853,7 +1001,7 @@ def make_ple_file_rss_trimmer(
     logger.info(
         "PLE table: resident set capped at %.1f GiB (%s), checked every %.0f s",
         budget_gb,
-        "coldest-segment LRU" if trimmer._lru else "drop-all",
+        "coldest-slice LRU" if trimmer._lru else "drop-all",
         float(envs.SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S.get()),
     )
     return trimmer
@@ -967,10 +1115,13 @@ def _device_attribute(attribute: int, device_index: int) -> Optional[int]:
     return None
 
 
-def advise_rows_willneed(fd: int, rows: torch.Tensor, row_bytes: int) -> int:
+def advise_rows_willneed(
+    fd: int, rows: torch.Tensor, row_bytes: int, base_offset: int = 0
+) -> int:
     """Queue the page-cache reads of ``rows`` of the file-backed table open as ``fd``
     and return once they are queued: ``posix_fadvise(WILLNEED)``, one call per run
-    of adjacent pages.
+    of adjacent pages. ``base_offset`` is where row 0 sits in ``fd``, which is
+    nonzero for one shard of a checkpoint-backed table.
 
     The host gather copies its rows on one thread (the server runs torch with one
     thread) from a ``MADV_RANDOM`` mapping, so without this each cold row is its own
@@ -981,7 +1132,7 @@ def advise_rows_willneed(fd: int, rows: torch.Tensor, row_bytes: int) -> int:
     global _WILLNEED_FAILED
     if rows.numel() == 0:
         return 0
-    first = rows.to(torch.int64) * row_bytes
+    first = rows.to(torch.int64) * row_bytes + base_offset
     pages = torch.cat(
         [first >> _PAGE_SHIFT, (first + row_bytes - 1) >> _PAGE_SHIFT]
     ).unique(sorted=True)
