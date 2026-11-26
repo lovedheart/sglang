@@ -466,9 +466,12 @@ class Envs:
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
-    # When the cap is below the table's size, drop-all re-colds the whole
-    # warm cache on a timer; rank the mappings by the gather's own row stream
-    # and evict only the coldest shard mappings until the cap holds.
+    # When the cap is below the table's size, drop-all re-colds the whole warm
+    # cache on a timer; rank the slices by the gather's own row stream and evict
+    # the coldest until the cap holds. A cycle drops at most a quarter of the
+    # resident set (an eviction costs a device fault when the row is read again),
+    # and a slice the workload read back after evicting it stops competing, so
+    # the cap converges onto the working set instead of churning against it.
     SGLANG_QWEN4_PLE_FILE_RSS_LRU = EnvBool(True)
     # Unit of that ranking and eviction, in MiB, for a checkpoint-backed table
     # (many shard mappings). A shard mapping is hundreds of MiB, so ranking whole

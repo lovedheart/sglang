@@ -81,6 +81,14 @@ PLE_FILE_PREFETCH_MIN_ROWS = 2048
 # set, smaller than a shard mapping (hundreds of MiB), so one hot slice no
 # longer keeps an entire cold shard resident.
 PLE_FILE_RSS_RANGE_BYTES = 32 << 20
+# Ceiling on the fraction of the *resident set* one trim cycle may drop. An
+# eviction is only free until the workload reads the slice again, so the cost of
+# a cycle is paid as a device fault per row by whatever reads it next -- a decode
+# step reads 256 rows per verify, so a cycle that empties most of the resident
+# set costs the next seconds of serving, not the 30 s until the next check. As a
+# fraction of what is resident it still converges (geometrically) while a
+# mapping is far over budget, and holds at the budget once there.
+PLE_FILE_RSS_TRIM_MAX_DROP = 0.25
 
 
 class PleSegment(NamedTuple):
@@ -644,6 +652,26 @@ class PleFileRssTrimmer:
         # drop-all.
         self._lru = bool(lru) and prefetcher is not None and prefetcher.grid is not None
         self._prefetcher = prefetcher
+        # One report per trimmer: a budget the workload keeps exceeding is a
+        # configuration fact, not a per-cycle event.
+        self._held_warned = False
+        # Slices this trim has already dropped, and the resident bytes it saw
+        # per mapping last time. Resident bytes are only readable per mapping, so
+        # without them the coldest-first sweep re-picks the same already-evicted
+        # low-index slices: the nominal credit says there is more to free, the
+        # madvise is a no-op, and the resident set plateaus above the budget. A
+        # mapping whose residency grew had rows read back, so its slices are
+        # candidates again.
+        self._evicted: set = set()
+        # Slices already evicted once that were then read back: the workload has
+        # proved they are hot, whatever the row stream says. A captured decode
+        # gather runs no Python, so decode never reaches ``note_rows`` and its
+        # rows look cold forever; re-read-after-eviction is the one signal the
+        # trim thread itself can see, and without it the trim and the workload
+        # churn against each other at the cost of a device fault per row read.
+        self._proven_hot: set = set()
+        self._slices_of: list = []
+        self._rss_seen: list = []
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._loop, name="ple-file-rss-trim", daemon=True
@@ -679,19 +707,67 @@ class PleFileRssTrimmer:
         bytes. Slices touched since the trim started are left alone, so at most
         the cold part of the table goes per cycle and the warm set migrates
         instead of collapsing.
+
+        Victims are ranked by evidence, coldest first: a recorded touch that has
+        aged out, then a slice no gather has been seen to read, then one this trim
+        evicted and the workload read back. "No recorded touch" is not "cold" --
+        the row stream sees only the gathers that run Python, while startup reads
+        every segment through the warm-up ``posix_fadvise`` and a captured decode
+        gather runs no Python at all -- so ranking unobserved slices first dropped
+        what decode re-reads seconds later, at a device fault per row (~9 us). A
+        slice already evicted and not read back is skipped entirely: it is already
+        absent, and madvising it again frees nothing while the sweep never reaches
+        the slices that are resident.
         """
         grid = self._prefetcher.grid
         hits = self._prefetcher.hit_cycles()
         cycle = self._prefetcher._cycle
+        if not self._slices_of:
+            self._slices_of = [[] for _ in self._ranges]
+            for index, mapping in enumerate(grid.owner):
+                self._slices_of[mapping].append(index)
+        if len(self._rss_seen) == len(per_rss):
+            for mapping, (now, seen) in enumerate(zip(per_rss, self._rss_seen)):
+                if now > seen:  # rows of this mapping were read back
+                    for index in self._slices_of[mapping]:
+                        if index in self._evicted:
+                            self._proven_hot.add(index)
+                    self._evicted.difference_update(self._slices_of[mapping])
         left = list(per_rss)  # per mapping; a slice cannot credit more than it holds
         total = sum(left)
         victims: list[int] = []
         freed = 0
-        for index in sorted(range(len(grid.ranges)), key=lambda i: (hits[i], i)):
-            if total <= self._budget or self._stop.is_set():
+        # Coldest by evidence: an aged-out recorded touch, then a slice nobody
+        # has been seen to read, then one evicted and read back (hot, but the
+        # budget stays a hard bound). A slice evicted and not read back is out of
+        # the running: it is already absent, so madvising it again frees nothing
+        # and the sweep would never reach the slices that are resident.
+        # Coldest by evidence: an aged-out recorded touch, then a slice nobody has
+        # been seen to read. Two classes are out of the running. One evicted and
+        # not read back is already absent, so madvising it again frees nothing and
+        # the sweep never reaches the slices that are resident. One evicted and
+        # then read back has been proved in use -- by a reader the row stream
+        # cannot see, which is the only way a slice can be hot without a recorded
+        # touch -- and re-evicting it starts a fight with that reader: the trim
+        # drops it, the workload faults it back, at a device fault per row. What
+        # is then left over budget has to be reported, not thrashed over; a leak
+        # grows by touching slices nobody recorded, and those stay evictable.
+        order = sorted(
+            (
+                i
+                for i in range(len(grid.ranges))
+                if i not in self._evicted and i not in self._proven_hot
+            ),
+            key=lambda i: (hits[i] == 0, min(hits[i], cycle), i),
+        )
+        cap = int(total * PLE_FILE_RSS_TRIM_MAX_DROP)
+        for index in order:
+            if total <= self._budget or freed >= cap or self._stop.is_set():
                 break
+            if hits[index] and hits[index] >= cycle:
+                continue  # touched since the snapshot
             mapping = grid.owner[index]
-            if left[mapping] == 0 or (hits[index] and hits[index] >= cycle):
+            if left[mapping] == 0:
                 continue
             # Credit the capped amount: a slice can only free what its mapping
             # actually has resident, and the same bound is what the log reports.
@@ -700,9 +776,31 @@ class PleFileRssTrimmer:
             total -= freed_here
             freed += freed_here
             victims.append(index)
+        # A cycle that filled its cap and still sits well over budget is the
+        # case where the trimmer cannot converge without re-colding the hot
+        # set: either the budget is under the working set or the reads come
+        # from a phase the row stream does not see (a captured decode gather
+        # runs no Python, so its rows never reach note_rows).
+        stuck = total > self._budget * 1.5 and (freed >= cap or not victims)
+        if stuck and not self._held_warned:
+            self._held_warned = True
+            logger.warning(
+                "PLE table: %.1f GiB resident against a %.1f GiB budget with "
+                "%.0f%% of the table proved in use by reads it cannot observe "
+                "(a captured decode gather records no recency). The budget is "
+                "below the working set: raise "
+                "SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB to bound it harder.",
+                total / 2**30,
+                self._budget / 2**30,
+                100 * len(self._proven_hot) / max(len(grid.ranges), 1),
+            )
         for index in victims:
             base, nbytes = grid.ranges[index]
             self._evict_range(base, nbytes)
+            self._evicted.add(index)
+        # What residency should now be: the next cycle compares against this, so
+        # bytes above it were read back by something the row stream never saw.
+        self._rss_seen = list(left)
         if freed:
             logger.info(
                 "PLE table: LRU-trimmed %d cold slices (~%.1f GiB, budget %.1f GiB)",

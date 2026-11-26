@@ -908,12 +908,171 @@ class TestPleSafetensorsAllocator(CustomTestCase):
             try:
                 self.assertTrue(trimmer._lru)
                 warm = sum(_ranges_rss_bytes(tbl.mappings()))
-                self.assertGreater(trimmer.trim_once(), 0)
+                # A cycle now drops a bounded fraction of the resident set, so
+                # the budget is met over a few cycles rather than in one burst.
+                for _ in range(40):
+                    if trimmer.trim_once() == 0:
+                        break
                 left = sum(_ranges_rss_bytes(tbl.mappings()))
             finally:
                 trimmer.close()
-            self.assertLess(left, warm // 2, "the trim did not reduce residency")
+            self.assertLess(left, 128 << 10, "the trim never reached the budget")
             self.assertGreater(left, 0, "the hot slice was evicted with the cold ones")
+            prefetcher.close()
+
+    def test_trim_evicts_a_stale_slice_before_an_unobserved_one(self):
+        # The row stream only sees gathers that run Python, so "no recorded
+        # touch" means unobserved, not cold: startup reads the whole table and a
+        # captured decode gather runs no Python at all. Ranking those first
+        # dropped the rows a decode step re-reads seconds later, so a slice
+        # whose recorded touch has aged out must go before one never seen.
+        import ctypes
+
+        from sglang.srt.models.qwen4_exp_ple_table import _ranges_rss_bytes
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(d, shards=1, rows=20000)
+            tbl = self._alloc(d, shards=1, rows=20000)
+            prefetcher = PleFilePrefetcher(
+                row_bytes=120, segments=tbl, min_rows=1, range_bytes=64 << 10
+            )
+            seg = tbl.segments[0]
+            ctypes.string_at(seg.buffer._addr, seg.buffer._nbytes)  # fault in
+            grid = prefetcher.grid
+            self.assertGreater(len(grid.ranges), 4)
+
+            def rows_of(index):
+                lo = tbl.row_start + grid.range_rows * index
+                hi = min(lo + grid.range_rows, tbl.row_end)
+                return torch.arange(lo, hi, dtype=torch.int64)
+
+            prefetcher.note_rows(rows_of(0))  # slice 0 touched, then aged out
+            prefetcher.note_rows(rows_of(1))  # slice 1 touched this cycle
+            self.assertEqual(prefetcher._cycle, 2)
+            per_mapping = _ranges_rss_bytes(tbl.mappings())  # what the trim sees
+            self.assertGreater(per_mapping[0], 0)
+            # Room for one slice, so the choice of victim is the test.
+            first_slice = grid.ranges[0][1]
+            trimmer = PleFileRssTrimmer(
+                segments=tbl,
+                prefetcher=prefetcher,
+                budget_bytes=sum(per_mapping) - first_slice + 4096,
+                interval_s=999,
+            )
+            victims = []
+            evict = trimmer._evict_range
+
+            def record(base, nbytes):
+                victims.append((base, nbytes))
+                evict(base, nbytes)
+
+            try:
+                with mock.patch.object(trimmer, "_evict_range", side_effect=record):
+                    freed = trimmer.trim_once()
+                left = sum(_ranges_rss_bytes(tbl.mappings()))
+            finally:
+                trimmer.close()
+            self.assertEqual(victims, [grid.ranges[0]], "wrong slice was picked")
+            self.assertEqual(freed, first_slice)
+            self.assertLess(left, sum(per_mapping), "the eviction did not take")
+            prefetcher.close()
+
+    def test_trim_caps_the_bytes_dropped_in_one_cycle(self):
+        # An eviction is only free until the table is read again, and a decode
+        # step reads 256 rows per verify: dropping most of the resident set at
+        # once costs the workload more than it saves, however far over budget
+        # the mapping is. One cycle must stop at the cap and say so once.
+        import ctypes
+
+        from sglang.srt.models.qwen4_exp_ple_table import (
+            PLE_FILE_RSS_TRIM_MAX_DROP,
+            _ranges_rss_bytes,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(d, shards=1, rows=40000)
+            tbl = self._alloc(d, shards=1, rows=40000)
+            prefetcher = PleFilePrefetcher(
+                row_bytes=120, segments=tbl, min_rows=1, range_bytes=64 << 10
+            )
+            seg = tbl.segments[0]
+            ctypes.string_at(seg.buffer._addr, seg.buffer._nbytes)
+            warm = sum(_ranges_rss_bytes(tbl.mappings()))
+            budget = warm // 8  # far over budget: the cap, not the budget, binds
+            trimmer = PleFileRssTrimmer(
+                segments=tbl,
+                prefetcher=prefetcher,
+                budget_bytes=budget,
+                interval_s=999,
+            )
+            try:
+                with self.assertLogs(level="WARNING") as logs:
+                    freed = trimmer.trim_once()
+                left = sum(_ranges_rss_bytes(tbl.mappings()))
+                self.assertTrue(
+                    any("resident against a" in line for line in logs.output),
+                    logs.output,
+                )
+            finally:
+                trimmer.close()
+            slice_bytes = prefetcher.grid.ranges[0][1]
+            self.assertGreater(freed, 0, "the cap left the trim doing nothing")
+            self.assertLessEqual(
+                freed, int(warm * PLE_FILE_RSS_TRIM_MAX_DROP) + slice_bytes
+            )
+            self.assertGreater(left, budget, "the cap did not leave it over budget")
+            prefetcher.close()
+
+    def test_trim_stops_re_evicting_a_slice_that_was_read_back(self):
+        # The regression this guards cost 27% of GSM8K throughput: decode reads
+        # through a captured CUDA graph, so it never reaches note_rows and its
+        # rows look cold to the row stream forever. The trim dropped them and
+        # decode faulted them back, every cycle, at a device fault per row.
+        # Re-read-after-eviction is the one signal the trim thread can see, so a
+        # slice that came back has to stop competing for the next eviction.
+        import ctypes
+
+        from sglang.srt.models.qwen4_exp_ple_table import _ranges_rss_bytes
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake_ple_checkpoint(d, shards=1, rows=20000)
+            tbl = self._alloc(d, shards=1, rows=20000)
+            prefetcher = PleFilePrefetcher(
+                row_bytes=120, segments=tbl, min_rows=1, range_bytes=64 << 10
+            )
+            seg = tbl.segments[0]
+            ctypes.string_at(seg.buffer._addr, seg.buffer._nbytes)  # fault in
+            grid = prefetcher.grid
+            slice_bytes = grid.ranges[0][1]
+            trimmer = PleFileRssTrimmer(
+                segments=tbl, prefetcher=prefetcher, budget_bytes=0, interval_s=999
+            )
+            victims = []
+            evict = trimmer._evict_range
+
+            def record(base, nbytes):
+                victims.append((base, nbytes))
+                evict(base, nbytes)
+
+            try:
+                with mock.patch.object(trimmer, "_evict_range", side_effect=record):
+                    # Room for one slice per cycle, so each pick is visible.
+                    trimmer._budget = sum(_ranges_rss_bytes(tbl.mappings())) - 1
+                    first = trimmer.trim_once()
+                    self.assertEqual(first, slice_bytes)
+                    self.assertEqual(len(victims), 1)
+                    dropped = victims[0]
+                    # Read that slice back: the mapping's residency grows.
+                    ctypes.string_at(dropped[0], dropped[1])
+                    victims.clear()
+                    trimmer._budget = sum(_ranges_rss_bytes(tbl.mappings())) - 1
+                    trimmer.trim_once()
+            finally:
+                trimmer.close()
+            self.assertNotEqual(
+                victims[0], dropped, "the re-read slice was evicted again"
+            )
+            self.assertEqual(len(victims), 1)
             prefetcher.close()
 
     def test_range_grid_slices_are_disjoint_and_page_aligned(self):
