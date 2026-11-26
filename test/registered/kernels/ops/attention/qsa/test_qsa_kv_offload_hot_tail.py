@@ -226,3 +226,31 @@ def test_hot_tail_split_matches_scattered_union():
         )
         assert all(torch.equal(a, b) for a, b in zip(got, ref)), f"layer {layer}"
     offload.destroy()
+
+
+def test_hot_tail_split_rejects_bad_counts():
+    # Guards must be ValueError, not assert: a mispaired split silently
+    # corrupts KV under `python -O`.
+    dev = torch.device("cuda")
+    with pytest.raises(ValueError):
+        make_hot_tail_split(
+            counts=[4, 4],
+            host_counts=[2],
+            tail_rows_cpu=torch.arange(4),
+            device=dev,
+        )
+    with pytest.raises(ValueError):
+        # 8 context rows != 3 host + 4 tail
+        make_hot_tail_split(
+            counts=[4, 4],
+            host_counts=[2, 1],
+            tail_rows_cpu=torch.arange(4),
+            device=dev,
+        )
+    with pytest.raises(ValueError):
+        make_hot_tail_split(
+            counts=[4, 4],
+            host_counts=[5, 0],
+            tail_rows_cpu=torch.arange(3),
+            device=dev,
+        )

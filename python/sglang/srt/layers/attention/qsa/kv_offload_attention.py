@@ -349,7 +349,7 @@ def gather_offloaded_context_union(
             layer_idx=layer_idx,
             slots=slots,
             split=split,
-            slots_cpu=slots.to("cpu") if offload.quantized else None,
+            slots_cpu=(slots.to("cpu").long() if offload.quantized else None),
         )
     else:
         k, v, k_sf, v_sf = offload.gather_context(layer_idx=layer_idx, slots=slots)
@@ -562,11 +562,20 @@ def gather_offloaded_context(
         and not torch.cuda.is_current_stream_capturing()
         and extend_lens is not None
         and extend_lens.numel() == sequence_lens.numel()
-        # The split-driven gather resolves the row split from the host lists;
-        # without them (or on a mismatch) it cannot be built.
+        # The split-driven gather tails each request's own extend rows off
+        # the host lists, so they must line up with the device batch and no
+        # request may extend past its own context (a negative host count
+        # would ValueError in make_hot_tail_split mid-forward).
         and forward_batch.seq_lens_cpu is not None
         and forward_batch.extend_seq_lens_cpu is not None
-        and sum(int(x) for x in forward_batch.seq_lens_cpu) == total_k
+        and len(forward_batch.seq_lens_cpu) == sequence_lens.numel()
+        and len(forward_batch.extend_seq_lens_cpu) == sequence_lens.numel()
+        and all(
+            int(e) <= int(s)
+            for s, e in zip(
+                forward_batch.seq_lens_cpu, forward_batch.extend_seq_lens_cpu
+            )
+        )
     )
     prefetched = None if slab_on else offload.take_prefetch(layer_idx)
     if slab_on:

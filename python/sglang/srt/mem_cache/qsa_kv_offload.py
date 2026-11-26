@@ -327,7 +327,11 @@ def make_hot_tail_split(
 ) -> HotTailSplit:
     """Build one forward's hot-tail gather indices on the host, from the
     per-request row counts and tail rows; no device readback."""
-    assert len(counts) == len(host_counts)
+    if len(counts) != len(host_counts):
+        raise ValueError(
+            f"QSA K/V offload: {len(counts)} context row counts vs "
+            f"{len(host_counts)} host counts"
+        )
     host_np, tail_np = [], []
     total = 0
     for rows, host in zip(counts, host_counts):
@@ -338,7 +342,11 @@ def make_hot_tail_split(
         host_np.append(np.arange(total, total + host, dtype=np.int64))
         tail_np.append(np.arange(total + host, total + rows, dtype=np.int64))
         total += rows
-    assert total == sum(host_counts) + tail_rows_cpu.numel()
+    if total != sum(host_counts) + tail_rows_cpu.numel():
+        raise ValueError(
+            f"QSA K/V offload: {total} context rows != "
+            f"{sum(host_counts)} host + {tail_rows_cpu.numel()} tail rows"
+        )
     host_idx_cpu = torch.from_numpy(
         np.concatenate(host_np) if counts else np.empty(0, np.int64)
     )
@@ -909,6 +917,13 @@ class QSAKVHostOffload:
         is the correct, and rare, answer)."""
         entry = self._sf_stages.get(key)
         if entry is None or entry["cap"] < rows or entry["stage"].dtype != like.dtype:
+            if entry is not None:
+                # The old stage may still hold in-flight HtoD copies; the
+                # caching pinned allocator would hand its buffer straight
+                # back to the replacement.
+                for ev in entry["events"]:
+                    if ev is not None:
+                        ev.synchronize()
             cap = max(rows, 8192)
             entry = {
                 "stage": torch.empty(
