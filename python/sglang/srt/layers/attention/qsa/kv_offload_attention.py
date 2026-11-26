@@ -15,6 +15,7 @@ import logging
 from typing import List, Optional, Tuple
 
 import msgspec
+import numpy as np
 import torch
 
 from sglang.srt.environ import envs
@@ -23,7 +24,11 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
 )
-from sglang.srt.mem_cache.qsa_kv_offload import _copy_rows
+from sglang.srt.mem_cache.qsa_kv_offload import (
+    _copy_rows,
+    _pinned_h2d,
+    make_hot_tail_split,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
@@ -279,24 +284,43 @@ def gather_offloaded_context_union(
     )
     # Local row of a selection = selections of its request before it.
     rank = chosen.cumsum(1, dtype=torch.int32) - 1
-    owners, positions = chosen.nonzero(as_tuple=True)
+    # Read the selection bitmap back once and resolve owners/positions (and
+    # the hot-tail split below) from it on the host: the row-major nonzero is
+    # the very order the device ``nonzero`` enumerates, so this replaces the
+    # mask machinery with range arithmetic at one batched readback — the
+    # layer's only sync.
+    chosen_np = chosen.to("cpu").numpy()
+    owners_np, positions_np = np.nonzero(chosen_np)
+    owners_np = owners_np.astype(np.int64)
+    positions_np = positions_np.astype(np.int64)
+    counts_h = chosen_np.sum(1).tolist()
+    priors_np = np.array(
+        [s - e for s, e in zip(sequence_lens, extend_lens)], dtype=np.int64
+    )
+    exts_np = np.asarray(extend_lens, dtype=np.int64)
+    befores_np = np.concatenate(
+        ([0], np.cumsum(exts_np[: max(num_sequences - 1, 0)]))
+    ).astype(np.int64)
+    tail_np = positions_np >= priors_np[owners_np]
+    split = make_hot_tail_split(
+        counts=counts_h,
+        host_counts=(
+            counts_h - np.bincount(owners_np[tail_np], minlength=num_sequences)
+        ).tolist(),
+        tail_rows_cpu=torch.from_numpy(
+            (
+                offload.layout.scratch_base
+                + befores_np[owners_np[tail_np]]
+                + (positions_np - priors_np[owners_np])[tail_np]
+            ).astype(np.int64)
+        ),
+        device=device,
+    )
+    owners = _pinned_h2d(torch.from_numpy(owners_np), device)
+    positions = _pinned_h2d(torch.from_numpy(positions_np), device)
     slots = offload.req_to_token[
         forward_batch.req_pool_indices.long()[owners], positions
     ].long()
-    # The chunk's own rows are in the mirror scratch (stored this layer);
-    # read them there, exactly as the dense path's hot tail does.
-    starts = torch.tensor(
-        [s - e for s, e in zip(sequence_lens, extend_lens)],
-        dtype=torch.int32,
-        device=device,
-    )[owners]
-    before = torch.tensor(
-        [sum(extend_lens[:i]) for i in range(num_sequences)],
-        dtype=torch.int32,
-        device=device,
-    )[owners]
-    tail_mask = positions >= starts
-    tail_rows = (offload.layout.scratch_base + before + (positions - starts))[tail_mask]
     # NOTE: capture-safety (extend-only, no graph) is enforced by the one
     # caller; any new caller must gate this block the same way.
     slabs = None
@@ -320,12 +344,12 @@ def gather_offloaded_context_union(
             extend_lens=extend_lens,
             req_ids=req_ids,
         )
-    elif tail_mask.any():
-        k, v, k_sf, v_sf = offload.gather_context_hot_tail(
+    elif split.tail_count:
+        k, v, k_sf, v_sf = offload.gather_context_hot_tail_split(
             layer_idx=layer_idx,
             slots=slots,
-            tail_mask=tail_mask,
-            tail_rows=tail_rows,
+            split=split,
+            slots_cpu=slots.to("cpu"),
         )
     else:
         k, v, k_sf, v_sf = offload.gather_context(layer_idx=layer_idx, slots=slots)
@@ -333,7 +357,7 @@ def gather_offloaded_context_union(
     # whether this gather beats the dense one. The device->host read stays
     # behind this test; other layers must not sync.
     if layer_idx == 0 and envs.SGLANG_QSA_OFFLOAD_UNION_GATHER_LOG.get():
-        total_selected = int(cu_seqlens_k[-1])
+        total_selected = sum(counts_h)
         logger.info(
             "QSA union gather: %d/%d context rows (%.1f%%)",
             total_selected,
@@ -538,6 +562,11 @@ def gather_offloaded_context(
         and not torch.cuda.is_current_stream_capturing()
         and extend_lens is not None
         and extend_lens.numel() == sequence_lens.numel()
+        # The split-driven gather resolves the row split from the host lists;
+        # without them (or on a mismatch) it cannot be built.
+        and forward_batch.seq_lens_cpu is not None
+        and forward_batch.extend_seq_lens_cpu is not None
+        and sum(int(x) for x in forward_batch.seq_lens_cpu) == total_k
     )
     prefetched = None if slab_on else offload.take_prefetch(layer_idx)
     if slab_on:
@@ -556,22 +585,28 @@ def gather_offloaded_context(
     elif hot_tail:
         # The current chunk's rows are in the device mirror scratch right now
         # (store_offloaded_kv wrote them this layer); read them there instead
-        # of waiting on their host round-trip. Token (b, p) of the chunk owns
-        # scratch row scratch_base + (rows taken by earlier requests) + its
-        # offset in the chunk. Same cu order, bitwise same content.
-        seq = sequence_lens.long()
-        e = extend_lens.long()
-        starts = seq[owner] - e[owner]
-        tail_mask = positions >= starts
-        rows_before = torch.cumsum(e, 0) - e
-        tail_rows = (
-            offload.layout.scratch_base + rows_before[owner] + (positions - starts)
-        )[tail_mask]
-        k, v, k_sf, v_sf = offload.gather_context_hot_tail(
+        # of waiting on their host round-trip. The chunk is each request's
+        # context suffix, so the split needs only the host row counts: token
+        # (b, p) of the chunk owns scratch row scratch_base + (rows taken by
+        # earlier requests) + its offset, i.e. one global arange. Same cu
+        # order, bitwise same content.
+        seqs_h = [int(x) for x in forward_batch.seq_lens_cpu]
+        exts_h = [int(x) for x in forward_batch.extend_seq_lens_cpu]
+        split = make_hot_tail_split(
+            counts=seqs_h,
+            host_counts=[s - e for s, e in zip(seqs_h, exts_h)],
+            tail_rows_cpu=torch.arange(
+                offload.layout.scratch_base,
+                offload.layout.scratch_base + sum(exts_h),
+                dtype=torch.int64,
+            ),
+            device=device,
+        )
+        k, v, k_sf, v_sf = offload.gather_context_hot_tail_split(
             layer_idx=layer_idx,
             slots=slots,
-            tail_mask=tail_mask,
-            tail_rows=tail_rows,
+            split=split,
+            slots_cpu=slots.to("cpu").long(),
         )
     else:
         k, v, k_sf, v_sf = offload.gather_context(layer_idx=layer_idx, slots=slots)

@@ -14,6 +14,7 @@ import torch
 from sglang.srt.mem_cache.qsa_kv_offload import (
     QSAKVHostOffload,
     compute_offload_layout,
+    make_hot_tail_split,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -25,7 +26,7 @@ HOST_ROWS = 1 << 18
 LAYERS = 2
 
 
-def _fill_and_check(lens, tails, seed):
+def _setup(lens, tails, seed):
     layout = compute_offload_layout(
         compress_ratio=CR,
         token_topk=TOPK,
@@ -73,24 +74,42 @@ def _fill_and_check(lens, tails, seed):
     # Mirror the current chunk: device scratch rows plus host copies at the
     # tail slots (what store + write_through leave behind).
     rows = offload.extend_rows(sum(tails))
-    tail_slots = (
-        torch.cat(
-            [
-                slots_by_req[b][lens[b] - tails[b] :]
-                for b in range(len(lens))
-                if tails[b] > 0
-            ]
+    gcuda = torch.Generator(device="cuda").manual_seed(seed)
+    for plane in (offload.dev_k, offload.dev_v):
+        plane[0][rows] = torch.randint(
+            0,
+            256,
+            (sum(tails), HEADS, DIM // 2),
+            generator=gcuda,
+            dtype=torch.uint8,
+            device="cuda",
         )
-        .long()
-        .cpu()
-    )
-    for dst, src in (
-        (offload.host_k, offload.dev_k),
-        (offload.host_v, offload.dev_v),
-        (offload.host_ksf, offload.dev_ksf),
-        (offload.host_vsf, offload.dev_vsf),
-    ):
-        dst[0][tail_slots] = src[0][rows].cpu()
+    for plane in (offload.dev_ksf, offload.dev_vsf):
+        plane[0][rows] = torch.randint(
+            0,
+            256,
+            (sum(tails), HEADS, DIM // 16),
+            generator=gcuda,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+    tail_slots_list = [
+        slots_by_req[b][lens[b] - tails[b] :] for b in range(len(lens)) if tails[b] > 0
+    ]
+    if tail_slots_list:
+        tail_slots = torch.cat(tail_slots_list).long().cpu()
+        for dst, src in (
+            (offload.host_k, offload.dev_k),
+            (offload.host_v, offload.dev_v),
+            (offload.host_ksf, offload.dev_ksf),
+            (offload.host_vsf, offload.dev_vsf),
+        ):
+            dst[0][tail_slots] = src[0][rows].cpu()
+    return offload, slots_by_req
+
+
+def _fill_and_check(lens, tails, seed):
+    offload, slots_by_req = _setup(lens, tails, seed)
     # Production shape: ``req_to_token`` is int32 and the gather is entered
     # with its raw int32 lookup (gather_context converts internally).
     slots = torch.cat([s.long() for s in slots_by_req]).to(torch.int32)
@@ -109,10 +128,25 @@ def _fill_and_check(lens, tails, seed):
     tail_rows = (
         offload.layout.scratch_base + rows_before[owner] + (positions - starts)
     )[tail_mask]
+    split = make_hot_tail_split(
+        counts=list(lens),
+        host_counts=[s - t for s, t in zip(lens, tails)],
+        tail_rows_cpu=torch.arange(
+            offload.layout.scratch_base,
+            offload.layout.scratch_base + sum(tails),
+            dtype=torch.int64,
+        ),
+        device=torch.device("cuda"),
+    )
+    slots_cpu = slots.to("cpu").long()
     for layer in range(LAYERS):
         ref = offload.gather_context(layer_idx=layer, slots=slots)
         got = offload.gather_context_hot_tail(
             layer_idx=layer, slots=slots, tail_mask=tail_mask, tail_rows=tail_rows
+        )
+        assert all(torch.equal(a, b) for a, b in zip(got, ref)), f"layer {layer}"
+        got = offload.gather_context_hot_tail_split(
+            layer_idx=layer, slots=slots, split=split, slots_cpu=slots_cpu
         )
         assert all(torch.equal(a, b) for a, b in zip(got, ref)), f"layer {layer}"
     offload.destroy()
@@ -130,3 +164,65 @@ def _fill_and_check(lens, tails, seed):
 )
 def test_hot_tail_matches_host_gather(lens, tails):
     _fill_and_check(lens, tails, seed=len(lens) * 1000 + sum(tails))
+
+
+@pytest.mark.parametrize(
+    "lens,tails",
+    [
+        ([512, 400, 460, 430], [0, 0, 0, 0]),  # no chunk rows: pure host
+        ([600], [0]),  # single request, no chunk rows
+    ],
+)
+def test_hot_tail_split_matches_host_gather(lens, tails):
+    _fill_and_check(lens, tails, seed=len(lens) * 77 + sum(tails) + 5)
+
+
+def test_hot_tail_split_matches_scattered_union():
+    # The union gather's chunk rows are whatever top-k selected: a subset of
+    # each request's chunk, so the tail rows of one request are scattered in
+    # the scratch. The split must reproduce the masked gather bit for bit.
+    lens, tails = [512, 400], [256, 200]
+    offload, slots_by_req = _setup(lens, tails, seed=99)
+    priors = [l - t for l, t in zip(lens, tails)]
+    host_picks = [list(range(0, pr, 3)) for pr in priors]
+    tail_picks = [list(range(pr, ln, 2)) for pr, ln in zip(priors, lens)]
+    slots_list, masks, tail_rows, host_counts = [], [], [], []
+    for r in range(len(lens)):
+        sel = host_picks[r] + tail_picks[r]
+        idx = torch.tensor(sel, device="cuda", dtype=torch.int64)
+        slots_list.append(slots_by_req[r][idx])
+        masks.append(
+            torch.tensor(
+                [False] * len(host_picks[r]) + [True] * len(tail_picks[r]),
+                device="cuda",
+            )
+        )
+        tail_rows.append(
+            (
+                offload.layout.scratch_base
+                + sum(tails[:r])
+                + torch.tensor(tail_picks[r])
+                - priors[r]
+            ).cuda()
+        )
+        host_counts.append(len(host_picks[r]))
+    slots = torch.cat(slots_list).to(torch.int32)
+    tail_mask = torch.cat(masks)
+    tail_rows = torch.cat(tail_rows).long()
+    split = make_hot_tail_split(
+        counts=[len(h) + len(t) for h, t in zip(host_picks, tail_picks)],
+        host_counts=host_counts,
+        tail_rows_cpu=tail_rows.cpu(),
+        device=torch.device("cuda"),
+    )
+    for layer in range(LAYERS):
+        ref = offload.gather_context(layer_idx=layer, slots=slots)
+        got = offload.gather_context_hot_tail(
+            layer_idx=layer, slots=slots, tail_mask=tail_mask, tail_rows=tail_rows
+        )
+        assert all(torch.equal(a, b) for a, b in zip(got, ref)), f"layer {layer}"
+        got = offload.gather_context_hot_tail_split(
+            layer_idx=layer, slots=slots, split=split, slots_cpu=slots.to("cpu").long()
+        )
+        assert all(torch.equal(a, b) for a, b in zip(got, ref)), f"layer {layer}"
+    offload.destroy()

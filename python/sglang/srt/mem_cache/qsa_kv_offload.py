@@ -27,9 +27,10 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import msgspec
+import numpy as np
 import torch
 
 from sglang.srt.environ import envs
@@ -289,6 +290,67 @@ def offload_table_bytes_per_slot(
     return num_layers * per_layer
 
 
+class HotTailSplit(msgspec.Struct, frozen=True):
+    """Row split of one hot-tail gather, resolved entirely from host counts.
+
+    A request's masked rows (``position >= chunk start``) are the suffix of
+    its gathered context rows, so the masked ``gather_context_hot_tail``
+    indices are contiguous per-request ranges: the host part first, the chunk
+    part after. ``host_idx`` / ``tail_idx`` are those output row ids and
+    ``tail_rows`` the tail slots' mirror rows (masked order); the device
+    tensors are the CPU arrays lifted by one pinned copy each.
+    """
+
+    host_idx: torch.Tensor  # (host rows,) device row ids read from the host store
+    host_idx_cpu: torch.Tensor  # the same ids, for the CPU scale-plane leg
+    tail_idx: torch.Tensor  # (tail rows,) device row ids read from the mirror
+    tail_rows: torch.Tensor  # (tail rows,) mirror scratch rows, masked order
+    host_count: int
+    tail_count: int
+
+
+def _pinned_h2d(cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if device.type != "cuda":
+        return cpu.to(device)
+    return cpu.pin_memory().to(device, non_blocking=True)
+
+
+def make_hot_tail_split(
+    *,
+    counts: List[int],
+    host_counts: List[int],
+    tail_rows_cpu: torch.Tensor,
+    device: torch.device,
+) -> HotTailSplit:
+    """Build one forward's hot-tail gather indices on the host, from the
+    per-request row counts and tail rows; no device readback."""
+    assert len(counts) == len(host_counts)
+    host_np, tail_np = [], []
+    total = 0
+    for rows, host in zip(counts, host_counts):
+        assert 0 <= host <= rows
+        host_np.append(np.arange(total, total + host, dtype=np.int64))
+        tail_np.append(np.arange(total + host, total + rows, dtype=np.int64))
+        total += rows
+    assert total == sum(host_counts) + tail_rows_cpu.numel()
+    host_idx_cpu = torch.from_numpy(
+        np.concatenate(host_np) if counts else np.empty(0, np.int64)
+    )
+    return HotTailSplit(
+        host_idx=_pinned_h2d(host_idx_cpu, device),
+        host_idx_cpu=host_idx_cpu,
+        tail_idx=_pinned_h2d(
+            torch.from_numpy(
+                np.concatenate(tail_np) if counts else np.empty(0, np.int64)
+            ),
+            device,
+        ),
+        tail_rows=_pinned_h2d(tail_rows_cpu, device),
+        host_count=int(host_idx_cpu.numel()),
+        tail_count=int(tail_rows_cpu.numel()),
+    )
+
+
 def _copy_plane(
     k_dst: torch.Tensor,
     v_dst: torch.Tensor,
@@ -438,6 +500,9 @@ class QSAKVHostOffload:
         self._prefetched: Optional[_QsaPrefetch] = None
         self._prefetch_write_gate: Optional[torch.cuda.Event] = None
         self._prefetch_stream = None  # the "qsa_kv_h2d" lease, taken eagerly
+        # Grow-only pinned staging for the CPU scale-plane leg of
+        # gather_context_hot_tail_split, keyed "k" / "v".
+        self._sf_stages: Dict[str, torch.Tensor] = {}
         # The fused resolve reads the host store through raw UVA pointers,
         # validated on CUDA only.
         self.use_fused = (
@@ -790,7 +855,13 @@ class QSAKVHostOffload:
         and the rest from the host store. Bit-identical to ``gather_context``
         whenever ``tail_rows`` holds exactly those slots' rows, which
         ``store`` + ``write_through`` guarantee for the current chunk: the
-        host copy is a bitwise copy of the device rows it was written from."""
+        host copy is a bitwise copy of the device rows it was written from.
+
+        The mask indexes are data-dependent shapes whose ``nonzero`` syncs;
+        serving uses the split-driven ``gather_context_hot_tail_split`` (the
+        same bytes, indices prebuilt on the host), and the bit-identity tests
+        pin this reference against it.
+        """
         k, v, ksf, vsf = self._gather_output(layer_idx, slots.numel())
         dst = torch.arange(slots.numel(), dtype=torch.int64, device=self.device)
         host = ~tail_mask
@@ -818,6 +889,86 @@ class QSAKVHostOffload:
             ks_src=self.dev_ksf[layer_idx] if self.quantized else None,
             vs_src=self.dev_vsf[layer_idx] if self.quantized else None,
         )
+        return k, v, ksf, vsf
+
+    def _sf_host_stage(
+        self, key: str, rows: int, like: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[list]]:
+        """Grow-only pinned staging for the CPU scale-plane leg, plus the
+        slot record. Reusing the slot on the CPU must not race its previous
+        async HtoD: the caller synchronizes the stored event (already
+        complete in steady state, so this never blocks in practice)."""
+        entry = self._sf_stages.get(key)
+        if entry is None or entry[0].shape[0] < rows or entry[0].dtype != like.dtype:
+            stage = torch.empty(
+                (max(rows, 8192), *like.shape[1:]),
+                dtype=like.dtype,
+                pin_memory=like.device.type == "cuda",
+            )
+            entry = [stage, None]
+            self._sf_stages[key] = entry
+        if entry[1] is not None:
+            entry[1].synchronize()
+        return entry[0][:rows], entry
+
+    def gather_context_hot_tail_split(
+        self,
+        *,
+        layer_idx: int,
+        slots: torch.Tensor,
+        split: HotTailSplit,
+        slots_cpu: torch.Tensor,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
+    ]:
+        """``gather_context_hot_tail`` driven by a host-resolved ``split``.
+
+        Same rows in the same order as the masked gather — the split is that
+        mask read as counts — but every index arrives prebuilt from the host,
+        so no leg carries a device synchronization or a data-dependent shape:
+        the scale planes' host leg gathers on the CPU (``slots_cpu`` is
+        ``slots`` read back once, away from this gather) and rides one pinned
+        copy up, which the masked path's 32-byte-row ``_copy_plane`` fallback
+        cannot do.
+        """
+        k, v, ksf, vsf = self._gather_output(layer_idx, slots.numel())
+        if split.host_count:
+            _copy_plane(
+                k,
+                v,
+                split.host_idx,
+                self.host_k[layer_idx],
+                self.host_v[layer_idx],
+                slots.index_select(0, split.host_idx).long(),
+            )
+            if self.quantized:
+                hi_slots = slots_cpu.index_select(0, split.host_idx_cpu)
+                for dst, src, key in (
+                    (ksf, self.host_ksf[layer_idx], "k"),
+                    (vsf, self.host_vsf[layer_idx], "v"),
+                ):
+                    stage, slot = self._sf_host_stage(key, split.host_count, dst)
+                    torch.index_select(src, 0, hi_slots, out=stage)
+                    dst.index_copy_(
+                        0, split.host_idx, stage.to(dst.device, non_blocking=True)
+                    )
+                    if stage.is_pinned():
+                        ev = torch.cuda.Event()
+                        ev.record()
+                        slot[1] = ev
+        if split.tail_count:
+            _copy_rows(
+                k_dst=k,
+                v_dst=v,
+                dst=split.tail_idx,
+                k_src=self.dev_k[layer_idx],
+                v_src=self.dev_v[layer_idx],
+                src=split.tail_rows,
+                ks_dst=ksf,
+                vs_dst=vsf,
+                ks_src=self.dev_ksf[layer_idx] if self.quantized else None,
+                vs_src=self.dev_vsf[layer_idx] if self.quantized else None,
+            )
         return k, v, ksf, vsf
 
     # ---- layer-ahead gather prefetch ------------------------------------------
