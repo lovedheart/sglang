@@ -470,10 +470,12 @@ class Envs:
     # warm cache on a timer; rank the mappings by the gather's own row stream
     # and evict only the coldest shard mappings until the cap holds.
     SGLANG_QWEN4_PLE_FILE_RSS_LRU = EnvBool(True)
-    # Unit of that ranking and eviction, in MiB. A shard mapping is hundreds of
-    # MiB, so ranking whole mappings drops rows read a second ago with the cold
-    # ones; smaller slices cost one paced madvise each, which is why this is not
-    # 1. 0 restores the whole-mapping unit.
+    # Unit of that ranking and eviction, in MiB, for a checkpoint-backed table
+    # (many shard mappings). A shard mapping is hundreds of MiB, so ranking whole
+    # mappings drops rows read a second ago with the cold ones; smaller slices
+    # cost one paced madvise each, which is why this is not 1. 0 restores the
+    # whole-mapping unit. The single-file "file" tier has no grid to rank over, so
+    # it bounds the resident set by dropping it instead and ignores this.
     SGLANG_QWEN4_PLE_FILE_RSS_RANGE_MB = EnvInt(32)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)

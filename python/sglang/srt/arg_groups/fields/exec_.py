@@ -1327,7 +1327,9 @@ class ExecOffload(msgspec.Struct):
             "reaches host memory by faulting it through the driver (HMM), a "
             "prefill-sized gather of either reads its distinct rows on the host "
             "into pinned memory first, so the kernel never faults table pages; "
-            "only the touched rows are read, so nothing extra stays resident.",
+            "only the touched rows are read, and "
+            "SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB bounds what they leave "
+            "resident.",
             choices=["pinned", "file", "safetensors"],
         ),
     ] = "pinned"

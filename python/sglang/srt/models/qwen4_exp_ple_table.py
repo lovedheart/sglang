@@ -69,13 +69,17 @@ PLE_FILE_RSS_TRIM_CHUNK_BYTES = 1 << 30
 # faults are cheap and the host-side hint would cost more than it saves.
 PLE_FILE_PREFETCH_MIN_ROWS = 2048
 # Default unit of the resident-set trim and of the gather's recency tracking.
-# 32 MiB, not smaller, because of the trimmer's own pacing: _evict_range madvises
-# a PLE_FILE_RSS_TRIM_CHUNK_BYTES slice and then waits 5 ms for faults queued
-# behind mmap_lock, so dropping N slices costs N x 5 ms. A 2 MiB unit would make
-# the worst case 887 waits (~4.4 s per cycle); at 32 MiB the same table is 1 143
-# slices and a trim that still has to drop most of it stays near a second. Bigger
-# than a working set, smaller than a shard mapping (hundreds of MiB), so one hot
-# slice no longer keeps an entire cold shard resident.
+# The trimmer's own pacing sets the floor: a slice smaller than
+# PLE_FILE_RSS_TRIM_CHUNK_BYTES means _evict_range madvises it in one call and
+# then waits 5 ms, so every victim slice costs 5 ms whatever its size. Dropping
+# the whole 47.7 GiB table down to an 8 GiB budget is then ~1 270 waits, about
+# 6 s -- the first trim of a fully resident table; between checks only the
+# overshoot goes, which is a handful of slices. A 2 MiB unit would make that
+# same first trim ~20 300 waits, near two minutes, which is why this is not
+# smaller; it sleeps between calls rather than holding mmap_lock, so the gather
+# is not stalled, but the trim takes seconds to finish. Bigger than a working
+# set, smaller than a shard mapping (hundreds of MiB), so one hot slice no
+# longer keeps an entire cold shard resident.
 PLE_FILE_RSS_RANGE_BYTES = 32 << 20
 
 
@@ -105,15 +109,15 @@ class PleRangeGrid(NamedTuple):
     A slice is what the trim drops at once and what the gather's recency is
     tracked per, so a hot slice keeps its rows while its colder neighbours go
     (a shard mapping is hundreds of MiB; the working set is tens of them).
-    ``first[i]``/``ends[i]`` bound segment ``i``'s slices and ``owner[j]`` is the
-    segment (mapping) slice ``j`` lives in; row binning uses ``range_rows``.
+    ``first[i]`` is where segment ``i``'s slices start, so binning a row is
+    ``first[segment] + local_row // range_rows``, and ``owner[j]`` is the segment
+    (mapping) slice ``j`` lives in, which is what the trim credits RSS against.
     """
 
     range_bytes: int  # nominal slice size; <= 0 = one slice per mapping
     range_rows: int  # rows per slice, what a row is divided by
     ranges: list  # (addr, nbytes) per slice, page-aligned inside its mapping
     first: list  # first slice of each segment
-    ends: list  # one past the last slice of each segment
     owner: list  # segment index of each slice
 
 
@@ -185,7 +189,7 @@ class PleSegmentTable:
                 "PLE table: staged rows fall in a gap between mapped segments "
                 f"{[s.row_start for s in self.segments]}"
             )
-        starts = torch.ones(rows.numel(), dtype=torch.bool)
+        starts = torch.ones(rows.numel(), dtype=torch.bool, device=rows.device)
         starts[1:] = segment[1:] != segment[:-1]
         starts = torch.nonzero(starts).flatten()
         lengths = torch.diff(starts, append=starts.new_tensor([int(rows.numel())]))
@@ -221,14 +225,12 @@ class PleSegmentTable:
                 0,
                 list(mappings),
                 list(range(len(mappings))),
-                list(range(1, len(mappings) + 1)),
                 list(range(len(mappings))),
             )
         page = 1 << _PAGE_SHIFT
         rows = max(1, range_bytes // self.row_bytes)
         out: list = []
         first: list = []
-        ends: list = []
         owner: list = []
         for index, (base, size) in enumerate(mappings):
             segment = self.segments[index]
@@ -241,8 +243,7 @@ class PleSegmentTable:
                     (aligned, min(base + size, -(-end // page) * page) - aligned)
                 )
                 owner.append(index)
-            ends.append(len(out))
-        return PleRangeGrid(range_bytes, rows, out, first, ends, owner)
+        return PleRangeGrid(range_bytes, rows, out, first, owner)
 
     def range_ids_for_rows(
         self, rows: torch.Tensor, grid: PleRangeGrid, first: torch.Tensor
@@ -685,20 +686,23 @@ class PleFileRssTrimmer:
         left = list(per_rss)  # per mapping; a slice cannot credit more than it holds
         total = sum(left)
         victims: list[int] = []
+        freed = 0
         for index in sorted(range(len(grid.ranges)), key=lambda i: (hits[i], i)):
             if total <= self._budget or self._stop.is_set():
                 break
             mapping = grid.owner[index]
             if left[mapping] == 0 or (hits[index] and hits[index] >= cycle):
                 continue
-            freed = min(grid.ranges[index][1], left[mapping])
-            left[mapping] -= freed
-            total -= freed
+            # Credit the capped amount: a slice can only free what its mapping
+            # actually has resident, and the same bound is what the log reports.
+            freed_here = min(grid.ranges[index][1], left[mapping])
+            left[mapping] -= freed_here
+            total -= freed_here
+            freed += freed_here
             victims.append(index)
         for index in victims:
             base, nbytes = grid.ranges[index]
             self._evict_range(base, nbytes)
-        freed = sum(grid.ranges[index][1] for index in victims)
         if freed:
             logger.info(
                 "PLE table: LRU-trimmed %d cold slices (~%.1f GiB, budget %.1f GiB)",
