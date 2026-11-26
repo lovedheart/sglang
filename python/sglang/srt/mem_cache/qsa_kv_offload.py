@@ -969,6 +969,11 @@ class QSAKVHostOffload:
         one pinned copy up, which the masked path's 32-byte-row
         ``_copy_plane`` fallback cannot do.
         """
+        if split.host_count + split.tail_count != slots.numel():
+            raise ValueError(
+                f"QSA K/V offload: split covers {split.host_count} host + "
+                f"{split.tail_count} tail rows for {slots.numel()} slots"
+            )
         k, v, ksf, vsf = self._gather_output(layer_idx, slots.numel())
         if split.host_count:
             _copy_plane(
@@ -983,7 +988,7 @@ class QSAKVHostOffload:
                 if slots_cpu is None:
                     # Quantized host leg: this also drains this layer's
                     # write-through copies before the CPU reads host rows.
-                    slots_cpu = slots.to("cpu")
+                    slots_cpu = slots.to("cpu").long()
                 hi_slots = slots_cpu.index_select(0, split.host_idx_cpu)
                 for dst, src, key in (
                     (ksf, self.host_ksf[layer_idx], "k"),

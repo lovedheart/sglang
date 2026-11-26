@@ -553,7 +553,8 @@ def gather_offloaded_context(
         and not torch.cuda.is_current_stream_capturing()
         and forward_batch.extend_seq_lens_cpu is not None
     )
-    hot_tail = (
+    seqs_h = exts_h = None
+    if (
         envs.SGLANG_QSA_OFFLOAD_HOT_TAIL_GATHER.get()
         and not offload.verify
         # The masked row copies have data-dependent shapes; a captured graph
@@ -562,20 +563,19 @@ def gather_offloaded_context(
         and not torch.cuda.is_current_stream_capturing()
         and extend_lens is not None
         and extend_lens.numel() == sequence_lens.numel()
-        # The split-driven gather tails each request's own extend rows off
-        # the host lists, so they must line up with the device batch and no
-        # request may extend past its own context (a negative host count
-        # would ValueError in make_hot_tail_split mid-forward).
         and forward_batch.seq_lens_cpu is not None
         and forward_batch.extend_seq_lens_cpu is not None
-        and len(forward_batch.seq_lens_cpu) == sequence_lens.numel()
-        and len(forward_batch.extend_seq_lens_cpu) == sequence_lens.numel()
-        and all(
-            int(e) <= int(s)
-            for s, e in zip(
-                forward_batch.seq_lens_cpu, forward_batch.extend_seq_lens_cpu
-            )
-        )
+    ):
+        seqs_h = [int(x) for x in forward_batch.seq_lens_cpu]
+        exts_h = [int(x) for x in forward_batch.extend_seq_lens_cpu]
+    # The split-driven gather tails each request's own extend rows off the
+    # host lists; they must line up with the device batch and no request may
+    # extend past its own context (a negative host count would ValueError
+    # in make_hot_tail_split mid-forward).
+    hot_tail = (
+        seqs_h is not None
+        and len(seqs_h) == sequence_lens.numel() == len(exts_h)
+        and all(e <= s for s, e in zip(seqs_h, exts_h))
     )
     prefetched = None if slab_on else offload.take_prefetch(layer_idx)
     if slab_on:
@@ -599,8 +599,6 @@ def gather_offloaded_context(
         # (b, p) of the chunk owns scratch row scratch_base + (rows taken by
         # earlier requests) + its offset, i.e. one global arange. Same cu
         # order, bitwise same content.
-        seqs_h = [int(x) for x in forward_batch.seq_lens_cpu]
-        exts_h = [int(x) for x in forward_batch.extend_seq_lens_cpu]
         split = make_hot_tail_split(
             counts=seqs_h,
             host_counts=[s - e for s, e in zip(seqs_h, exts_h)],

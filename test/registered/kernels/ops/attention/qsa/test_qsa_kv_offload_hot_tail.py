@@ -254,3 +254,51 @@ def test_hot_tail_split_rejects_bad_counts():
             tail_rows_cpu=torch.arange(3),
             device=dev,
         )
+
+
+def test_sf_stage_ring_wraps_then_grows():
+    # >_SF_STAGE_DEPTH gathers on one plane key wrap the pinned staging ring
+    # while earlier HtoDs may still be live (drain-on-overwrite path); a
+    # later gather with more host rows than the entry cap must drain the
+    # pending events before replacing the buffer (pinned-allocator reuse).
+    lens, tails = [600] * 24, [24] * 24  # big host_count crosses cap 8192
+    offload, slots_by_req = _setup(lens, tails, seed=4321)
+
+    def split_for(count):
+        sub = lens[:count]
+        return make_hot_tail_split(
+            counts=sub,
+            host_counts=[l - t for l, t in zip(sub, tails[:count])],
+            tail_rows_cpu=torch.arange(
+                offload.layout.scratch_base,
+                offload.layout.scratch_base + sum(tails[:count]),
+                dtype=torch.int64,
+            ),
+            device=torch.device("cuda"),
+        )
+
+    small_slots = torch.cat([s.long() for s in slots_by_req[:4]]).to(torch.int32)
+    small = split_for(4)
+    ref = offload.gather_context(layer_idx=0, slots=small_slots)
+    for _ in range(10):
+        got = offload.gather_context_hot_tail_split(
+            layer_idx=0,
+            slots=small_slots,
+            split=small,
+            slots_cpu=small_slots.to("cpu").long(),
+        )
+        assert all(torch.equal(a, b) for a, b in zip(got, ref))
+    assert offload._sf_stages["k"]["cap"] >= small.host_count
+
+    big_slots = torch.cat([s.long() for s in slots_by_req]).to(torch.int32)
+    big = split_for(24)
+    assert big.host_count > offload._sf_stages["k"]["cap"]
+    ref = offload.gather_context(layer_idx=0, slots=big_slots)
+    got = offload.gather_context_hot_tail_split(
+        layer_idx=0,
+        slots=big_slots,
+        split=big,
+        slots_cpu=big_slots.to("cpu").long(),
+    )
+    assert all(torch.equal(a, b) for a, b in zip(got, ref))
+    offload.destroy()
