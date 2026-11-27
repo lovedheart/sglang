@@ -2838,10 +2838,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 buf = req.kv.mamba_ping_pong_track_buffer
                 if buf is not None:
                     # Drop the -1 placeholders (lazy's second slot); clear
-                    # whatever physical slots were freshly recycled in.
-                    fresh_pp = buf[buf != -1]
-                    if fresh_pp.numel() > 0:
-                        clear_tensors.append(fresh_pp)
+                    # whatever physical slots were freshly recycled in. The
+                    # empty mirror is exact (the ping-pong buffer is written
+                    # only through set_mamba_ping_pong_slot, which keeps the
+                    # mirror and the device value in step), so the non-empty
+                    # positions are known on the host: selecting them yields
+                    # the same ascending rows as the device ``buf != -1``
+                    # nonzero, without its synchronization. cat materializes
+                    # the staged values here, as mask-indexing did.
+                    fresh_parts = [
+                        buf[i : i + 1]
+                        for i, empty in enumerate(req.kv.mamba_ping_pong_empty)
+                        if not empty
+                    ]
+                    if fresh_parts:
+                        clear_tensors.append(torch.cat(fresh_parts))
                 req.kv.mamba_ping_pong_needs_clear = False
             if req.kv.mamba_slot_clear_queue:
                 clear_tensors.extend(req.kv.mamba_slot_clear_queue)
