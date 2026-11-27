@@ -678,7 +678,7 @@ def fused_hc_mix_fp8_w8a8(
         assert a8.shape == (rows, k) and a8.dtype == torch.float8_e4m3fn
         assert asf.shape == (rows, k // 32) and asf.dtype == torch.uint8
         assert a8.is_contiguous() and asf.is_contiguous()
-    BM, BN, BK = 128, 64, 256
+    BM, BN, BK = 128, 64, 128
     _hc_mix_a8w8_down_kernel[(triton.cdiv(rows, BM), triton.cdiv(lowrank, BN))](
         a8,
         asf,
@@ -694,8 +694,12 @@ def fused_hc_mix_fp8_w8a8(
         BN=BN,
         BK=BK,
         NKB=k // 32,
-        num_warps=8,
-        num_stages=2,
+        # BK only changes Triton's loop chunking: tl.dot lowers to the same
+        # per-instruction HMMA chain along K, so the fp32 accumulation order
+        # -- and the fp8/sf bytes -- are bit-identical to BK=256 (verified
+        # across shapes and seeds). BK=128 w4/s3 beats BK=256 w8/s2 by ~10%.
+        num_warps=4,
+        num_stages=3,
     )
     _hc_mix_a8w8_up_kernel[(hs // 64, triton.cdiv(rows, 64))](
         t8,
