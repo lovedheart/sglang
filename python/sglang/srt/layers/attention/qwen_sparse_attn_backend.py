@@ -2077,9 +2077,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         req_to_token = self.req_to_token_pool.req_to_token
         num_sequences = len(sequence_lens)
         total_context = sum(sequence_lens)
-        sequence_lens_tensor = torch.tensor(
-            sequence_lens, dtype=torch.int32, device=q.device
-        )
+        # Device-side cast of the per-forward seq_lens, NOT
+        # torch.tensor(list, device=...): a pageable HtoD syncs and drains
+        # the launch queue once per QSA layer per extend forward.
+        sequence_lens_tensor = forward_batch.seq_lens.to(torch.int32)
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         if self._kv_offload is not None:
             if (
