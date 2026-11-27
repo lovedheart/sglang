@@ -441,6 +441,11 @@ class Envs:
     # Route prefill-size (>16 rows) HC mix through MXFP8 W8A8 tl.dot_scaled
     # GEMMs with on-the-fly activation quant; needs --enable-fp8-hc-mix.
     SGLANG_HC_MIX_W8A8_PREFILL = EnvBool(True)
+    # Fold that on-the-fly e4m3 activation quant into the HC RMSNorm kernel
+    # as an epilogue (bit-identical norm/quant bytes; the separate
+    # _mxfp8_quant_act launch disappears). Blackwell only; False restores the
+    # two-kernel norm + quant pipeline.
+    SGLANG_HC_NORM_QUANT_FOLD = EnvBool(True)
     # Fuse the per-token-group e4m3 activation quant into the SM120 blockwise
     # decode warp GEMM (bit-identical bytes/scales; the separate
     # per_token_group_quant launch disappears). Band-gated to the shapes the

@@ -9,6 +9,8 @@ HC mix weights to packed MXFP8 at load time (see srt/layers/fp8_hc_mix.py).
 
 from __future__ import annotations
 
+from typing import Optional, Tuple
+
 import torch
 import triton
 import triton.language as tl
@@ -647,20 +649,31 @@ def fused_hc_mix_fp8_w8a8(
     w_up_scale: torch.Tensor,
     hc: int,
     hs: int,
+    act_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
+    """Mix with MXFP8 activations. ``act_quant=(q, sf)`` supplies pre-quantized
+    activations from ``layernorm.grouped_gemma_rmsnorm_mxfp8`` -- bit-identical
+    to the internal ``_mxfp8_quant_act_kernel`` on the same ``x_normed``, just
+    without its launch (the norm kernel quantized the same registers)."""
     rows, k = x_normed.shape
     lowrank = w_down.shape[0]
     device = x_normed.device
     out = torch.empty((rows, hs), dtype=x_normed.dtype, device=device)
     if rows == 0:
         return out
-    a8 = torch.empty((rows, k), dtype=torch.float8_e4m3fn, device=device)
-    asf = torch.empty((rows, k // 32), dtype=torch.uint8, device=device)
     t8 = torch.empty((rows, lowrank), dtype=torch.float8_e4m3fn, device=device)
     tsf = torch.empty((rows, lowrank // 32), dtype=torch.uint8, device=device)
-    _mxfp8_quant_act_kernel[(rows, triton.cdiv(k, 1024))](
-        x_normed, a8, asf, rows, K=k, BLOCK=1024, num_warps=4
-    )
+    if act_quant is None:
+        a8 = torch.empty((rows, k), dtype=torch.float8_e4m3fn, device=device)
+        asf = torch.empty((rows, k // 32), dtype=torch.uint8, device=device)
+        _mxfp8_quant_act_kernel[(rows, triton.cdiv(k, 1024))](
+            x_normed, a8, asf, rows, K=k, BLOCK=1024, num_warps=4
+        )
+    else:
+        a8, asf = act_quant
+        assert a8.shape == (rows, k) and a8.dtype == torch.float8_e4m3fn
+        assert asf.shape == (rows, k // 32) and asf.dtype == torch.uint8
+        assert a8.is_contiguous() and asf.is_contiguous()
     BM, BN, BK = 128, 64, 256
     _hc_mix_a8w8_down_kernel[(triton.cdiv(rows, BM), triton.cdiv(lowrank, BN))](
         a8,

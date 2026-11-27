@@ -1,3 +1,4 @@
+import logging
 from functools import lru_cache
 from typing import Optional
 
@@ -62,6 +63,11 @@ class HyperConnectionConfig(msgspec.Struct, frozen=True):
     hc_per_branch_norm: bool = False
 
 
+_logger = logging.getLogger(__name__)
+
+_quant_fold_fallbacks_seen = set()
+
+
 class GroupedGemmaRMSNorm(nn.Module):
     def __init__(
         self, hidden_size: int, eps: float = 1e-6, group_size: Optional[int] = None
@@ -121,6 +127,47 @@ class GroupedGemmaRMSNorm(nn.Module):
                 x_grouped * torch.rsqrt(variance + self.variance_epsilon)
             ).flatten(-2)
         return (x_norm * (1.0 + self.weight.float())).to(input_dtype)
+
+    def forward_quant_mxfp8(
+        self, x: torch.Tensor
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """RMSNorm + MXFP8 quant in one kernel, or None if unsupported.
+
+        Returns ``(normed, quant, scale)`` bit-identical to
+        ``self.forward(x)`` followed by ``hc_mix_fp8._mxfp8_quant_act_kernel``;
+        callers must fall back to ``self.forward`` when this returns None
+        (non-JIT norm shapes, pre-Blackwell GPUs).
+        """
+        if (
+            self._jit_group_size is not None
+            and x.is_cuda
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and torch.cuda.get_device_capability(x.device)[0] >= 10
+        ):
+            from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm_mxfp8 import (
+                grouped_gemma_rmsnorm_mxfp8,
+            )
+
+            try:
+                return grouped_gemma_rmsnorm_mxfp8(
+                    x, self.weight, self._jit_group_size, self.variance_epsilon
+                )
+            except RuntimeError as e:
+                # e.g. module built on a pre-CUDA-12.9 toolchain where the
+                # epilogue is compiled out, or a host-side layout mismatch;
+                # the unfused path stays numerically identical, so fall back
+                # once per shape and log so the perf loss is visible.
+                key = (self._jit_group_size, x.dtype, str(x.shape))
+                if key not in _quant_fold_fallbacks_seen:
+                    _quant_fold_fallbacks_seen.add(key)
+                    _logger.warning(
+                        "HC rmsnorm+quant fold disabled for %s: %s; using the "
+                        "unfused norm + quant kernels",
+                        key,
+                        e,
+                    )
+                return None
+        return None
 
 
 class GatedResidual(nn.Module):
@@ -364,9 +411,12 @@ class GatedResidual(nn.Module):
             return mixed_input, (hyper_input, hyper_input, None)
 
         # The CuTe split-K pair wants the normed residual and only exists on
-        # sm_100 at decode sizes; there, keep the unfused norm.
+        # sm_100 at decode sizes; there, keep the unfused norm. The folded
+        # weight prep assumes the per-branch (K-sized) gain vector, so flat
+        # norm configs never enter the fold machinery.
         fold = (
             (self._norm_fold_ok or self._mxfp8_mix)
+            and self.config.hc_per_branch_norm
             and hyper_input.is_cuda
             and hyper_input.dtype in (torch.bfloat16, torch.float16)
             and not (self._jit_mix_ok and hyper_input.shape[0] <= 24)
@@ -426,16 +476,62 @@ class GatedResidual(nn.Module):
                 )
                 return mixed_input.to(self.params_dtype), (hyper_input, None, norm_g)
 
+        # The W8A8 prefill mix quantizes the normed residual to MXFP8 itself;
+        # when that branch will run, let the norm kernel emit the quant as an
+        # epilogue instead (bit-identical bytes, one less full read of the
+        # normed tensor). The branch is decided on hyper_input because its
+        # gates are shape/dtype/weights-only -- normed is the same shape and
+        # always contiguous, so the pre-check and the branch agree.
+        from sglang.srt.environ import envs
+
+        a8: Optional[torch.Tensor] = None
+        asf: Optional[torch.Tensor] = None
+        a8_fold = (
+            normalized_input is None
+            and self._mxfp8_mix
+            and not _is_npu
+            and envs.SGLANG_HC_NORM_QUANT_FOLD.get()
+            and hyper_input.is_cuda
+            and hyper_input.dtype in (torch.bfloat16, torch.float16)
+        )
+        if a8_fold:
+            scale_d = getattr(self.input_mix_weight_down, "_mxfp8_scale", None)
+            scale_u = getattr(self.input_mix_weight_up, "_mxfp8_scale", None)
+            a8_fold = fused_hc_mix_fp8_w8a8_supported(
+                hyper_input,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                scale_d,
+                scale_u,
+            )
+
         if normalized_input is not None:
             assert self.config.hc_per_branch_norm
             assert normalized_input.shape == hyper_input.shape
             hyper_input_normed = normalized_input
-        elif self.config.hc_per_branch_norm:
-            hyper_input_normed = self.hc_norm(hyper_input)
         else:
-            hyper_input_normed = self.hc_norm(
-                hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
-            ).flatten(-2)
+            norm_in = (
+                hyper_input
+                if self.config.hc_per_branch_norm
+                else hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
+            )
+            quant_triple = (
+                self.hc_norm.forward_quant_mxfp8(norm_in) if a8_fold else None
+            )
+            if quant_triple is not None:
+                normed, a8, asf = quant_triple
+                # normed/a8/asf share the row-major byte layout of the flat
+                # [rows, hc*hs] variants the mix expects. reshape (not
+                # flatten) because with hc_per_branch_norm the inputs are
+                # already 2-D and flatten(-2) would collapse the rows.
+                rows = hyper_input.shape[0]
+                hyper_input_normed = normed.reshape(rows, -1)
+                a8 = a8.reshape(rows, -1)
+                asf = asf.reshape(rows, -1)
+            elif self.config.hc_per_branch_norm:
+                hyper_input_normed = self.hc_norm(hyper_input)
+            else:
+                hyper_input_normed = self.hc_norm(norm_in).flatten(-2)
         if _is_npu:
             from sgl_kernel_npu.operators.hyper_conn import hc_mix
 
@@ -472,6 +568,8 @@ class GatedResidual(nn.Module):
             ):
                 # Prefill sizes: activations quantized to MXFP8 on the fly so
                 # both mix GEMMs run on fp8 tensor cores (~25% faster mix).
+                # a8/asf, when set, came from the norm kernel's identical
+                # quant epilogue above.
                 mixed_input = fused_hc_mix_fp8_w8a8(
                     hyper_input_normed,
                     self.input_mix_weight_down.weight,
@@ -480,6 +578,7 @@ class GatedResidual(nn.Module):
                     self.input_mix_weight_up._mxfp8_scale,
                     self.hc_count,
                     self.hidden_size,
+                    act_quant=None if a8 is None else (a8, asf),
                 ).to(self.params_dtype)
             else:
                 # Unfused: dequantize the mix weights once and keep the

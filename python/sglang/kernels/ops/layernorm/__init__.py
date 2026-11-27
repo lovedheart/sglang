@@ -78,6 +78,15 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="layernorm.grouped_gemma_rmsnorm_mxfp8",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm_mxfp8:grouped_gemma_rmsnorm_mxfp8",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="layernorm.rmsnorm_fanout",
         backend=KernelBackend.CUTE_DSL,
         target="sglang.kernels.ops.layernorm.rmsnorm_fanout:rmsnorm_fanout",
