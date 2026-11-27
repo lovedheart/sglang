@@ -326,7 +326,12 @@ def make_hot_tail_split(
     device: torch.device,
 ) -> HotTailSplit:
     """Build one forward's hot-tail gather indices on the host, from the
-    per-request row counts and tail rows; no device readback."""
+    per-request row counts and tail rows; no device readback.
+
+    NOTE: the dense caller rebuilds a byte-identical split once per QSA
+    layer (its inputs are layer-invariant); caching it per forward is a
+    known follow-up.
+    """
     if len(counts) != len(host_counts):
         raise ValueError(
             f"QSA K/V offload: {len(counts)} context row counts vs "
@@ -350,6 +355,8 @@ def make_hot_tail_split(
     host_idx_cpu = torch.from_numpy(
         np.concatenate(host_np) if counts else np.empty(0, np.int64)
     )
+    # The tail leg feeds a TMA kernel that wants int64 indices.
+    tail_rows_cpu = tail_rows_cpu.long()
     return HotTailSplit(
         host_idx=_pinned_h2d(host_idx_cpu, device),
         host_idx_cpu=host_idx_cpu,
@@ -914,7 +921,13 @@ class QSAKVHostOffload:
         async HtoD has not run, so the slot's recorded event is waited on; the
         rotation makes that event ``_SF_STAGE_DEPTH`` stage-uses old, which the
         CPU has overtaken only if the GPU fell that far behind (then waiting
-        is the correct, and rare, answer)."""
+        is the correct, and rare, answer).
+
+        NOTE: the ring is a high-water mark -- it grows to the largest gathered
+        host row count and is never shrunk, so an extreme-context batch
+        permanently pins ``_SF_STAGE_DEPTH * cap`` scale rows per plane. A
+        cap/chunk policy is a known follow-up.
+        """
         entry = self._sf_stages.get(key)
         if entry is None or entry["cap"] < rows or entry["stage"].dtype != like.dtype:
             if entry is not None:

@@ -310,6 +310,7 @@ def test_production_order_engages(monkeypatch):
         raise AssertionError("fell back off the prefetch gather path")
 
     monkeypatch.setattr(offload, "gather_context_hot_tail", _no_fallback)
+    monkeypatch.setattr(offload, "gather_context_hot_tail_split", _no_fallback)
     monkeypatch.setattr(offload, "gather_context", _no_fallback)
 
     pool = SimpleNamespace(

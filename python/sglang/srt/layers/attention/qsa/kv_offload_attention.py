@@ -291,8 +291,8 @@ def gather_offloaded_context_union(
     # layer's only sync.
     chosen_np = chosen.to("cpu").numpy()
     owners_np, positions_np = np.nonzero(chosen_np)
-    owners_np = owners_np.astype(np.int64)
-    positions_np = positions_np.astype(np.int64)
+    owners_np = owners_np.astype(np.int64, copy=False)
+    positions_np = positions_np.astype(np.int64, copy=False)
     counts_h = chosen_np.sum(1).tolist()
     priors_np = np.array(
         [s - e for s, e in zip(sequence_lens, extend_lens)], dtype=np.int64
@@ -300,7 +300,7 @@ def gather_offloaded_context_union(
     exts_np = np.asarray(extend_lens, dtype=np.int64)
     befores_np = np.concatenate(
         ([0], np.cumsum(exts_np[: max(num_sequences - 1, 0)]))
-    ).astype(np.int64)
+    ).astype(np.int64, copy=False)
     tail_np = positions_np >= priors_np[owners_np]
     owners = _pinned_h2d(torch.from_numpy(owners_np), device)
     positions = _pinned_h2d(torch.from_numpy(positions_np), device)
@@ -341,7 +341,7 @@ def gather_offloaded_context_union(
                     offload.layout.scratch_base
                     + befores_np[owners_np[tail_np]]
                     + (positions_np - priors_np[owners_np])[tail_np]
-                ).astype(np.int64)
+                ).astype(np.int64, copy=False)
             ),
             device=device,
         )
@@ -561,6 +561,9 @@ def gather_offloaded_context(
         # needs the fixed-shape all-host gather.
         and not is_in_breakable_cuda_graph()
         and not torch.cuda.is_current_stream_capturing()
+        # The slab and prefetch gathers win the branch race below; don't
+        # convert the host lists when they cannot be used.
+        and not slab_on
         and extend_lens is not None
         and extend_lens.numel() == sequence_lens.numel()
         and forward_batch.seq_lens_cpu is not None
@@ -569,12 +572,13 @@ def gather_offloaded_context(
         seqs_h = [int(x) for x in forward_batch.seq_lens_cpu]
         exts_h = [int(x) for x in forward_batch.extend_seq_lens_cpu]
     # The split-driven gather tails each request's own extend rows off the
-    # host lists; they must line up with the device batch and no request may
-    # extend past its own context (a negative host count would ValueError
-    # in make_hot_tail_split mid-forward).
+    # host lists; they must line up with the device batch (counts and total)
+    # and no request may extend past its own context (a negative host count
+    # would ValueError in make_hot_tail_split mid-forward).
     hot_tail = (
         seqs_h is not None
         and len(seqs_h) == sequence_lens.numel() == len(exts_h)
+        and sum(seqs_h) == total_k
         and all(e <= s for s, e in zip(seqs_h, exts_h))
     )
     prefetched = None if slab_on else offload.take_prefetch(layer_idx)
