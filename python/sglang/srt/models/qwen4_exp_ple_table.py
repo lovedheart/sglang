@@ -1038,6 +1038,29 @@ def _alloc_cuda_host_table(shape: tuple, dtype: torch.dtype) -> torch.Tensor:
     )
 
 
+def allocate_ple_row_scale_table(rows: int) -> torch.Tensor:
+    """The fp6 PLE row scales: a zeroed, exact-size pinned [rows, 1] fp32.
+
+    cudaHostAlloc like the table itself (``_alloc_cuda_host_table``) --
+    torch's pinned allocator would round this 1.28 GB buffer up to a 2 GiB
+    pinned block -- then a host-side zero_() of the exact block: a fresh
+    cudaHostAlloc mapping is untouched virtual memory, and the write
+    touches it through the pin the same way the loader will.
+    """
+    if torch.version.cuda is None:
+        # Same fallback as allocate_ple_host_table(): CudaRTLibrary needs a
+        # loaded libcudart, which non-CUDA builds do not have.
+        # device="cpu" is load-bearing there: the model is built under
+        # torch.device(cuda), where a device-less zeros() lands on the GPU
+        # and pinning fails.
+        return torch.zeros(
+            (int(rows), 1), dtype=torch.float32, device="cpu", pin_memory=True
+        )
+    buffer = _alloc_cuda_host_table((int(rows), 1), torch.float32)
+    buffer.zero_()
+    return buffer
+
+
 def _libc() -> Optional[ctypes.CDLL]:
     global _LIBC
     if _LIBC is None:

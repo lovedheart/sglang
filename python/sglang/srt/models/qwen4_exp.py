@@ -107,6 +107,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     PLE_FILE_PREFETCH_MIN_ROWS,
     advise_rows_willneed,
     allocate_ple_host_table,
+    allocate_ple_row_scale_table,
     allocate_ple_safetensors_table,
     device_faults_pageable_pages,
     make_ple_file_prefetcher,
@@ -119,7 +120,13 @@ from sglang.srt.runtime_context import (
     get_parallel,
     linear_attn_parallel_group,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu, logger
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    is_npu,
+    logger,
+)
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -1216,22 +1223,22 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # The scale is tiny; keep it with the model instead of offloading it
         # with the table.
         self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
-        # fp6 tables also carry one fp32 scale per row. Small, like
-        # weight_scale, so it lives on the device and the gather kernel
-        # indexes it by local row.
-        self.register_buffer(
-            "row_scales",
-            (
-                torch.zeros(
-                    (self.num_embeddings_per_partition, 1),
-                    dtype=torch.float32,
-                    device=embedding.weight_scale.device,
-                )
-                if self._is_fp6
-                else None
-            ),
-            persistent=True,
+        # fp6 tables also carry one fp32 scale per row. The gather kernel
+        # reaches host memory the same way it reaches the table itself, so
+        # the scales live in pinned host memory -- 1.28 GB of Qwen3.8-Flash-
+        # Next's VRAM is a per-row multiply, and the device copy never has to
+        # exist. The loader fills it row by row exactly as it fills weight.
+        # The exact-size cudaHostAlloc pin (see
+        # allocate_ple_row_scale_table) matters because torch's pinned
+        # allocator rounds blocks up to a power of two: for this buffer it
+        # would hold 2 GiB of unswappable RAM (measured) for 1.28 GB of
+        # scales.
+        _scales = (
+            allocate_ple_row_scale_table(self.num_embeddings_per_partition)
+            if self._is_fp6
+            else None
         )
+        self.register_buffer("row_scales", _scales, persistent=True)
         # One (starts, ends, bases, block) set per table, built on first use
         # and cached: constant across gathers, so CUDA-graph capture never
         # allocates and the host addresses are fixed at mapping time.
@@ -2875,9 +2882,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 n_rows = ov_end - ov_start
                 table = getattr(emb, dest)
                 table.data[local_start : local_start + n_rows].copy_(
-                    loaded_weight[src_start : src_start + n_rows].to(
-                        device=table.device, dtype=table.dtype
-                    )
+                    # fp6 row scales land in pinned host memory: a plain
+                    # host-to-host copy, no device round trip.
+                    loaded_weight[src_start : src_start + n_rows].to(dtype=table.dtype)
                 )
 
         # Print warning once per load_weights() call
