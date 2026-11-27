@@ -385,10 +385,10 @@ def main():
                 1.0 / HC,
                 BM=128,
                 BN=64,
-                BK=256,
+                BK=128,
                 NKB=KD // 32,
-                num_warps=8,
-                num_stages=2,
+                num_warps=4,
+                num_stages=3,
             )
         )
         t_pu = bench(

@@ -640,6 +640,10 @@ def fused_hc_mix_fp8_w8a8_supported(
         and x_normed.shape[0] >= _W8A8_MIN_ROWS
         and x_normed.shape[1] % 2048 == 0
         and x_normed.is_contiguous()
+        # The down epilogue stores its per-32 scale columns unmasked in n
+        # (BN//32 per tile); a lowrank that is not a multiple of BN=64
+        # would spill into the next sf row / 1 byte past the tsf buffer.
+        and w_down.shape[0] % 64 == 0
         and _weights_ok(w_down, w_down_scale, x_normed.dtype)
         and _weights_ok(w_up, w_up_scale, x_normed.dtype)
     )
@@ -694,10 +698,11 @@ def fused_hc_mix_fp8_w8a8(
         BN=BN,
         BK=BK,
         NKB=k // 32,
-        # BK only changes Triton's loop chunking: tl.dot lowers to the same
-        # per-instruction HMMA chain along K, so the fp32 accumulation order
+        # BK only changes Triton's loop chunking: tl.dot_scaled lowers to the
+        # same per-instruction HMMA chain along K, so the fp32 accumulation order
         # -- and the fp8/sf bytes -- are bit-identical to BK=256 (verified
-        # across shapes and seeds). BK=128 w4/s3 beats BK=256 w8/s2 by ~10%.
+        # across shapes and seeds). sm_120-tuned: BK=128 w4/s3 beats BK=256
+        # w8/s2 by ~10% at rows 8192 / K 10240 / lr 512.
         num_warps=4,
         num_stages=3,
     )
