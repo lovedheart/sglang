@@ -122,7 +122,8 @@ def old_path(x, d8, ds, u8, us, hc, hs):
         num_warps=8,
         num_stages=2,
     )
-    _hc_mix_a8w8_up_kernel[(triton.cdiv(rows, 64), hs // 64)](
+    # up kernel is launched (j_tiles, m_tiles) since d537d4f289
+    _hc_mix_a8w8_up_kernel[(hs // 64, triton.cdiv(rows, 64))](
         t8,
         tsf,
         u8,

@@ -562,8 +562,12 @@ def _hc_mix_a8w8_up_kernel(
     # Native mxfp8 dot_scaled: 1x32 e8m0 tiles keep the weight bit-exact vs
     # the W8A16 decode path (no per-row requant), and t rides the fp8 the
     # down epilogue already produced.
-    pid_m = tl.program_id(0)
-    pid_j = tl.program_id(1)
+    # j is the fast-varying launch dim: consecutive programs share one m
+    # band, so the [BM, LOWRANK] fp8 partial tile stays in L2 across the
+    # hs/BN tiles instead of re-streaming per tile. Pure rasterization
+    # change -- per-tile math and accumulation order are untouched.
+    pid_m = tl.program_id(1)
+    pid_j = tl.program_id(0)
     offs_m = pid_m * BM + tl.arange(0, BM)
     offs_j = pid_j * BN + tl.arange(0, BN)
     mask_m = offs_m < T
@@ -693,7 +697,7 @@ def fused_hc_mix_fp8_w8a8(
         num_warps=8,
         num_stages=2,
     )
-    _hc_mix_a8w8_up_kernel[(triton.cdiv(rows, 64), hs // 64)](
+    _hc_mix_a8w8_up_kernel[(hs // 64, triton.cdiv(rows, 64))](
         t8,
         tsf,
         w_up,

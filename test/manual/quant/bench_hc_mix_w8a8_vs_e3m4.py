@@ -392,7 +392,7 @@ def main():
             )
         )
         t_pu = bench(
-            lambda: _hc_mix_a8w8_up_kernel[(triton.cdiv(M, 64), HS // 64)](
+            lambda: _hc_mix_a8w8_up_kernel[(HS // 64, triton.cdiv(M, 64))](
                 pt8,
                 ptsf,
                 wu8,
