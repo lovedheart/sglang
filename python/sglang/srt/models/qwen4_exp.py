@@ -1278,11 +1278,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
-            table, ids = self.weight, flat_ids
+            table, scales, ids = self.weight, self.row_scales, flat_ids
             vocab_start = self.shard_indices.org_vocab_start_index
             vocab_end = self.shard_indices.org_vocab_end_index
             if self._gathers_on_host(flat_ids):
-                table, ids = self._stage_rows(flat_ids, vocab_start, vocab_end)
+                # Staging renumbers the rows, so the per-row scales have to
+                # move with them: the kernel indexes both by the staged index.
+                table, scales, ids = self._stage_rows(flat_ids, vocab_start, vocab_end)
                 vocab_start, vocab_end = 0, table.shape[0]
             elif self._file_prefetcher is not None:
                 self._file_prefetcher.enqueue(
@@ -1300,7 +1302,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 seg_block, seg_count = 1, 0
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
                 0 if self._seg_tensors is not None else table.data_ptr(),
-                self.row_scales.data_ptr() if self._is_fp6 else 0,
+                scales.data_ptr() if self._is_fp6 else 0,
                 ids,
                 output,
                 embedding_dim=self.embedding_dim,
@@ -1332,9 +1334,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
     def _stage_rows(self, flat_ids: torch.Tensor, vocab_start: int, vocab_end: int):
         """This rank's distinct rows of ``flat_ids``, read from the table on the host into
-        pinned memory and copied to the device in one transfer, and the ids remapped into
-        them (-1 outside the shard). The kernel then converts the staged rows exactly as it
-        converts the table's."""
+        pinned memory and copied to the device in one transfer, the fp6 per-row scales
+        staged alongside them, and the ids remapped into them (-1 outside the shard). The
+        kernel then converts the staged rows exactly as it converts the table's, and reads
+        the scale of staged row i -- which is why the scales cannot stay indexed by table
+        row: ``rows`` is a torch.unique subset, so the two index spaces only agree when
+        every row of the shard happens to be gathered."""
         ids = flat_ids.cpu()  # a prefill chunk's ids: one sync, as the page hint takes
         in_range = (ids >= vocab_start) & (ids < vocab_end)
         rows, inverse = torch.unique(ids[in_range] - vocab_start, return_inverse=True)
@@ -1353,7 +1358,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         local[in_range] = inverse
         device = flat_ids.device
         staged = staged.to(device, non_blocking=True).view(self.weight.dtype)
-        return staged, local.pin_memory().to(device, non_blocking=True)
+        scales = None
+        if self._is_fp6:
+            # One fp32 per staged row, in ``rows`` order, so the kernel's
+            # staged index addresses weight and scale with the same number.
+            scales_host = self.row_scales.data[rows].contiguous().pin_memory()
+            scales = scales_host.to(device, non_blocking=True)
+        return staged, scales, local.pin_memory().to(device, non_blocking=True)
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:

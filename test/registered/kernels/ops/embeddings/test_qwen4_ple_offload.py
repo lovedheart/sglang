@@ -40,10 +40,14 @@ def _make_source_embedding(
     org_vocab_size=8,
     tp_size=1,
     num_added_embeddings=0,
+    fp6_packed=False,
 ):
     local_rows = vocab_end - vocab_start
+    # A uint8 table is packed fp6: one row holds embedding_dim // 4 * 3 bytes
+    # for embedding_dim logical columns.
+    row_bytes = embedding_dim // 4 * 3 if fp6_packed else embedding_dim
     weight = nn.Parameter(
-        torch.empty((local_rows, embedding_dim), dtype=dtype, device=DEVICE),
+        torch.empty((local_rows, row_bytes), dtype=dtype, device=DEVICE),
         requires_grad=False,
     )
     set_weight_attrs(
@@ -420,6 +424,107 @@ def test_qwen4_ple_file_backend_gathers_prefill_rows_on_the_host(monkeypatch, dt
         torch.testing.assert_close(gather(small), expected(small), rtol=0, atol=0)
         assert staged == [4096, 2048]  # decode-sized: the kernel reads the table
         assert len(advised) == 2
+
+
+def _dequant_fp6_rows(packed: torch.Tensor, scales: torch.Tensor, embedding_dim: int):
+    """Independent oracle for the PLE fp6 layout: four 6-bit e2m3 codes per
+    3-byte little-endian group (bit 5 is the sign, the magnitude grid steps
+    0.125 up to code 15, 0.25 to 23, 0.5 above) and one fp32 scale per row."""
+    words = packed.view(packed.shape[0], embedding_dim // 4, 3).to(torch.int32)
+    word = words[:, :, 0] | (words[:, :, 1] << 8) | (words[:, :, 2] << 16)
+    codes = torch.stack(
+        [(word >> (6 * lane)) & 63 for lane in range(4)], dim=-1
+    ).flatten(1)
+    magnitude = codes & 31
+    value = torch.where(
+        magnitude < 16,
+        magnitude.to(torch.float32) * 0.125,
+        torch.where(
+            magnitude < 24,
+            2.0 + (magnitude - 16).to(torch.float32) * 0.25,
+            4.0 + (magnitude - 24).to(torch.float32) * 0.5,
+        ),
+    )
+    value = torch.where((codes & 32) != 0, -value, value)
+    return (value * scales.to(torch.float32)).to(torch.bfloat16)
+
+
+def test_qwen4_ple_staged_gather_carries_fp6_row_scales(monkeypatch):
+    """Host staging renumbers the gathered rows (they are a torch.unique
+    subset of the shard), so an fp6 gather must apply the scale of the *staged*
+    row: ids covering two of this rank's four rows have to give the bytes the
+    dequantized table says, not a neighbouring row's scale. Ids that miss the
+    shard entirely must still come out zero, which is the staging path's
+    empty-rows fallback. Staging is forced rather than detected -- its file
+    backend needs a device that reads pageable host memory, while the staging
+    logic itself only needs pinned memory -- so this guard runs on any device.
+    """
+    monkeypatch.setattr(
+        qwen4_exp_module, "advise_rows_willneed", lambda fd, rows, row_bytes: 0
+    )
+    embedding_dim = 160
+    # Rows 4-7 of an 8-row vocabulary on this rank (tp_size=2).
+    filed = Qwen4ExpPinnedHostEmbedding(
+        _make_source_embedding(
+            dtype=torch.uint8,
+            embedding_dim=embedding_dim,
+            vocab_start=4,
+            vocab_end=8,
+            tp_size=2,
+            fp6_packed=True,
+        )
+    )
+    torch.manual_seed(0)
+    packed = torch.randint(
+        0, 256, (4, embedding_dim // 4 * 3), dtype=torch.uint8, device=DEVICE
+    )
+    # Distinct per-row scales: a scale read from the wrong row is visible.
+    scales = torch.exp(torch.randn(4, 1, device=DEVICE) * 2.0)
+    filed.weight.copy_(packed)
+    filed.row_scales.copy_(scales.to(filed.row_scales.device))
+    dequantized = _dequant_fp6_rows(packed.cpu(), scales.cpu(), embedding_dim).to(
+        DEVICE
+    )
+
+    def expected(ids):
+        inside = ((ids >= 4) & (ids < 8)).to(torch.float32)
+        rows = dequantized.index_select(0, ids.clamp(4, 7).flatten() - 4).float()
+        return (rows * inside.flatten()[:, None]).to(torch.bfloat16)
+
+    def gather(ids):
+        # A sharded table: the output is preallocated (as the model does),
+        # since allocating one goes through the TP group, which this test has
+        # none of.
+        out = torch.empty(
+            (ids.numel(), embedding_dim), dtype=torch.bfloat16, device=DEVICE
+        )
+        return filed.gather(ids, out=out)
+
+    # Rows 5 and 6 only, so staged index 0/1 stands for local row 1/2.
+    ids = torch.randint(0, 2, (256,), device=DEVICE) + 5
+    monkeypatch.setattr(
+        Qwen4ExpPinnedHostEmbedding, "_gathers_on_host", lambda self, flat_ids: True
+    )
+    staged = gather(ids)
+    torch.testing.assert_close(staged, expected(ids), rtol=0, atol=0)
+    monkeypatch.setattr(
+        Qwen4ExpPinnedHostEmbedding, "_gathers_on_host", lambda self, flat_ids: False
+    )
+    # The staged path's bytes are the in-kernel path's bytes.
+    torch.testing.assert_close(staged, gather(ids), rtol=0, atol=0)
+
+    # Nothing in the shard: staging falls back to a single dummy row and every
+    # output row is zeroed by the kernel's range check.
+    outside = torch.randint(0, 4, (64,), device=DEVICE)
+    monkeypatch.setattr(
+        Qwen4ExpPinnedHostEmbedding, "_gathers_on_host", lambda self, flat_ids: True
+    )
+    torch.testing.assert_close(
+        gather(outside),
+        torch.zeros(64, embedding_dim, dtype=torch.bfloat16, device=DEVICE),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.skipif(
