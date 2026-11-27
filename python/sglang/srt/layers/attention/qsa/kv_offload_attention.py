@@ -221,7 +221,9 @@ def _gather_union_from_slab(
         dst=torch.arange(positions.numel(), dtype=torch.int64, device=device),
         k_src=offload.slab_k[layer_idx],
         v_src=offload.slab_v[layer_idx],
-        src=torch.tensor([slab.base for slab in slabs], device=device)[owners]
+        src=_pinned_h2d(
+            torch.tensor([slab.base for slab in slabs], dtype=torch.int64), device
+        )[owners]
         + positions,
         ks_dst=k_sf,
         vs_dst=v_sf,
@@ -261,9 +263,17 @@ def gather_offloaded_context_union(
     # Query-row owner from the (possibly DP-padded) top-k row count, not the
     # extend lengths: padded rows past the indexer's count still map to the
     # request that owns the last extend row.
+    # The device twin of `extend_lens` (ForwardBatch.init_new builds both
+    # from the same list); torch.tensor(list, device=...) would pay a
+    # pageable HtoD drain once per layer on this path.
     extend_end = torch.cumsum(
-        torch.tensor(extend_lens, dtype=torch.int32, device=device), 0
+        forward_batch.extend_seq_lens.to(device=device, dtype=torch.int32), 0
     )
+    if extend_end.numel() != num_sequences:
+        raise ValueError(
+            f"QSA K/V offload: {extend_end.numel()} extend rows vs "
+            f"{num_sequences} sequences"
+        )
     q_owner = torch.searchsorted(
         extend_end,
         torch.arange(topk_indices.shape[0], dtype=torch.int32, device=device),
